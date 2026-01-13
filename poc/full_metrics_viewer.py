@@ -40,6 +40,7 @@ except ImportError:
 
 from ws_connectors import MultiExchangeConnector
 from liq_engine import LiquidationStressEngine
+from liq_calibrator import LiquidationCalibrator
 
 
 @dataclass
@@ -134,6 +135,24 @@ class FullMetricsProcessor:
             debug_enabled=True,                    # Enable debug output
             debug_log_file="liq_engine_debug.log"  # Log to file (tail -f to watch)
         )
+
+        # Self-calibrating system for leverage weights
+        # Uses real Binance forceOrder liquidations as feedback
+        self.calibrator = LiquidationCalibrator(
+            symbol="BTC",
+            steps=20.0,
+            window_minutes=30,          # Calibrate every 30 minutes
+            hit_bucket_tolerance=2,     # Consider hit if within 2 buckets
+            learning_rate=0.10,         # Weight adjustment rate
+            closer_level_gamma=0.35,    # Prior for higher leverage
+            log_file="liq_calibrator.jsonl",
+            on_weights_updated=self._on_calibrator_weights_updated
+        )
+
+    def _on_calibrator_weights_updated(self, symbol: str, new_weights: list, new_buffer: float):
+        """Callback when calibrator updates weights."""
+        # Push updated weights to the liq engine
+        self.liq_engine.update_leverage_weights(symbol, new_weights, new_buffer)
 
     def process_message(self, msg_str: str):
         """Process incoming message."""
@@ -295,6 +314,18 @@ class FullMetricsProcessor:
             self.state.perp_liquidations_shortsTotal += qty
             self.state.perp_liquidations_shorts[level] = self.state.perp_liquidations_shorts.get(level, 0) + qty
 
+        # Send to calibrator for weight learning
+        # Binance forceOrder: "S": "BUY" means shorts got liquidated (they had to buy back)
+        # "S": "SELL" means longs got liquidated (they had to sell)
+        calib_side = "short" if side == "buy" else "long"
+        self.calibrator.on_liquidation({
+            'timestamp': time.time(),
+            'symbol': 'BTC',
+            'side': calib_side,
+            'price': price,
+            'qty': qty
+        })
+
     def _process_funding(self, exchange: str, data: dict):
         if "r" in data:
             funding = float(data["r"])
@@ -322,6 +353,23 @@ class FullMetricsProcessor:
                 self.state.pred_liq_longs_top = self.liq_engine.top_levels("BTC", "long", 5)
                 self.state.pred_liq_shorts_top = self.liq_engine.top_levels("BTC", "short", 5)
                 self.state.liq_engine_stats = self.liq_engine.get_stats("BTC")
+
+                # Send snapshot to calibrator for learning
+                # ohlc4 = (open + high + low + close) / 4
+                src = (self.state.perp_open + self.state.perp_high +
+                       self.state.perp_low + self.state.perp_close) / 4
+                config = self.liq_engine.get_leverage_config("BTC")
+                self.calibrator.on_minute_snapshot(
+                    symbol="BTC",
+                    timestamp=time.time(),
+                    src=src,
+                    pred_longs=self.liq_engine.get_all_levels("BTC", "long"),
+                    pred_shorts=self.liq_engine.get_all_levels("BTC", "short"),
+                    ladder=config.ladder if config else [],
+                    weights=config.weights if config else [],
+                    buffer=self.liq_engine.buffer,
+                    steps=self.liq_engine.steps
+                )
 
             # Reset minute metrics
             self.state.perp_buyVol = 0

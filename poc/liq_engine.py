@@ -425,3 +425,55 @@ class LiquidationStressEngine:
         if symbol in self.symbols:
             return self.symbols[symbol].leverage_config
         return get_leverage_config(symbol)
+
+    def update_leverage_weights(
+        self,
+        symbol: str,
+        new_weights: List[float],
+        new_buffer: float = None
+    ) -> bool:
+        """
+        Update leverage weights for a symbol at runtime.
+
+        Called by the calibrator to push updated weights based on observed liquidations.
+
+        Args:
+            symbol: Symbol name
+            new_weights: New weight values (should match ladder length)
+            new_buffer: Optional new buffer value
+
+        Returns:
+            True if successful
+        """
+        if symbol not in self.symbols:
+            return False
+
+        state = self.symbols[symbol]
+        config = state.leverage_config
+
+        if len(new_weights) != len(config.ladder):
+            logger.warning(
+                f"Weight length mismatch for {symbol}: "
+                f"got {len(new_weights)}, expected {len(config.ladder)}"
+            )
+            return False
+
+        # Update weights (normalize them)
+        total = sum(new_weights)
+        if total > 0:
+            config.weights = [w / total for w in new_weights]
+        else:
+            config.weights = new_weights.copy()
+
+        # Update buffer if provided
+        if new_buffer is not None:
+            self.buffer = new_buffer
+
+        if self.debug_enabled and symbol == self.debug_symbol:
+            logger.debug(f"[{symbol}] Weights updated by calibrator:")
+            for lev, weight in config.get_weighted_ladder():
+                logger.debug(f"    {lev:3d}x -> weight {weight:.4f}")
+            if new_buffer is not None:
+                logger.debug(f"  Buffer updated to: {new_buffer:.4f}")
+
+        return True

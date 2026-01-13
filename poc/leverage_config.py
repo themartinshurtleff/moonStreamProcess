@@ -137,6 +137,33 @@ class LeverageConfigRegistry:
         """List all symbols with explicit configurations."""
         return list(self._configs.keys())
 
+    def update_weights(self, symbol: str, new_weights: List[float]) -> bool:
+        """
+        Update weights for a symbol at runtime.
+
+        Args:
+            symbol: Symbol name
+            new_weights: New weight values (will be normalized)
+
+        Returns:
+            True if successful, False if symbol not found or length mismatch
+        """
+        if symbol not in self._configs:
+            return False
+
+        config = self._configs[symbol]
+        if len(new_weights) != len(config.ladder):
+            return False
+
+        # Normalize and update
+        total = sum(new_weights)
+        if total > 0:
+            config.weights = [w / total for w in new_weights]
+        else:
+            config.weights = new_weights.copy()
+
+        return True
+
     def get_ladder_summary(self, symbol: str) -> str:
         """Get a human-readable summary of the ladder config for a symbol."""
         config = self.get_config(symbol)
