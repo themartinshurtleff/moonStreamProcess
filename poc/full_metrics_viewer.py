@@ -144,10 +144,12 @@ class FullMetricsProcessor:
         self.calibrator = LiquidationCalibrator(
             symbol="BTC",
             steps=20.0,
-            window_minutes=30,          # Calibrate every 30 minutes
-            hit_bucket_tolerance=2,     # Consider hit if within 2 buckets
+            window_minutes=15,          # Calibrate every 15 minutes
+            hit_bucket_tolerance=5,     # Initial tolerance (will auto-calibrate)
             learning_rate=0.10,         # Weight adjustment rate
             closer_level_gamma=0.35,    # Prior for higher leverage
+            enable_buffer_tuning=True,  # Auto-tune buffer based on misses
+            enable_tolerance_tuning=True,  # Auto-tune hit tolerance
             log_file=os.path.join(POC_DIR, "liq_calibrator.jsonl"),
             weights_file=os.path.join(POC_DIR, "liq_calibrator_weights.json"),
             log_events=True,            # Log individual liquidation events

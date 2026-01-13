@@ -69,6 +69,8 @@ class CalibrationStats:
     leverage_notional: Dict[int, float] = field(default_factory=dict)
     # Direction tracking for buffer tuning
     distance_directions: List[float] = field(default_factory=list)  # positive = predicted farther
+    # Miss distances in buckets for tolerance tuning
+    miss_distances: List[float] = field(default_factory=list)
 
 
 class LiquidationCalibrator:
@@ -94,7 +96,11 @@ class LiquidationCalibrator:
         buffer_lr: float = 0.02,
         min_buffer: float = 0.0005,
         max_buffer: float = 0.01,
-        enable_buffer_tuning: bool = False,
+        enable_buffer_tuning: bool = True,
+        tolerance_lr: float = 0.20,
+        min_tolerance: int = 2,
+        max_tolerance: int = 50,
+        enable_tolerance_tuning: bool = True,
         log_file: str = None,
         weights_file: str = DEFAULT_WEIGHTS_FILE,
         log_events: bool = True,
@@ -114,6 +120,10 @@ class LiquidationCalibrator:
         self.min_buffer = min_buffer
         self.max_buffer = max_buffer
         self.enable_buffer_tuning = enable_buffer_tuning
+        self.tolerance_lr = tolerance_lr
+        self.min_tolerance = min_tolerance
+        self.max_tolerance = max_tolerance
+        self.enable_tolerance_tuning = enable_tolerance_tuning
         self.log_file = log_file
         self.weights_file = weights_file
         self.log_events = log_events
@@ -170,6 +180,7 @@ class LiquidationCalibrator:
             self.current_ladder = data.get('ladder', [])
             self.current_weights = data.get('weights', [])
             self.current_buffer = data.get('buffer', 0.002)
+            self.hit_bucket_tolerance = data.get('tolerance', self.hit_bucket_tolerance)
             self.calibration_count = data.get('calibration_count', 0)
 
             logger.info(f"Loaded weights from {self.weights_file}")
@@ -191,6 +202,7 @@ class LiquidationCalibrator:
                 'ladder': self.current_ladder,
                 'weights': self.current_weights,
                 'buffer': self.current_buffer,
+                'tolerance': self.hit_bucket_tolerance,
                 'calibration_count': self.calibration_count,
                 'saved_at': datetime.now().isoformat(),
                 'weights_by_leverage': {
@@ -348,6 +360,9 @@ class LiquidationCalibrator:
         else:
             self.stats.misses += 1
             self.stats.total_miss_distance += min_distance
+            # Track miss distance for tolerance tuning
+            if min_distance < float('inf'):
+                self.stats.miss_distances.append(min_distance)
 
         # Attribute to leverage level
         attributed_leverage = self._attribute_to_leverage(event, snapshot)
@@ -470,17 +485,38 @@ class LiquidationCalibrator:
                 new_buffer *= (1 + self.buffer_lr)
             new_buffer = max(self.min_buffer, min(self.max_buffer, new_buffer))
 
+        # Tolerance tuning (optional)
+        old_tolerance = self.hit_bucket_tolerance
+        new_tolerance = old_tolerance
+        if self.enable_tolerance_tuning and len(self.stats.miss_distances) >= 5:
+            # Use p75 of miss distances as target tolerance
+            sorted_misses = sorted(self.stats.miss_distances)
+            p75_idx = int(len(sorted_misses) * 0.75)
+            p75_miss = sorted_misses[p75_idx]
+
+            # If p75 miss is much larger than current tolerance, increase
+            # If p75 miss is much smaller, we could decrease (but be conservative)
+            if p75_miss > self.hit_bucket_tolerance * 1.5:
+                # Misses are far - increase tolerance
+                new_tolerance = int(self.hit_bucket_tolerance * (1 + self.tolerance_lr))
+            elif p75_miss < self.hit_bucket_tolerance * 0.5 and hit_rate > 0.5:
+                # Misses are close and we have decent hit rate - decrease slightly
+                new_tolerance = int(self.hit_bucket_tolerance * (1 - self.tolerance_lr * 0.5))
+
+            new_tolerance = max(self.min_tolerance, min(self.max_tolerance, new_tolerance))
+            self.hit_bucket_tolerance = new_tolerance
+
         # Log calibration
         self._log_calibration(
             minute_key, hit_rate, avg_hit_strength, avg_miss_distance,
             old_weights, new_weights, old_buffer, new_buffer,
-            snapshot
+            old_tolerance, new_tolerance, snapshot
         )
 
         # Print debug line
         weights_str = " ".join(f"{l}x={w:.3f}" for l, w in zip(self.current_ladder, new_weights))
         print(f"CALIB {self.symbol} hit_rate={hit_rate:.2f} miss_buckets={avg_miss_distance:.1f} "
-              f"events={self.stats.total_events} weights: {weights_str} buffer={new_buffer:.4f}")
+              f"events={self.stats.total_events} tol={new_tolerance} buffer={new_buffer:.4f}")
 
         # Reset stats for next window
         self.stats = CalibrationStats()
@@ -518,6 +554,8 @@ class LiquidationCalibrator:
         new_weights: List[float],
         old_buffer: float,
         new_buffer: float,
+        old_tolerance: int,
+        new_tolerance: int,
         snapshot: MinuteSnapshot
     ) -> None:
         """Write calibration event to JSONL log."""
@@ -550,6 +588,8 @@ class LiquidationCalibrator:
             'new_weights': {str(l): round(w, 4) for l, w in zip(self.current_ladder, new_weights)},
             'old_buffer': round(old_buffer, 5),
             'new_buffer': round(new_buffer, 5),
+            'old_tolerance': old_tolerance,
+            'new_tolerance': new_tolerance,
             'src_price': round(snapshot.src, 2),
             'top_long_zones': [[p, round(s, 3)] for p, s in top_longs],
             'top_short_zones': [[p, round(s, 3)] for p, s in top_shorts]
@@ -576,14 +616,29 @@ class LiquidationCalibrator:
         # Get top 5 predicted zones for this side
         top_zones = sorted(pred_zones.items(), key=lambda x: x[1], reverse=True)[:5]
 
-        # Calculate implied levels for all leverages
+        # Calculate implied levels for all leverages and find nearest
         implied_levels = {}
+        nearest_implied = None
+        nearest_implied_lev = None
+        min_implied_distance = float('inf')
+
         for lev in snapshot.ladder:
             offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
             if event.side == "long":
-                implied_levels[str(lev)] = round(snapshot.src * (1 - offset), 2)
+                implied = snapshot.src * (1 - offset)
             else:
-                implied_levels[str(lev)] = round(snapshot.src * (1 + offset), 2)
+                implied = snapshot.src * (1 + offset)
+            implied_levels[str(lev)] = round(implied, 2)
+
+            # Track nearest implied level to event price
+            dist = abs(implied - event.price)
+            if dist < min_implied_distance:
+                min_implied_distance = dist
+                nearest_implied = implied
+                nearest_implied_lev = lev
+
+        # Calculate how far off the nearest implied is (in price terms)
+        implied_miss_usd = round(event.price - nearest_implied, 2) if nearest_implied else None
 
         log_entry = {
             'type': 'event',
@@ -597,14 +652,18 @@ class LiquidationCalibrator:
             'is_hit': is_hit,
             'hit_strength': round(hit_strength, 4) if is_hit else None,
             'miss_distance_buckets': round(min_distance, 2) if not is_hit else None,
-            'nearest_predicted': round(nearest_pred, 2) if nearest_pred else None,
+            'nearest_implied': round(nearest_implied, 2) if nearest_implied else None,
+            'nearest_implied_leverage': nearest_implied_lev,
+            'implied_miss_usd': implied_miss_usd,
             'attributed_leverage': attributed_leverage,
             'implied_levels_by_leverage': implied_levels,
             'top_predicted_zones': [[round(p, 2), round(s, 3)] for p, s in top_zones],
             'current_weights': {
                 str(l): round(w, 4)
                 for l, w in zip(snapshot.ladder, snapshot.weights)
-            }
+            },
+            'current_buffer': round(snapshot.buffer, 5),
+            'hit_bucket_tolerance': self.hit_bucket_tolerance
         }
 
         self.log_fh.write(json.dumps(log_entry) + '\n')
