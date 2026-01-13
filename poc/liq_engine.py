@@ -3,6 +3,8 @@ Liquidation Stress Zone Predictor Engine
 
 Predicts likely liquidation zones based on volume patterns and leverage assumptions.
 Inspired by aggr.trade liquidation heatmap methodology.
+
+Uses per-symbol leverage ladders with weights for realistic liquidation zone estimation.
 """
 
 import math
@@ -10,6 +12,8 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
+
+from leverage_config import get_leverage_config, get_weighted_ladder, LeverageConfig
 
 # Configure logging for debug output
 logging.basicConfig(level=logging.INFO)
@@ -39,17 +43,20 @@ class SymbolState:
     current_minute: int = 0
     last_price: float = 0.0
 
+    # Cached leverage config for this symbol
+    leverage_config: Optional[LeverageConfig] = None
+
 
 class LiquidationStressEngine:
     """
     Predicts liquidation stress zones based on volume patterns.
 
-    Uses leverage ladder to estimate where positions opened at current price
-    would get liquidated, weighted by volume ratios.
+    Uses per-symbol leverage ladders with weights to estimate where positions
+    opened at current price would get liquidated, weighted by volume ratios
+    and leverage popularity.
     """
 
     # Configuration constants
-    LEVERAGE_LADDER = [5, 10, 20, 50, 75, 100]
     DEFAULT_BUFFER = 0.002  # 0.2% buffer
     DEFAULT_FADE = 0.97     # Decay factor per minute
     DEFAULT_VOL_LENGTH = 50 # SMA window length
@@ -64,7 +71,8 @@ class LiquidationStressEngine:
         buffer: float = DEFAULT_BUFFER,
         fade: float = DEFAULT_FADE,
         log_scale: bool = LOG_SCALE,
-        debug_symbol: str = "BTC"
+        debug_symbol: str = "BTC",
+        debug_enabled: bool = False
     ):
         self.steps = steps
         self.vol_length = vol_length
@@ -72,9 +80,15 @@ class LiquidationStressEngine:
         self.fade = fade
         self.log_scale = log_scale
         self.debug_symbol = debug_symbol
+        self.debug_enabled = debug_enabled
 
         # Per-symbol state
         self.symbols: Dict[str, SymbolState] = {}
+
+        # Log initialization
+        if self.debug_enabled:
+            logger.setLevel(logging.DEBUG)
+            logger.debug(f"LiquidationStressEngine initialized with debug_symbol={debug_symbol}")
 
     def _get_or_create_state(self, symbol: str) -> SymbolState:
         """Get or create state for a symbol."""
@@ -83,6 +97,18 @@ class LiquidationStressEngine:
             # Initialize with proper maxlen
             self.symbols[symbol].buy_vol_window = deque(maxlen=self.vol_length)
             self.symbols[symbol].sell_vol_window = deque(maxlen=self.vol_length)
+            # Cache leverage config for this symbol
+            self.symbols[symbol].leverage_config = get_leverage_config(symbol)
+
+            # Debug: print ladder config on first use
+            if self.debug_enabled and symbol == self.debug_symbol:
+                config = self.symbols[symbol].leverage_config
+                logger.debug(f"[{symbol}] Leverage ladder initialized:")
+                logger.debug(f"  Ladder: {config.ladder}")
+                logger.debug(f"  Weights (normalized): {[f'{w:.4f}' for w in config.weights]}")
+                for lev, weight in config.get_weighted_ladder():
+                    logger.debug(f"    {lev:3d}x -> weight {weight:.4f}")
+
         return self.symbols[symbol]
 
     def _compute_sma(self, window: deque) -> float:
@@ -94,7 +120,7 @@ class LiquidationStressEngine:
     def _bucket_price(self, price: float, direction: str) -> float:
         """
         Bucket a price to the nearest step.
-        direction: 'up' for ceil (short zones), 'down' for floor (long zones)
+        direction: 'up' for floor (short zones), 'down' for ceil (long zones)
         """
         if direction == 'up':
             return math.floor(price / self.steps) * self.steps
@@ -106,7 +132,7 @@ class LiquidationStressEngine:
         Update liquidation predictions for a symbol based on new minute metrics.
 
         Args:
-            symbol: Symbol name (e.g., "BTC")
+            symbol: Symbol name (e.g., "BTC", "ETH", "SOL")
             minute_metrics: Dict with keys:
                 - perp_open, perp_high, perp_low, perp_close
                 - perp_buyVol, perp_sellVol
@@ -151,8 +177,15 @@ class LiquidationStressEngine:
         # Step 4: Remove buckets that price has crossed
         self._remove_crossed_buckets(state, perp_high, perp_low)
 
-        # Step 5: Calculate new liquidation zones for each leverage
-        for lev in self.LEVERAGE_LADDER:
+        # Step 5: Calculate new liquidation zones for each leverage with weights
+        # Get the weighted ladder for this symbol
+        weighted_ladder = state.leverage_config.get_weighted_ladder()
+
+        # Track projected buckets for debug output
+        debug_projected_longs = []
+        debug_projected_shorts = []
+
+        for lev, weight in weighted_ladder:
             # Offset calculation: (1/L) + buffer + (0.01/L)
             offset = (1.0 / lev) + self.buffer + (0.01 / lev)
 
@@ -164,36 +197,89 @@ class LiquidationStressEngine:
             lp_dn = src * (1 - offset)
             bucket_dn = self._bucket_price(lp_dn, 'down')
 
-            # Add to short zones (weighted by sell ratio - shorts being opened)
+            # Calculate weighted strength contribution
+            # strength = ratio * leverage_weight
+            short_strength_add = sell_ratio * weight
+            long_strength_add = buy_ratio * weight
+
+            # Add to short zones (weighted by sell ratio * leverage weight)
             if bucket_up not in state.short_zones:
                 state.short_zones[bucket_up] = LiqBucket(
                     price=bucket_up,
                     strength=0.0,
                     last_updated_minute=state.current_minute
                 )
-            state.short_zones[bucket_up].strength += sell_ratio
+            state.short_zones[bucket_up].strength += short_strength_add
             state.short_zones[bucket_up].last_updated_minute = state.current_minute
 
-            # Add to long zones (weighted by buy ratio - longs being opened)
+            # Add to long zones (weighted by buy ratio * leverage weight)
             if bucket_dn not in state.long_zones:
                 state.long_zones[bucket_dn] = LiqBucket(
                     price=bucket_dn,
                     strength=0.0,
                     last_updated_minute=state.current_minute
                 )
-            state.long_zones[bucket_dn].strength += buy_ratio
+            state.long_zones[bucket_dn].strength += long_strength_add
             state.long_zones[bucket_dn].last_updated_minute = state.current_minute
 
+            # Track for debug
+            if self.debug_enabled and symbol == self.debug_symbol:
+                debug_projected_shorts.append((lev, bucket_up, short_strength_add, weight))
+                debug_projected_longs.append((lev, bucket_dn, long_strength_add, weight))
+
         # Debug logging for specified symbol
-        if symbol == self.debug_symbol:
-            top_longs = self.top_levels(symbol, 'long', 3)
-            top_shorts = self.top_levels(symbol, 'short', 3)
-            logger.debug(
-                f"[{symbol}] min={state.current_minute} src={src:.2f} "
-                f"buyRatio={buy_ratio:.3f} sellRatio={sell_ratio:.3f} | "
-                f"topLongs={[(p, f'{s:.2f}') for p, s in top_longs]} "
-                f"topShorts={[(p, f'{s:.2f}') for p, s in top_shorts]}"
+        if self.debug_enabled and symbol == self.debug_symbol:
+            self._log_debug_update(
+                symbol, state, src, buy_ratio, sell_ratio,
+                debug_projected_longs, debug_projected_shorts
             )
+
+    def _log_debug_update(
+        self,
+        symbol: str,
+        state: SymbolState,
+        src: float,
+        buy_ratio: float,
+        sell_ratio: float,
+        projected_longs: List[Tuple],
+        projected_shorts: List[Tuple]
+    ):
+        """Log detailed debug output for an update."""
+        logger.debug("=" * 80)
+        logger.debug(f"[{symbol}] MINUTE {state.current_minute} UPDATE")
+        logger.debug("=" * 80)
+        logger.debug(f"  src (ohlc4) = ${src:,.2f}")
+        logger.debug(f"  buyRatio = {buy_ratio:.4f}, sellRatio = {sell_ratio:.4f}")
+        logger.debug("")
+
+        # Show projections by leverage
+        logger.debug("  Projections by leverage:")
+        logger.debug("  " + "-" * 70)
+        logger.debug(f"  {'Lev':>5} | {'Weight':>8} | {'Long Zone':>12} | {'Short Zone':>12} | {'L Str':>8} | {'S Str':>8}")
+        logger.debug("  " + "-" * 70)
+        for i, (lev, bucket_dn, long_str, weight) in enumerate(projected_longs):
+            _, bucket_up, short_str, _ = projected_shorts[i]
+            logger.debug(
+                f"  {lev:>5}x | {weight:>8.4f} | ${bucket_dn:>10,.0f} | ${bucket_up:>10,.0f} | {long_str:>8.4f} | {short_str:>8.4f}"
+            )
+        logger.debug("")
+
+        # Show top 5 strongest zones
+        top_longs = self.top_levels(symbol, 'long', 5)
+        top_shorts = self.top_levels(symbol, 'short', 5)
+
+        logger.debug("  Top 5 LONG liquidation zones (support):")
+        for price, strength in top_longs:
+            dist = ((price - src) / src) * 100
+            logger.debug(f"    ${price:>10,.0f} ({dist:>+6.2f}%) -> strength {strength:.4f}")
+
+        logger.debug("")
+        logger.debug("  Top 5 SHORT liquidation zones (resistance):")
+        for price, strength in top_shorts:
+            dist = ((price - src) / src) * 100
+            logger.debug(f"    ${price:>10,.0f} ({dist:>+6.2f}%) -> strength {strength:.4f}")
+
+        logger.debug("=" * 80)
 
     def _apply_decay(self, state: SymbolState) -> None:
         """Apply decay factor to all buckets not updated this minute."""
@@ -292,6 +378,8 @@ class LiquidationStressEngine:
             return {}
 
         state = self.symbols[symbol]
+        config = state.leverage_config
+
         return {
             'current_minute': state.current_minute,
             'last_price': state.last_price,
@@ -301,4 +389,12 @@ class LiquidationStressEngine:
             'short_zones_count': len(state.short_zones),
             'avg_buy_vol': self._compute_sma(state.buy_vol_window),
             'avg_sell_vol': self._compute_sma(state.sell_vol_window),
+            'leverage_ladder': config.ladder if config else [],
+            'leverage_weights': [f'{w:.4f}' for w in config.weights] if config else [],
         }
+
+    def get_leverage_config(self, symbol: str) -> Optional[LeverageConfig]:
+        """Get the leverage config for a symbol."""
+        if symbol in self.symbols:
+            return self.symbols[symbol].leverage_config
+        return get_leverage_config(symbol)
