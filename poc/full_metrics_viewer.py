@@ -146,8 +146,13 @@ class FullMetricsProcessor:
             learning_rate=0.10,         # Weight adjustment rate
             closer_level_gamma=0.35,    # Prior for higher leverage
             log_file="liq_calibrator.jsonl",
+            weights_file="liq_calibrator_weights.json",  # Persist learned weights
+            log_events=True,            # Log individual liquidation events
             on_weights_updated=self._on_calibrator_weights_updated
         )
+
+        # Track if we've applied persisted weights
+        self._applied_persisted_weights = False
 
     def _on_calibrator_weights_updated(self, symbol: str, new_weights: list, new_buffer: float):
         """Callback when calibrator updates weights."""
@@ -348,6 +353,18 @@ class FullMetricsProcessor:
                     'perp_sellVol': self.state.perp_sellVol,
                 }
                 self.liq_engine.update("BTC", minute_metrics)
+
+                # Apply persisted weights from calibrator on first update
+                if not self._applied_persisted_weights:
+                    persisted = self.calibrator.get_persisted_weights()
+                    if persisted:
+                        self.liq_engine.update_leverage_weights(
+                            "BTC",
+                            persisted['weights'],
+                            persisted['buffer']
+                        )
+                        print(f"Loaded persisted weights (calibration #{persisted['calibration_count']})")
+                    self._applied_persisted_weights = True
 
                 # Get top predicted liquidation zones
                 self.state.pred_liq_longs_top = self.liq_engine.top_levels("BTC", "long", 5)

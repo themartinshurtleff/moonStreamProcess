@@ -13,6 +13,7 @@ The calibrator:
 
 import json
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -22,6 +23,9 @@ from typing import Dict, List, Tuple, Optional, Callable
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Default persistence file
+DEFAULT_WEIGHTS_FILE = "liq_calibrator_weights.json"
 
 
 @dataclass
@@ -92,6 +96,8 @@ class LiquidationCalibrator:
         max_buffer: float = 0.01,
         enable_buffer_tuning: bool = False,
         log_file: str = None,
+        weights_file: str = DEFAULT_WEIGHTS_FILE,
+        log_events: bool = True,
         on_weights_updated: Callable = None
     ):
         self.symbol = symbol
@@ -109,6 +115,8 @@ class LiquidationCalibrator:
         self.max_buffer = max_buffer
         self.enable_buffer_tuning = enable_buffer_tuning
         self.log_file = log_file
+        self.weights_file = weights_file
+        self.log_events = log_events
         self.on_weights_updated = on_weights_updated
 
         # Thread safety
@@ -121,7 +129,7 @@ class LiquidationCalibrator:
         # Current calibration stats
         self.stats = CalibrationStats()
 
-        # Current params (will be updated by predictor)
+        # Current params (will be updated by predictor, or loaded from file)
         self.current_ladder: List[int] = []
         self.current_weights: List[float] = []
         self.current_buffer: float = 0.002
@@ -137,9 +145,69 @@ class LiquidationCalibrator:
         else:
             self.log_fh = None
 
+        # Load persisted weights if available
+        self._load_weights()
+
         logger.info(f"LiquidationCalibrator initialized for {symbol}")
         logger.info(f"  window={window_minutes}min, hit_tolerance={hit_bucket_tolerance} buckets")
         logger.info(f"  lr={learning_rate}, gamma={closer_level_gamma}")
+        if self.current_weights:
+            logger.info(f"  Loaded persisted weights: {self.current_weights}")
+
+    def _load_weights(self) -> bool:
+        """Load persisted weights from file if available."""
+        if not self.weights_file or not os.path.exists(self.weights_file):
+            return False
+
+        try:
+            with open(self.weights_file, 'r') as f:
+                data = json.load(f)
+
+            if data.get('symbol') != self.symbol:
+                logger.warning(f"Weights file symbol mismatch: {data.get('symbol')} != {self.symbol}")
+                return False
+
+            self.current_ladder = data.get('ladder', [])
+            self.current_weights = data.get('weights', [])
+            self.current_buffer = data.get('buffer', 0.002)
+            self.calibration_count = data.get('calibration_count', 0)
+
+            logger.info(f"Loaded weights from {self.weights_file}")
+            logger.info(f"  Calibration count: {self.calibration_count}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error loading weights: {e}")
+            return False
+
+    def _save_weights(self) -> bool:
+        """Save current weights to file."""
+        if not self.weights_file:
+            return False
+
+        try:
+            data = {
+                'symbol': self.symbol,
+                'ladder': self.current_ladder,
+                'weights': self.current_weights,
+                'buffer': self.current_buffer,
+                'calibration_count': self.calibration_count,
+                'saved_at': datetime.now().isoformat(),
+                'weights_by_leverage': {
+                    str(l): round(w, 6)
+                    for l, w in zip(self.current_ladder, self.current_weights)
+                }
+            }
+
+            with open(self.weights_file, 'w') as f:
+                json.dump(data, f, indent=2)
+
+            logger.debug(f"Saved weights to {self.weights_file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error saving weights: {e}")
+            return False
 
     def on_liquidation(self, event_data: dict) -> None:
         """
@@ -296,12 +364,18 @@ class LiquidationCalibrator:
                 self.stats.leverage_hit_count[attributed_leverage] += 1
 
         # Track direction for buffer tuning
+        nearest_pred = None
         if pred_zones:
             # Find nearest predicted level
             nearest_pred = min(pred_zones.keys(), key=lambda p: abs(p - event.price))
             # Positive = predicted level is farther from current price than actual event
             direction = abs(nearest_pred - snapshot.src) - abs(event.price - snapshot.src)
             self.stats.distance_directions.append(direction)
+
+        # Log individual event for analysis
+        if self.log_events and self.log_fh:
+            self._log_event(event, snapshot, pred_zones, is_hit, hit_strength,
+                           min_distance, attributed_leverage, nearest_pred)
 
     def _attribute_to_leverage(self, event: LiquidationEvent, snapshot: MinuteSnapshot) -> Optional[int]:
         """
@@ -418,6 +492,9 @@ class LiquidationCalibrator:
         self.current_weights = new_weights
         self.current_buffer = new_buffer
 
+        # Persist weights to file
+        self._save_weights()
+
         # Notify callback
         result = {
             'weights': new_weights,
@@ -481,6 +558,58 @@ class LiquidationCalibrator:
         self.log_fh.write(json.dumps(log_entry) + '\n')
         self.log_fh.flush()
 
+    def _log_event(
+        self,
+        event: LiquidationEvent,
+        snapshot: MinuteSnapshot,
+        pred_zones: Dict[float, float],
+        is_hit: bool,
+        hit_strength: float,
+        min_distance: float,
+        attributed_leverage: Optional[int],
+        nearest_pred: Optional[float]
+    ) -> None:
+        """Log individual liquidation event with predicted zones for analysis."""
+        if not self.log_fh:
+            return
+
+        # Get top 5 predicted zones for this side
+        top_zones = sorted(pred_zones.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # Calculate implied levels for all leverages
+        implied_levels = {}
+        for lev in snapshot.ladder:
+            offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
+            if event.side == "long":
+                implied_levels[str(lev)] = round(snapshot.src * (1 - offset), 2)
+            else:
+                implied_levels[str(lev)] = round(snapshot.src * (1 + offset), 2)
+
+        log_entry = {
+            'type': 'event',
+            'timestamp': datetime.fromtimestamp(event.timestamp).isoformat(),
+            'symbol': event.symbol,
+            'side': event.side,
+            'event_price': round(event.price, 2),
+            'event_qty': round(event.qty, 6),
+            'event_notional': round(event.notional, 2),
+            'src_price': round(snapshot.src, 2),
+            'is_hit': is_hit,
+            'hit_strength': round(hit_strength, 4) if is_hit else None,
+            'miss_distance_buckets': round(min_distance, 2) if not is_hit else None,
+            'nearest_predicted': round(nearest_pred, 2) if nearest_pred else None,
+            'attributed_leverage': attributed_leverage,
+            'implied_levels_by_leverage': implied_levels,
+            'top_predicted_zones': [[round(p, 2), round(s, 3)] for p, s in top_zones],
+            'current_weights': {
+                str(l): round(w, 4)
+                for l, w in zip(snapshot.ladder, snapshot.weights)
+            }
+        }
+
+        self.log_fh.write(json.dumps(log_entry) + '\n')
+        self.log_fh.flush()
+
     def _bucket_price(self, price: float) -> float:
         """Bucket a price to the nearest step."""
         return round(price / self.steps) * self.steps
@@ -525,6 +654,29 @@ class LiquidationCalibrator:
                 'current_weights': dict(zip(self.current_ladder, self.current_weights)),
                 'current_buffer': self.current_buffer
             }
+
+    def get_persisted_weights(self) -> Optional[Dict]:
+        """
+        Get persisted weights if available.
+        Call this on startup to initialize the liq_engine with saved weights.
+
+        Returns:
+            Dict with 'ladder', 'weights', 'buffer' if available, None otherwise
+        """
+        with self.lock:
+            if self.current_weights and self.current_ladder:
+                return {
+                    'ladder': self.current_ladder,
+                    'weights': self.current_weights,
+                    'buffer': self.current_buffer,
+                    'calibration_count': self.calibration_count
+                }
+            return None
+
+    def has_persisted_weights(self) -> bool:
+        """Check if calibrator has loaded persisted weights."""
+        with self.lock:
+            return bool(self.current_weights and self.current_ladder)
 
     def close(self):
         """Clean up resources."""
