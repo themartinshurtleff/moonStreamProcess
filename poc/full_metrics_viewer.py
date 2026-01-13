@@ -42,6 +42,9 @@ from ws_connectors import MultiExchangeConnector
 from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
 
+# Directory where this script lives - use for log file paths
+POC_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 @dataclass
 class FullMetricsState:
@@ -132,8 +135,8 @@ class FullMetricsProcessor:
             buffer=0.002,      # 0.2% buffer
             fade=0.97,         # Decay factor
             debug_symbol="BTC",
-            debug_enabled=True,                    # Enable debug output
-            debug_log_file="liq_engine_debug.log"  # Log to file (tail -f to watch)
+            debug_enabled=True,
+            debug_log_file=os.path.join(POC_DIR, "liq_engine_debug.log")
         )
 
         # Self-calibrating system for leverage weights
@@ -145,8 +148,8 @@ class FullMetricsProcessor:
             hit_bucket_tolerance=2,     # Consider hit if within 2 buckets
             learning_rate=0.10,         # Weight adjustment rate
             closer_level_gamma=0.35,    # Prior for higher leverage
-            log_file="liq_calibrator.jsonl",
-            weights_file="liq_calibrator_weights.json",  # Persist learned weights
+            log_file=os.path.join(POC_DIR, "liq_calibrator.jsonl"),
+            weights_file=os.path.join(POC_DIR, "liq_calibrator_weights.json"),
             log_events=True,            # Log individual liquidation events
             on_weights_updated=self._on_calibrator_weights_updated
         )
