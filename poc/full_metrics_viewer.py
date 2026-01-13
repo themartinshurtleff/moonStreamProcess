@@ -39,6 +39,7 @@ except ImportError:
     from rich import box
 
 from ws_connectors import MultiExchangeConnector
+from liq_engine import LiquidationStressEngine
 
 
 @dataclass
@@ -100,6 +101,11 @@ class FullMetricsState:
     perp_TTP_ratio: float = 0.0
     perp_GTA_ratio: float = 0.0
 
+    # Predicted liquidation stress zones (from LiquidationStressEngine)
+    pred_liq_longs_top: List[tuple] = field(default_factory=list)   # Top 5 long liq zones (support)
+    pred_liq_shorts_top: List[tuple] = field(default_factory=list)  # Top 5 short liq zones (resistance)
+    liq_engine_stats: Dict[str, Any] = field(default_factory=dict)  # Debug stats
+
     # Connection stats
     msg_counts: Dict[str, int] = field(default_factory=dict)
     exchanges: List[str] = field(default_factory=list)
@@ -116,6 +122,15 @@ class FullMetricsProcessor:
         self.prev_books: Dict[str, float] = {}
         self.current_minute = datetime.now().minute
         self.prices_this_minute: List[float] = []
+
+        # Liquidation stress zone predictor
+        self.liq_engine = LiquidationStressEngine(
+            steps=20.0,        # $20 price buckets for BTC
+            vol_length=50,     # 50-minute SMA for volume normalization
+            buffer=0.002,      # 0.2% buffer
+            fade=0.97,         # Decay factor
+            debug_symbol="BTC"
+        )
 
     def process_message(self, msg_str: str):
         """Process incoming message."""
@@ -288,6 +303,24 @@ class FullMetricsProcessor:
     def _check_minute_rollover(self):
         current_minute = datetime.now().minute
         if current_minute != self.current_minute:
+            # Update liquidation stress engine BEFORE resetting minute metrics
+            if self.state.perp_close > 0:
+                minute_metrics = {
+                    'perp_open': self.state.perp_open,
+                    'perp_high': self.state.perp_high,
+                    'perp_low': self.state.perp_low,
+                    'perp_close': self.state.perp_close,
+                    'perp_buyVol': self.state.perp_buyVol,
+                    'perp_sellVol': self.state.perp_sellVol,
+                }
+                self.liq_engine.update("BTC", minute_metrics)
+
+                # Get top predicted liquidation zones
+                self.state.pred_liq_longs_top = self.liq_engine.top_levels("BTC", "long", 5)
+                self.state.pred_liq_shorts_top = self.liq_engine.top_levels("BTC", "short", 5)
+                self.state.liq_engine_stats = self.liq_engine.get_stats("BTC")
+
+            # Reset minute metrics
             self.state.perp_buyVol = 0
             self.state.perp_sellVol = 0
             self.state.perp_numberBuyTrades = 0
@@ -340,7 +373,8 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     layout["metrics"].split_row(
         Layout(name="col1", ratio=1),
         Layout(name="col2", ratio=1),
-        Layout(name="col3", ratio=1)
+        Layout(name="col3", ratio=1),
+        Layout(name="col4", ratio=1)
     )
 
     layout["metrics"]["col1"].split_column(
@@ -355,6 +389,9 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         Layout(name="funding", ratio=1),
         Layout(name="liquidations", ratio=1),
         Layout(name="positions", size=8)
+    )
+    layout["metrics"]["col4"].split_column(
+        Layout(name="stress_zones", ratio=1)
     )
 
     # Price panel
@@ -465,6 +502,63 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     t.add_row("perp_TTP_ratio", f"{state.perp_TTP_ratio:.4f}")
     t.add_row("perp_GTA_ratio", f"{state.perp_GTA_ratio:.4f}")
     layout["metrics"]["col3"]["positions"].update(Panel(t, title="[bold]POSITIONS[/]", border_style="white"))
+
+    # Stress Zones panel (predicted liquidation zones)
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    t.add_column("Level", style="white")
+    t.add_column("Strength", justify="right")
+
+    # Engine stats
+    stats = state.liq_engine_stats
+    if stats:
+        t.add_row("[dim]Minutes processed[/]", f"[dim]{stats.get('current_minute', 0)}[/]")
+        t.add_row("[dim]Avg buy vol[/]", f"[dim]{stats.get('avg_buy_vol', 0):.4f}[/]")
+        t.add_row("[dim]Avg sell vol[/]", f"[dim]{stats.get('avg_sell_vol', 0):.4f}[/]")
+        t.add_row("", "")
+
+    # Short liquidation zones (resistance - where shorts get liquidated)
+    t.add_row("[bold red]SHORT LIQ ZONES[/]", "[bold red](resistance)[/]")
+    if state.pred_liq_shorts_top:
+        for price, strength in state.pred_liq_shorts_top:
+            # Calculate distance from current price
+            if state.btc_price > 0:
+                dist_pct = ((price - state.btc_price) / state.btc_price) * 100
+                t.add_row(
+                    f"  ${price:,.0f} [dim]({dist_pct:+.2f}%)[/]",
+                    f"[red]{strength:.2f}[/]"
+                )
+            else:
+                t.add_row(f"  ${price:,.0f}", f"[red]{strength:.2f}[/]")
+    else:
+        t.add_row("  [dim]No zones yet[/]", "[dim]waiting...[/]")
+
+    t.add_row("", "")
+
+    # Long liquidation zones (support - where longs get liquidated)
+    t.add_row("[bold green]LONG LIQ ZONES[/]", "[bold green](support)[/]")
+    if state.pred_liq_longs_top:
+        for price, strength in state.pred_liq_longs_top:
+            # Calculate distance from current price
+            if state.btc_price > 0:
+                dist_pct = ((price - state.btc_price) / state.btc_price) * 100
+                t.add_row(
+                    f"  ${price:,.0f} [dim]({dist_pct:+.2f}%)[/]",
+                    f"[green]{strength:.2f}[/]"
+                )
+            else:
+                t.add_row(f"  ${price:,.0f}", f"[green]{strength:.2f}[/]")
+    else:
+        t.add_row("  [dim]No zones yet[/]", "[dim]waiting...[/]")
+
+    t.add_row("", "")
+    t.add_row("[dim]Zones: L={} S={}[/]".format(
+        stats.get('long_zones_count', 0) if stats else 0,
+        stats.get('short_zones_count', 0) if stats else 0
+    ), "")
+
+    layout["metrics"]["col4"]["stress_zones"].update(
+        Panel(t, title="[bold yellow]STRESS ZONES[/]", border_style="yellow")
+    )
 
     # Footer
     total_msgs = sum(state.msg_counts.values())
