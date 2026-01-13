@@ -9,6 +9,7 @@ Uses per-symbol leverage ladders with weights for realistic liquidation zone est
 
 import math
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
@@ -16,8 +17,30 @@ from typing import Dict, List, Tuple, Optional
 from leverage_config import get_leverage_config, get_weighted_ladder, LeverageConfig
 
 # Configure logging for debug output
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def setup_debug_logging(log_file: str = None):
+    """
+    Setup debug logging, optionally to a file.
+
+    Args:
+        log_file: Path to log file. If None, logs to stderr.
+    """
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+
+    if log_file:
+        # Log to file
+        handler = logging.FileHandler(log_file, mode='w')
+    else:
+        # Log to stderr
+        handler = logging.StreamHandler()
+
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return log_file
 
 
 @dataclass
@@ -72,7 +95,8 @@ class LiquidationStressEngine:
         fade: float = DEFAULT_FADE,
         log_scale: bool = LOG_SCALE,
         debug_symbol: str = "BTC",
-        debug_enabled: bool = False
+        debug_enabled: bool = False,
+        debug_log_file: str = None
     ):
         self.steps = steps
         self.vol_length = vol_length
@@ -81,13 +105,16 @@ class LiquidationStressEngine:
         self.log_scale = log_scale
         self.debug_symbol = debug_symbol
         self.debug_enabled = debug_enabled
+        self.debug_log_file = debug_log_file
 
         # Per-symbol state
         self.symbols: Dict[str, SymbolState] = {}
 
-        # Log initialization
+        # Setup debug logging
         if self.debug_enabled:
-            logger.setLevel(logging.DEBUG)
+            log_path = setup_debug_logging(debug_log_file)
+            if log_path:
+                logger.debug(f"Debug logging to file: {log_path}")
             logger.debug(f"LiquidationStressEngine initialized with debug_symbol={debug_symbol}")
 
     def _get_or_create_state(self, symbol: str) -> SymbolState:

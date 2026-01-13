@@ -124,12 +124,15 @@ class FullMetricsProcessor:
         self.prices_this_minute: List[float] = []
 
         # Liquidation stress zone predictor
+        # Set debug_enabled=True and debug_log_file to see detailed output
         self.liq_engine = LiquidationStressEngine(
             steps=20.0,        # $20 price buckets for BTC
             vol_length=50,     # 50-minute SMA for volume normalization
             buffer=0.002,      # 0.2% buffer
             fade=0.97,         # Decay factor
-            debug_symbol="BTC"
+            debug_symbol="BTC",
+            debug_enabled=True,                    # Enable debug output
+            debug_log_file="liq_engine_debug.log"  # Log to file (tail -f to watch)
         )
 
     def process_message(self, msg_str: str):
