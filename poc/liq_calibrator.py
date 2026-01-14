@@ -71,6 +71,9 @@ class CalibrationStats:
     distance_directions: List[float] = field(default_factory=list)  # positive = predicted farther
     # Miss distances in buckets for tolerance tuning
     miss_distances: List[float] = field(default_factory=list)
+    # Per-side offset tracking (implied_miss_usd values)
+    long_offsets: List[float] = field(default_factory=list)
+    short_offsets: List[float] = field(default_factory=list)
 
 
 class LiquidationCalibrator:
@@ -144,6 +147,11 @@ class LiquidationCalibrator:
         self.current_weights: List[float] = []
         self.current_buffer: float = 0.002
 
+        # Learned directional offsets (applied to implied levels)
+        # Positive = actual liquidations happen above implied level
+        self.long_offset_usd: float = 0.0
+        self.short_offset_usd: float = 0.0
+
         # Tracking
         self.last_calibration_minute: int = 0
         self.calibration_count: int = 0
@@ -182,9 +190,12 @@ class LiquidationCalibrator:
             self.current_buffer = data.get('buffer', 0.002)
             self.hit_bucket_tolerance = data.get('tolerance', self.hit_bucket_tolerance)
             self.calibration_count = data.get('calibration_count', 0)
+            self.long_offset_usd = data.get('long_offset_usd', 0.0)
+            self.short_offset_usd = data.get('short_offset_usd', 0.0)
 
             logger.info(f"Loaded weights from {self.weights_file}")
             logger.info(f"  Calibration count: {self.calibration_count}")
+            logger.info(f"  Offsets: long={self.long_offset_usd:.1f}, short={self.short_offset_usd:.1f}")
             return True
 
         except Exception as e:
@@ -203,6 +214,8 @@ class LiquidationCalibrator:
                 'weights': self.current_weights,
                 'buffer': self.current_buffer,
                 'tolerance': self.hit_bucket_tolerance,
+                'long_offset_usd': round(self.long_offset_usd, 2),
+                'short_offset_usd': round(self.short_offset_usd, 2),
                 'calibration_count': self.calibration_count,
                 'saved_at': datetime.now().isoformat(),
                 'weights_by_leverage': {
@@ -364,7 +377,7 @@ class LiquidationCalibrator:
             if min_distance < float('inf'):
                 self.stats.miss_distances.append(min_distance)
 
-        # Attribute to leverage level
+        # Attribute to leverage level and calculate implied miss
         attributed_leverage = self._attribute_to_leverage(event, snapshot)
         if attributed_leverage:
             if attributed_leverage not in self.stats.leverage_total_count:
@@ -377,6 +390,22 @@ class LiquidationCalibrator:
 
             if is_hit:
                 self.stats.leverage_hit_count[attributed_leverage] += 1
+
+            # Calculate implied miss for offset tracking
+            offset = (1.0 / attributed_leverage) + snapshot.buffer + (0.01 / attributed_leverage)
+            if event.side == "long":
+                # Apply current offset correction
+                nearest_implied = snapshot.src * (1 - offset) + self.long_offset_usd
+            else:
+                nearest_implied = snapshot.src * (1 + offset) + self.short_offset_usd
+
+            implied_miss = event.price - nearest_implied
+
+            # Track per-side offsets for calibration
+            if event.side == "long":
+                self.stats.long_offsets.append(implied_miss)
+            else:
+                self.stats.short_offsets.append(implied_miss)
 
         # Track direction for buffer tuning
         nearest_pred = None
@@ -506,17 +535,35 @@ class LiquidationCalibrator:
             new_tolerance = max(self.min_tolerance, min(self.max_tolerance, new_tolerance))
             self.hit_bucket_tolerance = new_tolerance
 
+        # Offset tuning - learn directional bias per side
+        old_long_offset = self.long_offset_usd
+        old_short_offset = self.short_offset_usd
+        offset_lr = 0.3  # How quickly to adjust offsets
+
+        if len(self.stats.long_offsets) >= 3:
+            mean_long_miss = sum(self.stats.long_offsets) / len(self.stats.long_offsets)
+            # Smooth update: move toward mean miss
+            self.long_offset_usd += offset_lr * mean_long_miss
+
+        if len(self.stats.short_offsets) >= 3:
+            mean_short_miss = sum(self.stats.short_offsets) / len(self.stats.short_offsets)
+            # Smooth update: move toward mean miss
+            self.short_offset_usd += offset_lr * mean_short_miss
+
         # Log calibration
         self._log_calibration(
             minute_key, hit_rate, avg_hit_strength, avg_miss_distance,
             old_weights, new_weights, old_buffer, new_buffer,
-            old_tolerance, new_tolerance, snapshot
+            old_tolerance, new_tolerance,
+            old_long_offset, self.long_offset_usd,
+            old_short_offset, self.short_offset_usd,
+            snapshot
         )
 
         # Print debug line
-        weights_str = " ".join(f"{l}x={w:.3f}" for l, w in zip(self.current_ladder, new_weights))
-        print(f"CALIB {self.symbol} hit_rate={hit_rate:.2f} miss_buckets={avg_miss_distance:.1f} "
-              f"events={self.stats.total_events} tol={new_tolerance} buffer={new_buffer:.4f}")
+        print(f"CALIB {self.symbol} hit={hit_rate:.0%} events={self.stats.total_events} "
+              f"tol={new_tolerance} buf={new_buffer:.4f} "
+              f"long_off={self.long_offset_usd:+.0f} short_off={self.short_offset_usd:+.0f}")
 
         # Reset stats for next window
         self.stats = CalibrationStats()
@@ -556,6 +603,10 @@ class LiquidationCalibrator:
         new_buffer: float,
         old_tolerance: int,
         new_tolerance: int,
+        old_long_offset: float,
+        new_long_offset: float,
+        old_short_offset: float,
+        new_short_offset: float,
         snapshot: MinuteSnapshot
     ) -> None:
         """Write calibration event to JSONL log."""
@@ -590,6 +641,10 @@ class LiquidationCalibrator:
             'new_buffer': round(new_buffer, 5),
             'old_tolerance': old_tolerance,
             'new_tolerance': new_tolerance,
+            'old_long_offset': round(old_long_offset, 2),
+            'new_long_offset': round(new_long_offset, 2),
+            'old_short_offset': round(old_short_offset, 2),
+            'new_short_offset': round(new_short_offset, 2),
             'src_price': round(snapshot.src, 2),
             'top_long_zones': [[p, round(s, 3)] for p, s in top_longs],
             'top_short_zones': [[p, round(s, 3)] for p, s in top_shorts]
@@ -617,8 +672,13 @@ class LiquidationCalibrator:
         top_zones = sorted(pred_zones.items(), key=lambda x: x[1], reverse=True)[:5]
 
         # Calculate implied levels for all leverages and find nearest
+        # Apply learned offset correction per side
+        side_offset = self.long_offset_usd if event.side == "long" else self.short_offset_usd
+
         implied_levels = {}
+        implied_levels_corrected = {}
         nearest_implied = None
+        nearest_implied_corrected = None
         nearest_implied_lev = None
         min_implied_distance = float('inf')
 
@@ -628,17 +688,21 @@ class LiquidationCalibrator:
                 implied = snapshot.src * (1 - offset)
             else:
                 implied = snapshot.src * (1 + offset)
-            implied_levels[str(lev)] = round(implied, 2)
 
-            # Track nearest implied level to event price
-            dist = abs(implied - event.price)
+            implied_corrected = implied + side_offset
+            implied_levels[str(lev)] = round(implied, 2)
+            implied_levels_corrected[str(lev)] = round(implied_corrected, 2)
+
+            # Track nearest corrected implied level to event price
+            dist = abs(implied_corrected - event.price)
             if dist < min_implied_distance:
                 min_implied_distance = dist
                 nearest_implied = implied
+                nearest_implied_corrected = implied_corrected
                 nearest_implied_lev = lev
 
-        # Calculate how far off the nearest implied is (in price terms)
-        implied_miss_usd = round(event.price - nearest_implied, 2) if nearest_implied else None
+        # Calculate how far off the corrected implied is (in price terms)
+        implied_miss_usd = round(event.price - nearest_implied_corrected, 2) if nearest_implied_corrected else None
 
         log_entry = {
             'type': 'event',
@@ -652,11 +716,14 @@ class LiquidationCalibrator:
             'is_hit': is_hit,
             'hit_strength': round(hit_strength, 4) if is_hit else None,
             'miss_distance_buckets': round(min_distance, 2) if not is_hit else None,
-            'nearest_implied': round(nearest_implied, 2) if nearest_implied else None,
+            'nearest_implied_raw': round(nearest_implied, 2) if nearest_implied else None,
+            'nearest_implied_corrected': round(nearest_implied_corrected, 2) if nearest_implied_corrected else None,
             'nearest_implied_leverage': nearest_implied_lev,
             'implied_miss_usd': implied_miss_usd,
+            'side_offset_applied': round(side_offset, 2),
             'attributed_leverage': attributed_leverage,
-            'implied_levels_by_leverage': implied_levels,
+            'implied_levels_raw': implied_levels,
+            'implied_levels_corrected': implied_levels_corrected,
             'top_predicted_zones': [[round(p, 2), round(s, 3)] for p, s in top_zones],
             'current_weights': {
                 str(l): round(w, 4)
