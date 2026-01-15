@@ -41,6 +41,16 @@ SOFT_ATTRIBUTION_CONFIG = {
     "SOL": {"tau_usd": 0.6, "delta_usd": 0.35},
 }
 
+# Distance band thresholds (as fraction of src_price)
+# NEAR: dist_pct <= 0.010 (1%)
+# MID:  0.010 < dist_pct <= 0.025 (1-2.5%)
+# FAR:  dist_pct > 0.025 (>2.5%)
+DIST_BAND_NEAR = 0.010
+DIST_BAND_MID = 0.025
+
+# Approach gating: predicted zone must have been approached within this % to be judged
+APPROACH_PCT = 0.0075  # 0.75%
+
 
 @dataclass
 class LiquidationEvent:
@@ -88,6 +98,14 @@ class CalibrationStats:
     # Per-side offset tracking (implied_miss_usd values)
     long_offsets: List[float] = field(default_factory=list)
     short_offsets: List[float] = field(default_factory=list)
+    # Distance band counts (NEAR/MID/FAR)
+    band_counts: Dict[str, int] = field(default_factory=lambda: {"NEAR": 0, "MID": 0, "FAR": 0})
+    # Window price range for approach gating
+    window_high: float = 0.0
+    window_low: float = float('inf')
+    # Zone judgment stats
+    zones_judged: int = 0
+    zones_unreached: int = 0
 
 
 class LiquidationCalibrator:
@@ -354,6 +372,25 @@ class LiquidationCalibrator:
         if not snapshot:
             return
 
+        # === DISTANCE BAND COMPUTATION ===
+        dist_pct = abs(event.price - snapshot.src) / snapshot.src if snapshot.src > 0 else 0.0
+        if dist_pct <= DIST_BAND_NEAR:
+            band = "NEAR"
+        elif dist_pct <= DIST_BAND_MID:
+            band = "MID"
+        else:
+            band = "FAR"
+
+        # Track band counts
+        self.stats.band_counts[band] += 1
+
+        # Update window high/low for approach gating
+        self.stats.window_high = max(self.stats.window_high, event.price)
+        self.stats.window_low = min(self.stats.window_low, event.price)
+
+        # Determine if this event should update calibration (NEAR + MID only)
+        updates_calibration = band in ("NEAR", "MID")
+
         # Determine which zones to check based on event side
         # Long liquidation = longs got stopped = check pred_longs
         # Short liquidation = shorts got stopped = check pred_shorts
@@ -379,7 +416,7 @@ class LiquidationCalibrator:
             if distance_buckets < min_distance:
                 min_distance = distance_buckets
 
-        # Update binary stats (for logging/monitoring)
+        # Update binary stats (for logging/monitoring) - always count
         self.stats.total_events += 1
         if is_hit:
             self.stats.hits += 1
@@ -387,8 +424,8 @@ class LiquidationCalibrator:
         else:
             self.stats.misses += 1
             self.stats.total_miss_distance += min_distance
-            # Track miss distance for tolerance tuning
-            if min_distance < float('inf'):
+            # Track miss distance for tolerance tuning (only if updates calibration)
+            if updates_calibration and min_distance < float('inf'):
                 self.stats.miss_distances.append(min_distance)
 
         # === SOFT ATTRIBUTION ===
@@ -426,20 +463,22 @@ class LiquidationCalibrator:
             for lev in snapshot.ladder:
                 responsibilities[lev] = 1.0 / len(snapshot.ladder)
 
-        # Update soft stats: totals[L] += r(L), hits[L] += r(L) * exp(-d(L)/delta_usd)
-        for lev in snapshot.ladder:
-            r_L = responsibilities[lev]
-            d_L = distances[lev]
-            hit_contrib = r_L * math.exp(-d_L / delta_usd)
+        # Only update soft stats for NEAR and MID events (not FAR)
+        if updates_calibration:
+            # Update soft stats: totals[L] += r(L), hits[L] += r(L) * exp(-d(L)/delta_usd)
+            for lev in snapshot.ladder:
+                r_L = responsibilities[lev]
+                d_L = distances[lev]
+                hit_contrib = r_L * math.exp(-d_L / delta_usd)
 
-            if lev not in self.stats.leverage_totals:
-                self.stats.leverage_totals[lev] = 0.0
-                self.stats.leverage_hits[lev] = 0.0
-                self.stats.leverage_notional[lev] = 0.0
+                if lev not in self.stats.leverage_totals:
+                    self.stats.leverage_totals[lev] = 0.0
+                    self.stats.leverage_hits[lev] = 0.0
+                    self.stats.leverage_notional[lev] = 0.0
 
-            self.stats.leverage_totals[lev] += r_L
-            self.stats.leverage_hits[lev] += hit_contrib
-            self.stats.leverage_notional[lev] += r_L * event.notional
+                self.stats.leverage_totals[lev] += r_L
+                self.stats.leverage_hits[lev] += hit_contrib
+                self.stats.leverage_notional[lev] += r_L * event.notional
 
         # Find the leverage with highest responsibility for offset tracking
         best_lev = max(responsibilities.keys(), key=lambda l: responsibilities[l])
@@ -451,26 +490,28 @@ class LiquidationCalibrator:
 
         implied_miss = event.price - nearest_implied
 
-        # Track per-side offsets for calibration
-        if event.side == "long":
-            self.stats.long_offsets.append(implied_miss)
-        else:
-            self.stats.short_offsets.append(implied_miss)
+        # Track per-side offsets for calibration (only if updates calibration)
+        if updates_calibration:
+            if event.side == "long":
+                self.stats.long_offsets.append(implied_miss)
+            else:
+                self.stats.short_offsets.append(implied_miss)
 
-        # Track direction for buffer tuning
+        # Track direction for buffer tuning (only if updates calibration)
         nearest_pred = None
         if pred_zones:
             # Find nearest predicted level
             nearest_pred = min(pred_zones.keys(), key=lambda p: abs(p - event.price))
-            # Positive = predicted level is farther from current price than actual event
-            direction = abs(nearest_pred - snapshot.src) - abs(event.price - snapshot.src)
-            self.stats.distance_directions.append(direction)
+            if updates_calibration:
+                # Positive = predicted level is farther from current price than actual event
+                direction = abs(nearest_pred - snapshot.src) - abs(event.price - snapshot.src)
+                self.stats.distance_directions.append(direction)
 
         # Log individual event for analysis (with soft attribution info)
         if self.log_events and self.log_fh:
             self._log_event(event, snapshot, pred_zones, is_hit, hit_strength,
                            min_distance, best_lev, nearest_pred,
-                           responsibilities, distances)
+                           responsibilities, distances, dist_pct, band, updates_calibration)
 
     def _attribute_to_leverage(self, event: LiquidationEvent, snapshot: MinuteSnapshot) -> Optional[int]:
         """
@@ -600,6 +641,30 @@ class LiquidationCalibrator:
             # Smooth update: move toward mean miss
             self.short_offset_usd += offset_lr * mean_short_miss
 
+        # === APPROACH GATING FOR ZONES ===
+        # Determine which predicted zones were "approachable" during this window
+        # A zone Z is approachable if price came within APPROACH_PCT of Z
+        # Using window high/low as approximation of price path
+        zones_judged = 0
+        zones_unreached = 0
+
+        if self.stats.window_high > 0 and self.stats.window_low < float('inf'):
+            # Define the approachable range
+            approach_low = self.stats.window_low * (1 - APPROACH_PCT)
+            approach_high = self.stats.window_high * (1 + APPROACH_PCT)
+
+            # Check all predicted zones from current snapshot
+            all_zones = list(snapshot.pred_longs.keys()) + list(snapshot.pred_shorts.keys())
+            for zone_price in all_zones:
+                if approach_low <= zone_price <= approach_high:
+                    zones_judged += 1
+                else:
+                    zones_unreached += 1
+
+        # Store in stats for logging
+        self.stats.zones_judged = zones_judged
+        self.stats.zones_unreached = zones_unreached
+
         # Log calibration
         self._log_calibration(
             minute_key, hit_rate, avg_hit_strength, avg_miss_distance,
@@ -685,6 +750,13 @@ class LiquidationCalibrator:
                 }
                 for lev in self.current_ladder
             },
+            # Distance band counts
+            'band_counts': self.stats.band_counts.copy(),
+            # Zone judgment stats
+            'zones_judged': self.stats.zones_judged,
+            'zones_unreached': self.stats.zones_unreached,
+            'window_high': round(self.stats.window_high, 2) if self.stats.window_high > 0 else None,
+            'window_low': round(self.stats.window_low, 2) if self.stats.window_low < float('inf') else None,
             'old_weights': {str(l): round(w, 4) for l, w in zip(self.current_ladder, old_weights)},
             'new_weights': {str(l): round(w, 4) for l, w in zip(self.current_ladder, new_weights)},
             'old_buffer': round(old_buffer, 5),
@@ -714,7 +786,10 @@ class LiquidationCalibrator:
         attributed_leverage: Optional[int],
         nearest_pred: Optional[float],
         responsibilities: Dict[int, float] = None,
-        distances: Dict[int, float] = None
+        distances: Dict[int, float] = None,
+        dist_pct: float = None,
+        band: str = None,
+        updates_calibration: bool = None
     ) -> None:
         """Log individual liquidation event with predicted zones and soft attribution for analysis."""
         if not self.log_fh:
@@ -775,6 +850,10 @@ class LiquidationCalibrator:
             'side': event.side,
             'event_price': round(event.price, 2),
             'src_price': round(snapshot.src, 2),
+            # Distance band info
+            'dist_pct': round(dist_pct, 6) if dist_pct is not None else None,
+            'band': band,
+            'updates_calibration': updates_calibration,
             'event_qty': round(event.qty, 6),
             'event_notional': round(event.notional, 2),
             'is_hit': is_hit,
