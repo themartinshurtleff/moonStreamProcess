@@ -43,9 +43,12 @@ class LeverageConfig:
 # - Minimal usage at max leverage (high risk of liquidation)
 # =============================================================================
 
-# BTC perpetual leverage config (Binance max 125x)
-BTC_LEVERAGE_LADDER = [5, 10, 20, 25, 50, 75, 100, 125]
-BTC_LEVERAGE_WEIGHTS = [1.0, 1.0, 0.9, 0.7, 0.35, 0.18, 0.10, 0.07]
+# BTC perpetual leverage config (Binance max 125x, extended to 250x for tighter attribution)
+# Extended to cover dist_pct ~0.4-0.6% regime which requires 200x-250x
+BTC_LEVERAGE_LADDER = [5, 10, 20, 25, 50, 75, 100, 125, 150, 200, 250]
+# Initial weights: lower for ultra-high leverage (150x, 200x, 250x)
+# Redistribute mass from 75x/100x/125x to cover new levels with mild decay
+BTC_LEVERAGE_WEIGHTS = [1.0, 1.0, 0.9, 0.7, 0.35, 0.14, 0.08, 0.05, 0.03, 0.015, 0.008]
 
 # ETH perpetual leverage config (Binance max 125x)
 ETH_LEVERAGE_LADDER = [5, 10, 20, 25, 50, 75, 100, 125]

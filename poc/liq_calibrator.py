@@ -93,6 +93,14 @@ MID_LEV_THRESHOLD = 25  # Leverages <= 25x are considered "mid/low"
 # Debug logging for unreached zone penalties (top 10 per cycle)
 DEBUG_UNREACHED_ZONES = True  # Set to False to disable per-zone penalty logging
 
+# === PHASE 3: PERCENT-BASED ADAPTIVE BIAS ===
+# EMA update rate for bias correction (slow, reversible)
+BIAS_ETA = 0.05
+# Maximum bias cap (±0.30% of price)
+BIAS_CAP = 0.003
+# Minimum samples required to update bias per cycle
+MIN_BIAS_SAMPLES = 10
+
 # Epsilon for numerical stability
 EPS = 1e-9
 
@@ -126,6 +134,9 @@ class LiquidationEvent:
     qty: float
     notional: float    # price * qty
     minute_key: int    # minute timestamp for grouping
+    # Event-time reference price (Phase 1): priority markPrice > mid > last > ohlc4
+    event_src_price: float = 0.0  # Will be set from best available price
+    src_source: str = "fallback"  # One of: "markPrice", "mid", "last", "fallback_ohlc4"
 
 
 @dataclass
@@ -168,9 +179,15 @@ class CalibrationStats:
     distance_directions: List[float] = field(default_factory=list)  # positive = predicted farther
     # Miss distances in buckets for tolerance tuning
     miss_distances: List[float] = field(default_factory=list)
-    # Per-side offset tracking (implied_miss_usd values)
+    # Per-side offset tracking (implied_miss_usd values) - DEPRECATED, kept for backward compat
     long_offsets: List[float] = field(default_factory=list)
     short_offsets: List[float] = field(default_factory=list)
+    # Phase 3: Per-side PERCENT miss tracking for adaptive bias
+    # miss_pct = (event_price - implied_corrected) / event_src_price
+    long_miss_pct: List[float] = field(default_factory=list)
+    short_miss_pct: List[float] = field(default_factory=list)
+    # Attributed leverage histogram for cycle summary
+    attributed_leverage_counts: Dict[int, int] = field(default_factory=dict)
     # Distance band counts (NEAR/MID/FAR)
     band_counts: Dict[str, int] = field(default_factory=lambda: {"NEAR": 0, "MID": 0, "FAR": 0})
     # Window price range for approach gating
@@ -257,10 +274,15 @@ class LiquidationCalibrator:
         self.current_weights: List[float] = []
         self.current_buffer: float = 0.002
 
-        # Learned directional offsets (applied to implied levels)
+        # Learned directional offsets (applied to implied levels) - DEPRECATED
         # Positive = actual liquidations happen above implied level
         self.long_offset_usd: float = 0.0
         self.short_offset_usd: float = 0.0
+
+        # Phase 3: Percent-based adaptive bias (replaces USD offsets)
+        # bias_pct is applied as: implied_corrected = implied_raw + bias_pct * event_src_price
+        self.bias_pct_long: float = 0.0
+        self.bias_pct_short: float = 0.0
 
         # Tracking
         self.last_calibration_minute: int = 0
@@ -308,10 +330,13 @@ class LiquidationCalibrator:
             self.calibration_count = data.get('calibration_count', 0)
             self.long_offset_usd = data.get('long_offset_usd', 0.0)
             self.short_offset_usd = data.get('short_offset_usd', 0.0)
+            # Phase 3: Load percent-based bias
+            self.bias_pct_long = data.get('bias_pct_long', 0.0)
+            self.bias_pct_short = data.get('bias_pct_short', 0.0)
 
             logger.info(f"Loaded weights from {self.weights_file}")
             logger.info(f"  Calibration count: {self.calibration_count}")
-            logger.info(f"  Offsets: long={self.long_offset_usd:.1f}, short={self.short_offset_usd:.1f}")
+            logger.info(f"  Bias pct: long={self.bias_pct_long:.5f}, short={self.bias_pct_short:.5f}")
             return True
 
         except Exception as e:
@@ -332,6 +357,9 @@ class LiquidationCalibrator:
                 'tolerance': self.hit_bucket_tolerance,
                 'long_offset_usd': round(self.long_offset_usd, 2),
                 'short_offset_usd': round(self.short_offset_usd, 2),
+                # Phase 3: Percent-based bias
+                'bias_pct_long': round(self.bias_pct_long, 6),
+                'bias_pct_short': round(self.bias_pct_short, 6),
                 'calibration_count': self.calibration_count,
                 'saved_at': datetime.now().isoformat(),
                 'weights_by_leverage': {
@@ -356,18 +384,46 @@ class LiquidationCalibrator:
 
         Args:
             event_data: Dict with keys: timestamp, symbol, side, price, qty
+                Optional event-time src keys (Phase 1):
+                - mark_price: Mark price at event time (highest priority)
+                - mid_price: Orderbook midpoint at event time
+                - last_price: Last trade price at event time
         """
         with self.lock:
             try:
+                event_price = float(event_data.get('price', 0))
+
+                # Phase 1: Determine event-time src price with priority order
+                # Priority: markPrice > mid > last > fallback to minute ohlc4
+                event_src_price = 0.0
+                src_source = "fallback_ohlc4"
+
+                mark_price = float(event_data.get('mark_price', 0))
+                mid_price = float(event_data.get('mid_price', 0))
+                last_price = float(event_data.get('last_price', 0))
+
+                if mark_price > 0:
+                    event_src_price = mark_price
+                    src_source = "markPrice"
+                elif mid_price > 0:
+                    event_src_price = mid_price
+                    src_source = "mid"
+                elif last_price > 0:
+                    event_src_price = last_price
+                    src_source = "last"
+                # else: will use snapshot.src (ohlc4) as fallback in _process_event
+
                 # Parse event
                 event = LiquidationEvent(
                     timestamp=event_data.get('timestamp', time.time()),
                     symbol=event_data.get('symbol', self.symbol),
                     side=event_data.get('side', 'unknown'),
-                    price=float(event_data.get('price', 0)),
+                    price=event_price,
                     qty=float(event_data.get('qty', 0)),
-                    notional=float(event_data.get('price', 0)) * float(event_data.get('qty', 0)),
-                    minute_key=int(event_data.get('timestamp', time.time()) // 60)
+                    notional=event_price * float(event_data.get('qty', 0)),
+                    minute_key=int(event_data.get('timestamp', time.time()) // 60),
+                    event_src_price=event_src_price,
+                    src_source=src_source
                 )
 
                 if event.price <= 0 or event.symbol != self.symbol:
@@ -511,17 +567,31 @@ class LiquidationCalibrator:
             return None
 
     def _process_event(self, event: LiquidationEvent) -> None:
-        """Process a single liquidation event for stats using soft attribution."""
+        """
+        Process a single liquidation event for stats using soft attribution.
+
+        Phase 1: Uses event-time src_price (markPrice/mid/last) instead of minute ohlc4
+        for implied level calculations and responsibility distribution.
+        """
         # Find the snapshot for this event's minute (or closest prior)
         snapshot = self._get_snapshot_for_event(event)
         if not snapshot:
             return
 
-        # === DISTANCE BAND COMPUTATION ===
-        dist_pct = abs(event.price - snapshot.src) / snapshot.src if snapshot.src > 0 else 0.0
-        if dist_pct <= DIST_BAND_NEAR:
+        # === PHASE 1: DETERMINE EVENT-TIME SRC ===
+        # Use event.event_src_price if available, else fall back to snapshot.src (ohlc4)
+        if event.event_src_price > 0:
+            src_used = event.event_src_price
+            src_source = event.src_source
+        else:
+            src_used = snapshot.src
+            src_source = "fallback_ohlc4"
+
+        # === DISTANCE BAND COMPUTATION (using event-time src) ===
+        dist_pct_event = abs(event.price - src_used) / src_used if src_used > 0 else 0.0
+        if dist_pct_event <= DIST_BAND_NEAR:
             band = "NEAR"
-        elif dist_pct <= DIST_BAND_MID:
+        elif dist_pct_event <= DIST_BAND_MID:
             band = "MID"
         else:
             band = "FAR"
@@ -537,8 +607,6 @@ class LiquidationCalibrator:
         updates_calibration = band in ("NEAR", "MID")
 
         # Determine which zones to check based on event side
-        # Long liquidation = longs got stopped = check pred_longs
-        # Short liquidation = shorts got stopped = check pred_shorts
         if event.side == "long":
             pred_zones = snapshot.pred_longs
         else:
@@ -569,48 +637,72 @@ class LiquidationCalibrator:
         else:
             self.stats.misses += 1
             self.stats.total_miss_distance += min_distance
-            # Track miss distance for tolerance tuning (only if updates calibration)
             if updates_calibration and min_distance < float('inf'):
                 self.stats.miss_distances.append(min_distance)
 
-        # === SOFT ATTRIBUTION ===
-        # Get soft attribution config for this symbol
+        # === SOFT ATTRIBUTION (using event-time src) ===
         soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
         tau_usd = soft_config["tau_usd"]
         delta_usd = soft_config["delta_usd"]
 
-        # Compute implied levels and distances for each leverage
-        implied_levels = {}  # lev -> implied_price
-        distances = {}       # lev -> d(L) in USD
-        responsibilities = {}  # lev -> r(L) normalized
+        # Compute implied levels using EVENT-TIME src (not minute ohlc4)
+        implied_levels_raw = {}     # lev -> implied_price (raw, no bias)
+        implied_levels_corrected = {}  # lev -> implied_price (with bias correction)
+        distances = {}              # lev -> d(L) in USD (from raw implied)
+        distances_corrected = {}    # lev -> d(L) in USD (from corrected implied)
+        responsibilities = {}       # lev -> r(L) normalized
+
+        # Get side-specific bias
+        bias_pct = self.bias_pct_long if event.side == "long" else self.bias_pct_short
 
         for lev in snapshot.ladder:
             offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
             if event.side == "long":
-                implied = snapshot.src * (1 - offset)
+                implied_raw = src_used * (1 - offset)
             else:
-                implied = snapshot.src * (1 + offset)
-            implied_levels[lev] = implied
-            distances[lev] = abs(event.price - implied)
+                implied_raw = src_used * (1 + offset)
 
-        # Compute unnormalized responsibilities: r(L) = exp(-d(L)/tau_usd)
+            # Apply percent-based bias correction
+            implied_corrected = implied_raw + bias_pct * src_used
+
+            implied_levels_raw[lev] = implied_raw
+            implied_levels_corrected[lev] = implied_corrected
+            distances[lev] = abs(event.price - implied_raw)
+            distances_corrected[lev] = abs(event.price - implied_corrected)
+
+        # Compute responsibilities using RAW distances (bias is for hit evaluation)
         unnorm_resp = {}
         for lev in snapshot.ladder:
             unnorm_resp[lev] = math.exp(-distances[lev] / tau_usd)
 
-        # Normalize responsibilities
         total_resp = sum(unnorm_resp.values())
         if total_resp > 0:
             for lev in snapshot.ladder:
                 responsibilities[lev] = unnorm_resp[lev] / total_resp
         else:
-            # Fallback: uniform
             for lev in snapshot.ladder:
                 responsibilities[lev] = 1.0 / len(snapshot.ladder)
 
-        # Only update soft stats for NEAR and MID events (not FAR)
+        # Find best leverage (highest responsibility)
+        best_lev = max(responsibilities.keys(), key=lambda l: responsibilities[l])
+
+        # Track attributed leverage histogram
+        if best_lev not in self.stats.attributed_leverage_counts:
+            self.stats.attributed_leverage_counts[best_lev] = 0
+        self.stats.attributed_leverage_counts[best_lev] += 1
+
+        # === PHASE 0: DIAGNOSTIC LOGGING ===
+        # Compute nearest_implied_distance_pct for diagnosis
+        nearest_implied_raw = implied_levels_raw[best_lev]
+        nearest_implied_corrected = implied_levels_corrected[best_lev]
+        nearest_implied_dist_pct = abs(event.price - nearest_implied_raw) / src_used if src_used > 0 else 0.0
+
+        # Compute miss values
+        miss_usd = event.price - nearest_implied_corrected
+        miss_pct = miss_usd / src_used if src_used > 0 else 0.0
+
+        # Only update soft stats for NEAR and MID events
         if updates_calibration:
-            # Update soft stats: totals[L] += r(L), hits[L] += r(L) * exp(-d(L)/delta_usd)
             for lev in snapshot.ladder:
                 r_L = responsibilities[lev]
                 d_L = distances[lev]
@@ -625,38 +717,52 @@ class LiquidationCalibrator:
                 self.stats.leverage_hits[lev] += hit_contrib
                 self.stats.leverage_notional[lev] += r_L * event.notional
 
-        # Find the leverage with highest responsibility for offset tracking
-        best_lev = max(responsibilities.keys(), key=lambda l: responsibilities[l])
-        offset = (1.0 / best_lev) + snapshot.buffer + (0.01 / best_lev)
-        if event.side == "long":
-            nearest_implied = snapshot.src * (1 - offset) + self.long_offset_usd
-        else:
-            nearest_implied = snapshot.src * (1 + offset) + self.short_offset_usd
-
-        implied_miss = event.price - nearest_implied
-
-        # Track per-side offsets for calibration (only if updates calibration)
-        if updates_calibration:
+            # Track miss_pct for Phase 3 adaptive bias (only NEAR + MID)
             if event.side == "long":
-                self.stats.long_offsets.append(implied_miss)
+                self.stats.long_miss_pct.append(miss_pct)
+                self.stats.long_offsets.append(miss_usd)  # Keep USD for backward compat
             else:
-                self.stats.short_offsets.append(implied_miss)
+                self.stats.short_miss_pct.append(miss_pct)
+                self.stats.short_offsets.append(miss_usd)
 
-        # Track direction for buffer tuning (only if updates calibration)
+        # Track direction for buffer tuning
         nearest_pred = None
         if pred_zones:
-            # Find nearest predicted level
             nearest_pred = min(pred_zones.keys(), key=lambda p: abs(p - event.price))
             if updates_calibration:
-                # Positive = predicted level is farther from current price than actual event
-                direction = abs(nearest_pred - snapshot.src) - abs(event.price - snapshot.src)
+                direction = abs(nearest_pred - src_used) - abs(event.price - src_used)
                 self.stats.distance_directions.append(direction)
 
-        # Log individual event for analysis (with soft attribution info)
+        # Log individual event with all Phase 0-4 fields
         if self.log_events and self.log_fh:
-            self._log_event(event, snapshot, pred_zones, is_hit, hit_strength,
-                           min_distance, best_lev, nearest_pred,
-                           responsibilities, distances, dist_pct, band, updates_calibration)
+            self._log_event_v2(
+                event=event,
+                snapshot=snapshot,
+                pred_zones=pred_zones,
+                is_hit=is_hit,
+                hit_strength=hit_strength,
+                min_distance=min_distance,
+                best_lev=best_lev,
+                nearest_pred=nearest_pred,
+                responsibilities=responsibilities,
+                distances=distances,
+                dist_pct_event=dist_pct_event,
+                band=band,
+                updates_calibration=updates_calibration,
+                # Phase 1 fields
+                src_used=src_used,
+                src_source=src_source,
+                # Phase 0 diagnostic fields
+                nearest_implied_raw=nearest_implied_raw,
+                nearest_implied_corrected=nearest_implied_corrected,
+                nearest_implied_dist_pct=nearest_implied_dist_pct,
+                # Phase 3 bias fields
+                miss_pct=miss_pct,
+                miss_usd=miss_usd,
+                bias_pct=bias_pct,
+                implied_levels_raw=implied_levels_raw,
+                implied_levels_corrected=implied_levels_corrected
+            )
 
     def _process_approach_events(self, snapshot: MinuteSnapshot, cache_entry: MinuteCacheEntry) -> None:
         """
@@ -1434,19 +1540,56 @@ class LiquidationCalibrator:
             new_tolerance = max(self.min_tolerance, min(self.max_tolerance, new_tolerance))
             self.hit_bucket_tolerance = new_tolerance
 
-        # Offset tuning - learn directional bias per side
+        # === PHASE 3: PERCENT-BASED ADAPTIVE BIAS UPDATE ===
+        # Update bias_pct_long and bias_pct_short using EMA with robust aggregate
+        old_bias_pct_long = self.bias_pct_long
+        old_bias_pct_short = self.bias_pct_short
+        bias_update_info = {
+            'long_samples': len(self.stats.long_miss_pct),
+            'short_samples': len(self.stats.short_miss_pct),
+            'long_agg_miss_pct': None,
+            'short_agg_miss_pct': None,
+            'long_updated': False,
+            'short_updated': False
+        }
+
+        # Long bias update (only if enough samples)
+        if len(self.stats.long_miss_pct) >= MIN_BIAS_SAMPLES:
+            # Use median as robust aggregate
+            sorted_long = sorted(self.stats.long_miss_pct)
+            median_idx = len(sorted_long) // 2
+            agg_long = sorted_long[median_idx]
+            bias_update_info['long_agg_miss_pct'] = agg_long
+
+            # EMA update with clamping
+            new_bias_long = (1 - BIAS_ETA) * self.bias_pct_long + BIAS_ETA * agg_long
+            self.bias_pct_long = max(-BIAS_CAP, min(BIAS_CAP, new_bias_long))
+            bias_update_info['long_updated'] = True
+
+        # Short bias update (only if enough samples)
+        if len(self.stats.short_miss_pct) >= MIN_BIAS_SAMPLES:
+            # Use median as robust aggregate
+            sorted_short = sorted(self.stats.short_miss_pct)
+            median_idx = len(sorted_short) // 2
+            agg_short = sorted_short[median_idx]
+            bias_update_info['short_agg_miss_pct'] = agg_short
+
+            # EMA update with clamping
+            new_bias_short = (1 - BIAS_ETA) * self.bias_pct_short + BIAS_ETA * agg_short
+            self.bias_pct_short = max(-BIAS_CAP, min(BIAS_CAP, new_bias_short))
+            bias_update_info['short_updated'] = True
+
+        # Keep old USD offset tuning for backward compatibility (deprecated)
         old_long_offset = self.long_offset_usd
         old_short_offset = self.short_offset_usd
-        offset_lr = 0.3  # How quickly to adjust offsets
+        offset_lr = 0.3
 
         if len(self.stats.long_offsets) >= 3:
             mean_long_miss = sum(self.stats.long_offsets) / len(self.stats.long_offsets)
-            # Smooth update: move toward mean miss
             self.long_offset_usd += offset_lr * mean_long_miss
 
         if len(self.stats.short_offsets) >= 3:
             mean_short_miss = sum(self.stats.short_offsets) / len(self.stats.short_offsets)
-            # Smooth update: move toward mean miss
             self.short_offset_usd += offset_lr * mean_short_miss
 
         # === APPROACH GATING FOR ZONES ===
@@ -1473,14 +1616,17 @@ class LiquidationCalibrator:
         self.stats.zones_judged = zones_judged
         self.stats.zones_unreached = zones_unreached
 
-        # Log calibration
+        # Log calibration (with Phase 3/4 fields)
         self._log_calibration(
             minute_key, hit_rate, avg_hit_strength, avg_miss_distance,
             old_weights, new_weights, old_buffer, new_buffer,
             old_tolerance, new_tolerance,
             old_long_offset, self.long_offset_usd,
             old_short_offset, self.short_offset_usd,
-            snapshot
+            snapshot,
+            bias_update_info=bias_update_info,
+            old_bias_pct_long=old_bias_pct_long,
+            old_bias_pct_short=old_bias_pct_short
         )
 
         # === CYCLE SUMMARY ===
@@ -1505,7 +1651,24 @@ class LiquidationCalibrator:
               f"a/f={approach_to_force:.2f} entropy={weight_entropy:.3f} "
               f"hit={hit_rate:.0%} buf={new_buffer:.4f}")
 
-        # Line 2: Unreached penalty stats
+        # Line 2: Phase 3 - Bias pct values
+        long_samples = bias_update_info['long_samples']
+        short_samples = bias_update_info['short_samples']
+        long_agg = bias_update_info['long_agg_miss_pct']
+        short_agg = bias_update_info['short_agg_miss_pct']
+        long_agg_str = f"{long_agg*100:.4f}%" if long_agg is not None else "N/A"
+        short_agg_str = f"{short_agg*100:.4f}%" if short_agg is not None else "N/A"
+        print(f"  BIAS long={self.bias_pct_long*100:.4f}% (n={long_samples},agg={long_agg_str}) "
+              f"short={self.bias_pct_short*100:.4f}% (n={short_samples},agg={short_agg_str})")
+
+        # Line 3: Attributed leverage histogram (Phase 4)
+        lev_counts = self.stats.attributed_leverage_counts
+        if lev_counts:
+            sorted_levs = sorted(lev_counts.items(), key=lambda x: -x[1])[:5]
+            hist_str = ','.join([f"{lev}x:{cnt}" for lev, cnt in sorted_levs])
+            print(f"  LEV_HIST top5=[{hist_str}]")
+
+        # Line 4: Unreached penalty stats
         unreached_count = unreached_penalty_info.get('unreached_zones_count', 0)
         penalty_applied = unreached_penalty_info.get('unreached_penalty_applied_count', 0)
         avg_resp = unreached_penalty_info.get('avg_unreached_resp', 0.0)
@@ -1525,7 +1688,7 @@ class LiquidationCalibrator:
                           f"price={z['zone_price']} origin_src={z['origin_src']} "
                           f"origin_min={z['origin_minute_key']} top3=[{resp_str}]")
 
-        # Line 3: Floor enforcement stats (only if triggered)
+        # Line 5: Floor enforcement stats (only if triggered)
         if floor_info.get('floor_triggered', False):
             drained_str = ','.join([f"{d['leverage']}x" for d in floor_info.get('drained_leverages', [])])
             print(f"  FLOOR triggered mid_mass={floor_info['mid_mass_before']:.3f}->"
@@ -1577,9 +1740,13 @@ class LiquidationCalibrator:
         new_long_offset: float,
         old_short_offset: float,
         new_short_offset: float,
-        snapshot: MinuteSnapshot
+        snapshot: MinuteSnapshot,
+        # Phase 3: Bias update info
+        bias_update_info: Dict = None,
+        old_bias_pct_long: float = 0.0,
+        old_bias_pct_short: float = 0.0
     ) -> None:
-        """Write calibration event to JSONL log."""
+        """Write calibration event to JSONL log with Phase 3/4 fields."""
         if not self.log_fh:
             return
 
@@ -1587,7 +1754,11 @@ class LiquidationCalibrator:
         top_longs = sorted(snapshot.pred_longs.items(), key=lambda x: x[1], reverse=True)[:5]
         top_shorts = sorted(snapshot.pred_shorts.items(), key=lambda x: x[1], reverse=True)[:5]
 
+        # Phase 4: Leverage histogram
+        lev_hist = dict(self.stats.attributed_leverage_counts)
+
         log_entry = {
+            'type': 'calibration',
             'timestamp': datetime.now().isoformat(),
             'minute_key': minute_key,
             'symbol': self.symbol,
@@ -1605,6 +1776,8 @@ class LiquidationCalibrator:
                 }
                 for lev in self.current_ladder
             },
+            # Phase 4: Attributed leverage histogram
+            'attributed_leverage_counts': lev_hist,
             # Distance band counts
             'band_counts': self.stats.band_counts.copy(),
             # Approach events (stress-based learning)
@@ -1620,10 +1793,20 @@ class LiquidationCalibrator:
             'new_buffer': round(new_buffer, 5),
             'old_tolerance': old_tolerance,
             'new_tolerance': new_tolerance,
+            # Deprecated USD offsets (kept for backward compat)
             'old_long_offset': round(old_long_offset, 2),
             'new_long_offset': round(new_long_offset, 2),
             'old_short_offset': round(old_short_offset, 2),
             'new_short_offset': round(new_short_offset, 2),
+            # Phase 3: Percent-based bias
+            'old_bias_pct_long': round(old_bias_pct_long, 6),
+            'new_bias_pct_long': round(self.bias_pct_long, 6),
+            'old_bias_pct_short': round(old_bias_pct_short, 6),
+            'new_bias_pct_short': round(self.bias_pct_short, 6),
+            # Phase 3: Bias update details
+            'bias_update_info': bias_update_info or {},
+            # Phase 4: Full ladder (confirm extended levels)
+            'ladder': self.current_ladder,
             'src_price': round(snapshot.src, 2),
             'top_long_zones': [[p, round(s, 3)] for p, s in top_longs],
             'top_short_zones': [[p, round(s, 3)] for p, s in top_shorts]
@@ -1726,6 +1909,110 @@ class LiquidationCalibrator:
             'attributed_leverage': attributed_leverage,
             'implied_levels_raw': implied_levels,
             'implied_levels_corrected': implied_levels_corrected,
+            'top_predicted_zones': [[round(p, 2), round(s, 3)] for p, s in top_zones],
+            'current_weights': {
+                str(l): round(w, 4)
+                for l, w in zip(snapshot.ladder, snapshot.weights)
+            },
+            'current_buffer': round(snapshot.buffer, 5),
+            'hit_bucket_tolerance': self.hit_bucket_tolerance
+        }
+
+        self.log_fh.write(json.dumps(log_entry) + '\n')
+        self.log_fh.flush()
+
+    def _log_event_v2(
+        self,
+        event: LiquidationEvent,
+        snapshot: MinuteSnapshot,
+        pred_zones: Dict[float, float],
+        is_hit: bool,
+        hit_strength: float,
+        min_distance: float,
+        best_lev: int,
+        nearest_pred: Optional[float],
+        responsibilities: Dict[int, float],
+        distances: Dict[int, float],
+        dist_pct_event: float,
+        band: str,
+        updates_calibration: bool,
+        # Phase 1 fields
+        src_used: float,
+        src_source: str,
+        # Phase 0 diagnostic fields
+        nearest_implied_raw: float,
+        nearest_implied_corrected: float,
+        nearest_implied_dist_pct: float,
+        # Phase 3 bias fields
+        miss_pct: float,
+        miss_usd: float,
+        bias_pct: float,
+        implied_levels_raw: Dict[int, float],
+        implied_levels_corrected: Dict[int, float]
+    ) -> None:
+        """
+        Log individual liquidation event with all Phase 0-4 fields.
+
+        Phase 0: Diagnostic fields (dist_pct_event, nearest_implied_dist_pct, src_used, src_source)
+        Phase 1: Event-time src (src_used, src_source)
+        Phase 3: Bias fields (miss_pct, miss_usd, bias_pct)
+        Phase 4: Full verification outputs (ladder, implied_levels_raw, implied_levels_corrected)
+        """
+        if not self.log_fh:
+            return
+
+        # Get top 5 predicted zones for this side
+        top_zones = sorted(pred_zones.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # Build top 3 leverages by responsibility with d(L)
+        top_3_by_responsibility = []
+        sorted_by_resp = sorted(responsibilities.items(), key=lambda x: x[1], reverse=True)[:3]
+        for lev, r_L in sorted_by_resp:
+            d_L = distances.get(lev, 0.0)
+            top_3_by_responsibility.append({
+                'leverage': lev,
+                'responsibility': round(r_L, 4),
+                'distance_usd': round(d_L, 2)
+            })
+
+        log_entry = {
+            'type': 'event',
+            'timestamp': datetime.fromtimestamp(event.timestamp).isoformat(),
+            'symbol': event.symbol,
+            'side': event.side,
+            'event_price': round(event.price, 2),
+            # Phase 1: Event-time src (not minute ohlc4)
+            'event_src_price': round(src_used, 2),
+            'src_source': src_source,
+            'snapshot_src': round(snapshot.src, 2),  # Keep for comparison
+            # Phase 0: Diagnostic dist_pct computed from event_src_price
+            'dist_pct_event': round(dist_pct_event, 6),
+            'nearest_implied_dist_pct': round(nearest_implied_dist_pct, 6),
+            'band': band,
+            'updates_calibration': updates_calibration,
+            'event_qty': round(event.qty, 6),
+            'event_notional': round(event.notional, 2),
+            'is_hit': is_hit,
+            'hit_strength': round(hit_strength, 4) if is_hit else None,
+            'miss_distance_buckets': round(min_distance, 2) if not is_hit else None,
+            # Soft attribution: top 3 leverages by responsibility
+            'top_3_by_responsibility': top_3_by_responsibility,
+            'attributed_leverage': best_lev,
+            # Phase 0/3: Implied levels (raw and corrected)
+            'nearest_implied_leverage_raw': best_lev,
+            'nearest_implied_raw': round(nearest_implied_raw, 2),
+            'nearest_implied_corrected': round(nearest_implied_corrected, 2),
+            # Phase 3: Miss values for bias tracking
+            'miss_pct': round(miss_pct, 6),
+            'miss_usd': round(miss_usd, 2),
+            # Phase 3: Current bias values
+            'bias_pct_long': round(self.bias_pct_long, 6),
+            'bias_pct_short': round(self.bias_pct_short, 6),
+            'bias_pct_applied': round(bias_pct, 6),
+            # Phase 4: Full ladder (to confirm new levels in use)
+            'ladder': snapshot.ladder,
+            'implied_levels_raw': {str(k): round(v, 2) for k, v in implied_levels_raw.items()},
+            'implied_levels_corrected': {str(k): round(v, 2) for k, v in implied_levels_corrected.items()},
             'top_predicted_zones': [[round(p, 2), round(s, 3)] for p, s in top_zones],
             'current_weights': {
                 str(l): round(w, 4)
