@@ -160,11 +160,9 @@ class FullMetricsProcessor:
         # Track if we've applied persisted weights
         self._applied_persisted_weights = False
 
-        # REST poller for OI and trader ratios (proxy-aware)
-        # Set proxy='http://your-proxy:port' if in restricted region
+        # REST poller for OI and trader ratios (direct HTTPS)
         self.rest_poller = BinanceRESTPollerThread(
             symbols=["BTCUSDT"],
-            proxy=None,  # Set to proxy URL if needed
             oi_interval=10.0,      # Poll OI every 10s
             ratio_interval=60.0,   # Poll ratios every 60s
             on_update=self._on_rest_poller_update,

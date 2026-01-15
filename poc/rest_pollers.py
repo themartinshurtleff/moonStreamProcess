@@ -86,13 +86,12 @@ class PollerState:
 class BinanceRESTPoller:
     """
     Async poller for Binance REST endpoints.
-    Handles OI and trader ratios with proxy support.
+    Handles OI and trader ratios with direct HTTPS requests.
     """
 
     def __init__(
         self,
         symbols: List[str] = None,
-        proxy: str = None,
         oi_interval: float = DEFAULT_OI_INTERVAL,
         ratio_interval: float = DEFAULT_RATIO_INTERVAL,
         on_update: Callable[[PollerState], None] = None,
@@ -100,7 +99,6 @@ class BinanceRESTPoller:
         debug: bool = False
     ):
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-        self.proxy = proxy
         self.oi_interval = oi_interval
         self.ratio_interval = ratio_interval
         self.on_update = on_update
@@ -132,16 +130,20 @@ class BinanceRESTPoller:
             print(f"[REST {ts}] {msg}")
 
     async def _request(self, endpoint: str, params: dict = None) -> Optional[dict]:
-        """Make a REST request with error handling."""
+        """Make a direct REST request with error handling."""
         url = f"{BINANCE_FAPI_BASE}{endpoint}"
 
         try:
-            async with self.session.get(url, params=params, proxy=self.proxy) as resp:
+            async with self.session.get(url, params=params) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 elif resp.status in (418, 429):
-                    # Rate limited
-                    self._log(f"Rate limited ({resp.status}): {endpoint}")
+                    # Rate limited - backoff will be applied
+                    self._log(f"Rate limited ({resp.status}): {endpoint}, backing off")
+                    return None
+                elif resp.status in (403, 451):
+                    # Forbidden / unavailable in region
+                    self._log(f"HTTP {resp.status}: {endpoint}, region restricted or forbidden")
                     return None
                 else:
                     self._log(f"HTTP {resp.status}: {endpoint}")
@@ -350,7 +352,7 @@ class BinanceRESTPoller:
                 print(f"  ✓ OI: {oi:,.2f} contracts")
                 results["openInterest"] = True
             else:
-                print(f"  ✗ OI: No data returned (proxy may be required)")
+                print(f"  ✗ OI: No data returned")
                 results["openInterest"] = False
         except Exception as e:
             print(f"  ✗ OI: {e}")
@@ -386,8 +388,7 @@ class BinanceRESTPoller:
         print(f"\nSelf-test: {success_count}/{total} endpoints OK")
 
         if success_count == 0:
-            print("\n⚠️  All endpoints failed. If you're in a restricted region,")
-            print("   set proxy='http://your-proxy:port' to use a Germany proxy.")
+            print("\n⚠️  All endpoints failed. Check network connectivity.")
 
         print("=" * 40 + "\n")
 
@@ -444,7 +445,6 @@ class BinanceRESTPollerThread:
     def __init__(
         self,
         symbols: List[str] = None,
-        proxy: str = None,
         oi_interval: float = DEFAULT_OI_INTERVAL,
         ratio_interval: float = DEFAULT_RATIO_INTERVAL,
         on_update: Callable[[PollerState], None] = None,
@@ -455,7 +455,6 @@ class BinanceRESTPollerThread:
 
         self.poller = BinanceRESTPoller(
             symbols=symbols,
-            proxy=proxy,
             oi_interval=oi_interval,
             ratio_interval=ratio_interval,
             on_update=on_update,
