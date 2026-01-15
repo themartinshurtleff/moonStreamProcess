@@ -26,6 +26,10 @@ BINANCE_FAPI_BASE = "https://fapi.binance.com"
 DEFAULT_OI_INTERVAL = 10  # OI updates frequently
 DEFAULT_RATIO_INTERVAL = 60  # Ratios update every 5min anyway
 
+# Ratio period: try "1m" first, fallback to "5m" if rejected
+RATIO_PERIOD_PRIMARY = "1m"
+RATIO_PERIOD_FALLBACK = "5m"
+
 # Rate limit backoff settings
 INITIAL_BACKOFF = 5
 MAX_BACKOFF = 300  # 5 minutes
@@ -118,6 +122,13 @@ class BinanceRESTPoller:
         }
         self._last_error_time = {}
 
+        # Ratio period with fallback
+        self._ratio_period = RATIO_PERIOD_PRIMARY
+        self._ratio_period_fallback_logged = False
+
+        # Per-minute consolidated log tracking
+        self._last_log_minute: int = -1
+
     def _add_jitter(self, interval: float) -> float:
         """Add ±10% jitter to interval."""
         jitter = interval * JITTER_RANGE
@@ -180,7 +191,7 @@ class BinanceRESTPoller:
         return None
 
     async def poll_ratio(self, symbol: str, ratio_type: str) -> Optional[RatioData]:
-        """Poll trader ratio for a symbol."""
+        """Poll trader ratio for a symbol with period fallback."""
         endpoint_map = {
             "TTA": "/futures/data/topLongShortAccountRatio",
             "TTP": "/futures/data/topLongShortPositionRatio",
@@ -191,11 +202,27 @@ class BinanceRESTPoller:
         if not endpoint:
             return None
 
+        # Try current period
         data = await self._request(endpoint, {
             "symbol": symbol,
-            "period": "5m",
+            "period": self._ratio_period,
             "limit": 1
         })
+
+        # If primary period fails with empty/error, try fallback
+        if (data is None or (isinstance(data, list) and len(data) == 0)) and self._ratio_period == RATIO_PERIOD_PRIMARY:
+            # Try fallback period
+            data = await self._request(endpoint, {
+                "symbol": symbol,
+                "period": RATIO_PERIOD_FALLBACK,
+                "limit": 1
+            })
+            if data and isinstance(data, list) and len(data) > 0:
+                # Fallback worked, switch permanently
+                self._ratio_period = RATIO_PERIOD_FALLBACK
+                if not self._ratio_period_fallback_logged:
+                    self._log(f"Ratio period '{RATIO_PERIOD_PRIMARY}' not supported, using '{RATIO_PERIOD_FALLBACK}'")
+                    self._ratio_period_fallback_logged = True
 
         if data and isinstance(data, list) and len(data) > 0:
             try:
@@ -224,6 +251,8 @@ class BinanceRESTPoller:
         """Update aggregated values from per-symbol data."""
         # Total OI (in USD)
         total_oi = 0.0
+        price_missing = []
+
         for symbol, oi_data in self.state.oi_data.items():
             # Get price from callback if available
             price = 0.0
@@ -238,6 +267,8 @@ class BinanceRESTPoller:
                 oi_usd = oi_data.oi_qty * price
                 oi_data.oi_value = oi_usd
                 total_oi += oi_usd
+            elif oi_data.oi_qty > 0 and price <= 0:
+                price_missing.append(symbol)
             elif oi_data.oi_value > 0:
                 total_oi += oi_data.oi_value
 
@@ -257,6 +288,49 @@ class BinanceRESTPoller:
         self.state.weighted_tta = avg_ratio(self.state.tta_ratio)
         self.state.weighted_ttp = avg_ratio(self.state.ttp_ratio)
         self.state.weighted_gta = avg_ratio(self.state.gta_ratio)
+
+        # Per-minute consolidated log (once per minute)
+        self._log_minute_summary(price_missing)
+
+    def _log_minute_summary(self, price_missing: List[str]):
+        """Log consolidated summary once per minute."""
+        current_minute = datetime.now().minute
+        if current_minute == self._last_log_minute:
+            return
+        self._last_log_minute = current_minute
+
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        for symbol in self.symbols:
+            oi_data = self.state.oi_data.get(symbol)
+            tta = self.state.tta_ratio.get(symbol)
+            ttp = self.state.ttp_ratio.get(symbol)
+            gta = self.state.gta_ratio.get(symbol)
+
+            # OI info
+            if oi_data:
+                oi_usd = oi_data.oi_value
+                oi_qty = oi_data.oi_qty
+                if oi_usd > 0:
+                    oi_str = f"OI=${oi_usd:,.0f}"
+                else:
+                    oi_str = f"OI={oi_qty:,.0f}contracts (price=0)"
+            else:
+                oi_str = "OI=N/A"
+
+            # OI change
+            oi_chg = self.state.oi_change
+            oi_chg_str = f"Δ={oi_chg:+,.0f}" if oi_chg != 0 else ""
+
+            # Ratios
+            tta_str = f"TTA={tta.long_short_ratio:.3f}" if tta else "TTA=N/A"
+            ttp_str = f"TTP={ttp.long_short_ratio:.3f}" if ttp else "TTP=N/A"
+            gta_str = f"GTA={gta.long_short_ratio:.3f}" if gta else "GTA=N/A"
+
+            # Price warning
+            price_warn = " [PRICE=0]" if symbol in price_missing else ""
+
+            print(f"[REST {ts}] {symbol}: {oi_str} {oi_chg_str} | {tta_str} {ttp_str} {gta_str}{price_warn}")
 
     async def _oi_loop(self):
         """OI polling loop."""
