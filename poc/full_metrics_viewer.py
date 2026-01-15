@@ -190,6 +190,8 @@ class FullMetricsProcessor:
                 self._process_liquidations(exchange, data)
             elif obj_type in ["markprice", "funding"]:
                 self._process_funding(exchange, data)
+            elif obj_type in ["oi", "oifunding"]:
+                self._process_oi(exchange, data)
 
             self.state.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._check_minute_rollover()
@@ -344,6 +346,64 @@ class FullMetricsProcessor:
             if fundings:
                 self.state.perp_weighted_funding = sum(fundings) / len(fundings)
 
+    def _process_oi(self, exchange: str, data: dict):
+        """Process open interest data from various exchanges."""
+        oi_value = None
+        source = "unknown"
+
+        # DEBUG: Log raw message (first 200 chars)
+        # import json
+        # print(f"DEBUG OI RAW [{exchange}]: {json.dumps(data)[:200]}")
+
+        # Bybit format: data.data.openInterestValue (ticker stream)
+        if "data" in data and isinstance(data["data"], dict):
+            inner_data = data["data"]
+            if "openInterestValue" in inner_data:
+                oi_value = float(inner_data["openInterestValue"])
+                source = "bybit_openInterestValue"
+            elif "openInterest" in inner_data:
+                # Some exchanges send openInterest in contracts, need price to convert
+                oi_contracts = float(inner_data["openInterest"])
+                if self.state.btc_price > 0:
+                    oi_value = oi_contracts * self.state.btc_price
+                    source = "bybit_openInterest_converted"
+
+        # OKX format: data[0].oiCcy or data[0].oi (from open-interest channel)
+        elif isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            if "oiCcy" in item:
+                # OI in base currency (BTC)
+                oi_btc = float(item["oiCcy"])
+                if self.state.btc_price > 0:
+                    oi_value = oi_btc * self.state.btc_price
+                    source = "okx_oiCcy_converted"
+            elif "oi" in item:
+                oi_value = float(item["oi"])
+                source = "okx_oi"
+
+        # Direct openInterestValue field
+        elif "openInterestValue" in data:
+            oi_value = float(data["openInterestValue"])
+            source = "direct_openInterestValue"
+
+        if oi_value is not None and oi_value > 0:
+            prev_total = self.state.perp_total_oi
+            self.state.perp_OIs_per_instrument[exchange] = oi_value
+            # Recompute total OI
+            self.state.perp_total_oi = sum(self.state.perp_OIs_per_instrument.values())
+            # DEBUG: Log OI update (uncomment if needed)
+            # print(f"DEBUG OI [{exchange}] {source}: {oi_value:,.0f} -> total={self.state.perp_total_oi:,.0f}")
+
+        # Also extract funding if present in oifunding stream
+        if "data" in data and isinstance(data["data"], dict):
+            inner_data = data["data"]
+            if "fundingRate" in inner_data:
+                funding = float(inner_data["fundingRate"])
+                self.state.perp_fundings_per_instrument[exchange] = funding
+                fundings = list(self.state.perp_fundings_per_instrument.values())
+                if fundings:
+                    self.state.perp_weighted_funding = sum(fundings) / len(fundings)
+
     def _check_minute_rollover(self):
         current_minute = datetime.now().minute
         if current_minute != self.current_minute:
@@ -392,6 +452,9 @@ class FullMetricsProcessor:
                     buffer=self.liq_engine.buffer,
                     steps=self.liq_engine.steps
                 )
+
+                # Per-minute OI/funding log line
+                print(f"BTC OI={self.state.perp_total_oi:,.0f} funding={self.state.perp_weighted_funding*100:.4f}%")
 
             # Reset minute metrics
             self.state.perp_buyVol = 0
@@ -541,6 +604,11 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     fund_style = "green" if state.perp_weighted_funding >= 0 else "red"
     t.add_row("perp_weighted_funding", f"[{fund_style}]{state.perp_weighted_funding*100:.4f}%[/]")
     t.add_row("perp_total_oi", f"{state.perp_total_oi:,.0f} USD")
+    if state.perp_OIs_per_instrument:
+        t.add_row("", "")
+        t.add_row("[bold]OIs_per_instrument[/]", "")
+        for ex, oi in state.perp_OIs_per_instrument.items():
+            t.add_row(f"  {ex}", f"{oi:,.0f}")
     if state.perp_fundings_per_instrument:
         t.add_row("", "")
         t.add_row("[bold]fundings_per_instrument[/]", "")
