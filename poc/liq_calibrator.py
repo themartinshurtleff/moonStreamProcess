@@ -6,9 +6,14 @@ liquidation prints as feedback. Uses deterministic online calibration (no ML).
 
 The calibrator:
 1. Receives forceOrder liquidation events
-2. Attributes each event to the leverage level that best explains it
-3. Maintains rolling stats over a window
-4. Updates weights using bounded multiplicative rule with closer-level prior
+2. Uses SOFT ATTRIBUTION: distributes responsibility across leverage levels using
+   r(L) = exp(-d(L)/tau_usd), normalized, where d(L) = |event_price - implied_price(L)|
+3. Updates soft hit stats: hits[L] += r(L) * exp(-d(L)/delta_usd)
+4. Maintains rolling stats over a window
+5. Updates weights using bounded multiplicative rule with stabilization clamps:
+   - Per-update ratio clamp: new_w/old_w in [0.85, 1.20]
+   - Max weight cap: 0.35 per leverage
+   - Normalized after clamping
 """
 
 import json
@@ -26,6 +31,15 @@ logger = logging.getLogger(__name__)
 
 # Default persistence file
 DEFAULT_WEIGHTS_FILE = "liq_calibrator_weights.json"
+
+# Soft attribution config constants per symbol
+# tau_usd: temperature for responsibility distribution (higher = more spread)
+# delta_usd: scale for hit contribution decay (higher = more lenient hits)
+SOFT_ATTRIBUTION_CONFIG = {
+    "BTC": {"tau_usd": 150.0, "delta_usd": 90.0},
+    "ETH": {"tau_usd": 8.0, "delta_usd": 5.0},
+    "SOL": {"tau_usd": 0.6, "delta_usd": 0.35},
+}
 
 
 @dataclass
@@ -63,9 +77,9 @@ class CalibrationStats:
     misses: int = 0
     total_hit_strength: float = 0.0
     total_miss_distance: float = 0.0
-    # Per-leverage tracking
-    leverage_hit_count: Dict[int, int] = field(default_factory=dict)
-    leverage_total_count: Dict[int, int] = field(default_factory=dict)
+    # Per-leverage tracking (soft attribution - floats)
+    leverage_hits: Dict[int, float] = field(default_factory=dict)      # soft hit contributions
+    leverage_totals: Dict[int, float] = field(default_factory=dict)    # soft responsibility totals
     leverage_notional: Dict[int, float] = field(default_factory=dict)
     # Direction tracking for buffer tuning
     distance_directions: List[float] = field(default_factory=list)  # positive = predicted farther
@@ -334,7 +348,7 @@ class LiquidationCalibrator:
             return None
 
     def _process_event(self, event: LiquidationEvent) -> None:
-        """Process a single liquidation event for stats."""
+        """Process a single liquidation event for stats using soft attribution."""
         # Find the snapshot for this event's minute (or closest prior)
         snapshot = self._get_snapshot_for_event(event)
         if not snapshot:
@@ -351,7 +365,7 @@ class LiquidationCalibrator:
         # Bucket the event price
         event_bucket = self._bucket_price(event.price)
 
-        # Check for hit within tolerance
+        # Check for hit within tolerance (binary, for logging)
         is_hit = False
         hit_strength = 0.0
         min_distance = float('inf')
@@ -365,7 +379,7 @@ class LiquidationCalibrator:
             if distance_buckets < min_distance:
                 min_distance = distance_buckets
 
-        # Update stats
+        # Update binary stats (for logging/monitoring)
         self.stats.total_events += 1
         if is_hit:
             self.stats.hits += 1
@@ -377,35 +391,71 @@ class LiquidationCalibrator:
             if min_distance < float('inf'):
                 self.stats.miss_distances.append(min_distance)
 
-        # Attribute to leverage level and calculate implied miss
-        attributed_leverage = self._attribute_to_leverage(event, snapshot)
-        if attributed_leverage:
-            if attributed_leverage not in self.stats.leverage_total_count:
-                self.stats.leverage_total_count[attributed_leverage] = 0
-                self.stats.leverage_hit_count[attributed_leverage] = 0
-                self.stats.leverage_notional[attributed_leverage] = 0.0
+        # === SOFT ATTRIBUTION ===
+        # Get soft attribution config for this symbol
+        soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
+        tau_usd = soft_config["tau_usd"]
+        delta_usd = soft_config["delta_usd"]
 
-            self.stats.leverage_total_count[attributed_leverage] += 1
-            self.stats.leverage_notional[attributed_leverage] += event.notional
+        # Compute implied levels and distances for each leverage
+        implied_levels = {}  # lev -> implied_price
+        distances = {}       # lev -> d(L) in USD
+        responsibilities = {}  # lev -> r(L) normalized
 
-            if is_hit:
-                self.stats.leverage_hit_count[attributed_leverage] += 1
-
-            # Calculate implied miss for offset tracking
-            offset = (1.0 / attributed_leverage) + snapshot.buffer + (0.01 / attributed_leverage)
+        for lev in snapshot.ladder:
+            offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
             if event.side == "long":
-                # Apply current offset correction
-                nearest_implied = snapshot.src * (1 - offset) + self.long_offset_usd
+                implied = snapshot.src * (1 - offset)
             else:
-                nearest_implied = snapshot.src * (1 + offset) + self.short_offset_usd
+                implied = snapshot.src * (1 + offset)
+            implied_levels[lev] = implied
+            distances[lev] = abs(event.price - implied)
 
-            implied_miss = event.price - nearest_implied
+        # Compute unnormalized responsibilities: r(L) = exp(-d(L)/tau_usd)
+        unnorm_resp = {}
+        for lev in snapshot.ladder:
+            unnorm_resp[lev] = math.exp(-distances[lev] / tau_usd)
 
-            # Track per-side offsets for calibration
-            if event.side == "long":
-                self.stats.long_offsets.append(implied_miss)
-            else:
-                self.stats.short_offsets.append(implied_miss)
+        # Normalize responsibilities
+        total_resp = sum(unnorm_resp.values())
+        if total_resp > 0:
+            for lev in snapshot.ladder:
+                responsibilities[lev] = unnorm_resp[lev] / total_resp
+        else:
+            # Fallback: uniform
+            for lev in snapshot.ladder:
+                responsibilities[lev] = 1.0 / len(snapshot.ladder)
+
+        # Update soft stats: totals[L] += r(L), hits[L] += r(L) * exp(-d(L)/delta_usd)
+        for lev in snapshot.ladder:
+            r_L = responsibilities[lev]
+            d_L = distances[lev]
+            hit_contrib = r_L * math.exp(-d_L / delta_usd)
+
+            if lev not in self.stats.leverage_totals:
+                self.stats.leverage_totals[lev] = 0.0
+                self.stats.leverage_hits[lev] = 0.0
+                self.stats.leverage_notional[lev] = 0.0
+
+            self.stats.leverage_totals[lev] += r_L
+            self.stats.leverage_hits[lev] += hit_contrib
+            self.stats.leverage_notional[lev] += r_L * event.notional
+
+        # Find the leverage with highest responsibility for offset tracking
+        best_lev = max(responsibilities.keys(), key=lambda l: responsibilities[l])
+        offset = (1.0 / best_lev) + snapshot.buffer + (0.01 / best_lev)
+        if event.side == "long":
+            nearest_implied = snapshot.src * (1 - offset) + self.long_offset_usd
+        else:
+            nearest_implied = snapshot.src * (1 + offset) + self.short_offset_usd
+
+        implied_miss = event.price - nearest_implied
+
+        # Track per-side offsets for calibration
+        if event.side == "long":
+            self.stats.long_offsets.append(implied_miss)
+        else:
+            self.stats.short_offsets.append(implied_miss)
 
         # Track direction for buffer tuning
         nearest_pred = None
@@ -416,10 +466,11 @@ class LiquidationCalibrator:
             direction = abs(nearest_pred - snapshot.src) - abs(event.price - snapshot.src)
             self.stats.distance_directions.append(direction)
 
-        # Log individual event for analysis
+        # Log individual event for analysis (with soft attribution info)
         if self.log_events and self.log_fh:
             self._log_event(event, snapshot, pred_zones, is_hit, hit_strength,
-                           min_distance, attributed_leverage, nearest_pred)
+                           min_distance, best_lev, nearest_pred,
+                           responsibilities, distances)
 
     def _attribute_to_leverage(self, event: LiquidationEvent, snapshot: MinuteSnapshot) -> Optional[int]:
         """
@@ -458,16 +509,16 @@ class LiquidationCalibrator:
         old_weights = self.current_weights.copy()
         old_buffer = self.current_buffer
 
-        # Calculate hit rate
+        # Calculate hit rate (binary, for monitoring)
         hit_rate = self.stats.hits / max(self.stats.total_events, 1)
         avg_hit_strength = self.stats.total_hit_strength / max(self.stats.hits, 1)
         avg_miss_distance = self.stats.total_miss_distance / max(self.stats.misses, 1)
 
-        # Calculate leverage scores
+        # Calculate leverage scores using SOFT attribution stats
         leverage_scores = {}
         for lev in self.current_ladder:
-            hits = self.stats.leverage_hit_count.get(lev, 0)
-            total = self.stats.leverage_total_count.get(lev, 0)
+            hits = self.stats.leverage_hits.get(lev, 0.0)
+            total = self.stats.leverage_totals.get(lev, 0.0)
             score = (hits + self.alpha) / (total + self.beta)
             leverage_scores[lev] = score
 
@@ -483,24 +534,23 @@ class LiquidationCalibrator:
                     adjustment = 1 + self.learning_rate * (score - mean_score)
                     new_weights[i] = old_weights[i] * adjustment
 
-            # Clamp weights
-            new_weights = [max(self.min_weight, min(self.max_weight, w)) for w in new_weights]
+            # === STABILIZATION CLAMPS ===
+            # Per-update ratio clamp: new_w / old_w must be within [0.85, 1.20]
+            for i in range(len(new_weights)):
+                if old_weights[i] > 0:
+                    ratio = new_weights[i] / old_weights[i]
+                    clamped_ratio = max(0.85, min(1.20, ratio))
+                    new_weights[i] = old_weights[i] * clamped_ratio
 
-            # Normalize
+            # Max weight cap: new_w <= 0.35 per leverage
+            new_weights = [min(0.35, w) for w in new_weights]
+
+            # Normalize weights after clamping
             total = sum(new_weights)
             if total > 0:
                 new_weights = [w / total for w in new_weights]
 
-            # Apply closer-level prior (higher leverage = closer levels)
-            max_lev = max(self.current_ladder)
-            for i, lev in enumerate(self.current_ladder):
-                prior_factor = (lev / max_lev) ** self.closer_level_gamma
-                new_weights[i] *= prior_factor
-
-            # Renormalize again
-            total = sum(new_weights)
-            if total > 0:
-                new_weights = [w / total for w in new_weights]
+            # NOTE: closer-level prior has been REMOVED to fix calibration collapse
 
         # Buffer tuning (optional)
         new_buffer = old_buffer
@@ -628,10 +678,10 @@ class LiquidationCalibrator:
             'hit_rate': round(hit_rate, 4),
             'avg_hit_strength': round(avg_hit_strength, 4),
             'avg_miss_distance': round(avg_miss_distance, 2),
-            'leverage_counts': {
+            'leverage_soft_stats': {
                 str(lev): {
-                    'total': self.stats.leverage_total_count.get(lev, 0),
-                    'hits': self.stats.leverage_hit_count.get(lev, 0)
+                    'total_resp': round(self.stats.leverage_totals.get(lev, 0.0), 4),
+                    'hits_soft': round(self.stats.leverage_hits.get(lev, 0.0), 4)
                 }
                 for lev in self.current_ladder
             },
@@ -662,9 +712,11 @@ class LiquidationCalibrator:
         hit_strength: float,
         min_distance: float,
         attributed_leverage: Optional[int],
-        nearest_pred: Optional[float]
+        nearest_pred: Optional[float],
+        responsibilities: Dict[int, float] = None,
+        distances: Dict[int, float] = None
     ) -> None:
-        """Log individual liquidation event with predicted zones for analysis."""
+        """Log individual liquidation event with predicted zones and soft attribution for analysis."""
         if not self.log_fh:
             return
 
@@ -704,18 +756,32 @@ class LiquidationCalibrator:
         # Calculate how far off the corrected implied is (in price terms)
         implied_miss_usd = round(event.price - nearest_implied_corrected, 2) if nearest_implied_corrected else None
 
+        # Build top 3 leverages by responsibility with d(L)
+        top_3_by_responsibility = []
+        if responsibilities and distances:
+            sorted_by_resp = sorted(responsibilities.items(), key=lambda x: x[1], reverse=True)[:3]
+            for lev, r_L in sorted_by_resp:
+                d_L = distances.get(lev, 0.0)
+                top_3_by_responsibility.append({
+                    'leverage': lev,
+                    'responsibility': round(r_L, 4),
+                    'distance_usd': round(d_L, 2)
+                })
+
         log_entry = {
             'type': 'event',
             'timestamp': datetime.fromtimestamp(event.timestamp).isoformat(),
             'symbol': event.symbol,
             'side': event.side,
             'event_price': round(event.price, 2),
+            'src_price': round(snapshot.src, 2),
             'event_qty': round(event.qty, 6),
             'event_notional': round(event.notional, 2),
-            'src_price': round(snapshot.src, 2),
             'is_hit': is_hit,
             'hit_strength': round(hit_strength, 4) if is_hit else None,
             'miss_distance_buckets': round(min_distance, 2) if not is_hit else None,
+            # Soft attribution: top 3 leverages by responsibility
+            'top_3_by_responsibility': top_3_by_responsibility,
             'nearest_implied_raw': round(nearest_implied, 2) if nearest_implied else None,
             'nearest_implied_corrected': round(nearest_implied_corrected, 2) if nearest_implied_corrected else None,
             'nearest_implied_leverage': nearest_implied_lev,
