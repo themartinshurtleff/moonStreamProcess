@@ -90,6 +90,9 @@ UNREACHED_PENALTY = 0.05  # hits[L] += r(L) * (-UNREACHED_PENALTY)
 MIN_MASS_MID = 0.25
 MID_LEV_THRESHOLD = 25  # Leverages <= 25x are considered "mid/low"
 
+# Debug logging for unreached zone penalties (top 10 per cycle)
+DEBUG_UNREACHED_ZONES = True  # Set to False to disable per-zone penalty logging
+
 # Epsilon for numerical stability
 EPS = 1e-9
 
@@ -141,6 +144,15 @@ class MinuteSnapshot:
 
 
 @dataclass
+class ZoneMeta:
+    """Metadata for a predicted zone, storing origin context for correct attribution."""
+    origin_minute_key: int
+    origin_src: float
+    origin_buffer: float
+    zone_price: float  # Original float price for logging/debugging
+
+
+@dataclass
 class CalibrationStats:
     """Rolling calibration statistics."""
     total_events: int = 0
@@ -167,8 +179,11 @@ class CalibrationStats:
     # Zone judgment stats
     zones_judged: int = 0
     zones_unreached: int = 0
-    # Reached zones tracking: set of (zone_price, zone_side) that were approached
+    # Reached zones tracking: set of (zone_bucket_int, side) that were approached
+    # zone_bucket_int = int(round(zone_price / steps)) to avoid float key issues
     reached_zones: set = field(default_factory=set)
+    # Zone metadata: (zone_bucket_int, side) -> ZoneMeta for correct attribution
+    zone_meta: Dict[Tuple[int, str], 'ZoneMeta'] = field(default_factory=dict)
 
 
 class LiquidationCalibrator:
@@ -434,6 +449,29 @@ class LiquidationCalibrator:
             )
             self.snapshots[minute_key] = snapshot
 
+            # === STORE ZONE METADATA FOR ALL PREDICTED ZONES ===
+            # This allows unreached penalty to use correct origin src/buffer
+            for zone_price in pred_longs.keys():
+                zone_bucket_int = self._zone_bucket_int(zone_price, steps)
+                zone_key = (zone_bucket_int, "long")
+                if zone_key not in self.stats.zone_meta:
+                    self.stats.zone_meta[zone_key] = ZoneMeta(
+                        origin_minute_key=minute_key,
+                        origin_src=src,
+                        origin_buffer=buffer,
+                        zone_price=zone_price
+                    )
+            for zone_price in pred_shorts.keys():
+                zone_bucket_int = self._zone_bucket_int(zone_price, steps)
+                zone_key = (zone_bucket_int, "short")
+                if zone_key not in self.stats.zone_meta:
+                    self.stats.zone_meta[zone_key] = ZoneMeta(
+                        origin_minute_key=minute_key,
+                        origin_src=src,
+                        origin_buffer=buffer,
+                        zone_price=zone_price
+                    )
+
             # Update current params
             self.current_ladder = ladder.copy()
             self.current_weights = weights.copy()
@@ -660,8 +698,19 @@ class LiquidationCalibrator:
             if dist_pct > APPROACH_LEARN_PCT:
                 continue  # Not approached
 
-            # Zone was approached - mark as reached for unreached penalty tracking
-            self.stats.reached_zones.add((zone_price, zone_side))
+            # Zone was approached - mark as reached using integer bucket key
+            zone_bucket_int = self._zone_bucket_int(zone_price, snapshot.steps)
+            zone_key = (zone_bucket_int, zone_side)
+            self.stats.reached_zones.add(zone_key)
+
+            # Store zone metadata if not already stored (first occurrence wins)
+            if zone_key not in self.stats.zone_meta:
+                self.stats.zone_meta[zone_key] = ZoneMeta(
+                    origin_minute_key=snapshot.minute_key,
+                    origin_src=snapshot.src,
+                    origin_buffer=snapshot.buffer,
+                    zone_price=zone_price
+                )
 
             # Compute stress score with full breakdown
             stress_breakdown = self._compute_stress_score_with_breakdown(
@@ -837,6 +886,17 @@ class LiquidationCalibrator:
         if steps is None:
             steps = self.steps
         return round(price / steps) * steps
+
+    def _zone_bucket_int(self, zone_price: float, steps: float = None) -> int:
+        """
+        Convert zone_price to integer bucket count to avoid float key issues.
+
+        Returns int(round(zone_price / steps)) which is the bucket index.
+        Use this for all zone key lookups (reached_zones, zone_meta).
+        """
+        if steps is None:
+            steps = self.steps
+        return int(round(zone_price / steps))
 
     def _get_depth_around_bucket(
         self,
@@ -1137,6 +1197,8 @@ class LiquidationCalibrator:
         """
         Apply weak negative signal for zones that were judged reachable but never reached.
 
+        Uses integer bucket keys and origin src/buffer from zone_meta for correct attribution.
+
         For each unreached zone:
         - totals[L] += r(L)
         - hits[L] += r(L) * (-UNREACHED_PENALTY)
@@ -1148,7 +1210,8 @@ class LiquidationCalibrator:
             'unreached_penalty_applied_count': 0,
             'avg_unreached_resp': 0.0,
             'top_penalized_leverages': [],
-            'penalty_mass_by_leverage': {}
+            'penalty_mass_by_leverage': {},
+            'debug_penalized_zones': []  # For DEBUG_UNREACHED_ZONES logging
         }
 
         if self.stats.window_high <= 0 or self.stats.window_low >= float('inf'):
@@ -1158,12 +1221,14 @@ class LiquidationCalibrator:
         approach_low = self.stats.window_low * (1 - APPROACH_PCT)
         approach_high = self.stats.window_high * (1 + APPROACH_PCT)
 
-        # Collect all predicted zones
+        # Collect all predicted zones with their integer bucket keys
         all_zones = []
         for zone_price, strength in snapshot.pred_longs.items():
-            all_zones.append((zone_price, strength, "long"))
+            zone_bucket_int = self._zone_bucket_int(zone_price, snapshot.steps)
+            all_zones.append((zone_price, zone_bucket_int, strength, "long"))
         for zone_price, strength in snapshot.pred_shorts.items():
-            all_zones.append((zone_price, strength, "short"))
+            zone_bucket_int = self._zone_bucket_int(zone_price, snapshot.steps)
+            all_zones.append((zone_price, zone_bucket_int, strength, "short"))
 
         # Get soft attribution config
         soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
@@ -1172,28 +1237,45 @@ class LiquidationCalibrator:
         penalty_mass_by_lev = {lev: 0.0 for lev in self.current_ladder}
         total_resp_sum = 0.0
 
-        for zone_price, zone_strength, zone_side in all_zones:
+        # Collect penalized zone details for debug logging
+        penalized_zone_details = []
+
+        for zone_price, zone_bucket_int, zone_strength, zone_side in all_zones:
+            zone_key = (zone_bucket_int, zone_side)
+
             # Check if zone was judged reachable
             if not (approach_low <= zone_price <= approach_high):
                 continue  # Not in judged range
 
             result['unreached_zones_count'] += 1
 
-            # Check if zone was reached (approached during the window)
-            if (zone_price, zone_side) in self.stats.reached_zones:
+            # Check if zone was reached (approached during the window) using integer key
+            if zone_key in self.stats.reached_zones:
                 continue  # Was reached, no penalty
 
             # Zone was judged reachable but never reached - apply penalty
             result['unreached_penalty_applied_count'] += 1
 
-            # Compute responsibility distribution for this zone
+            # Get origin src/buffer from zone_meta (use current snapshot as fallback)
+            meta = self.stats.zone_meta.get(zone_key)
+            if meta:
+                origin_src = meta.origin_src
+                origin_buffer = meta.origin_buffer
+                origin_minute_key = meta.origin_minute_key
+            else:
+                # Fallback to current snapshot (shouldn't happen if zone_meta is properly populated)
+                origin_src = snapshot.src
+                origin_buffer = snapshot.buffer
+                origin_minute_key = snapshot.minute_key
+
+            # Compute responsibility distribution using ORIGIN src/buffer
             responsibilities = {}
             for lev in self.current_ladder:
-                offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
+                offset = (1.0 / lev) + origin_buffer + (0.01 / lev)
                 if zone_side == "long":
-                    implied = snapshot.src * (1 - offset)
+                    implied = origin_src * (1 - offset)
                 else:
-                    implied = snapshot.src * (1 + offset)
+                    implied = origin_src * (1 + offset)
                 distance = abs(zone_price - implied)
                 responsibilities[lev] = math.exp(-distance / tau_usd)
 
@@ -1220,6 +1302,20 @@ class LiquidationCalibrator:
                 penalty_mass_by_lev[lev] += r_L
                 total_resp_sum += r_L
 
+            # Store debug info for this penalized zone
+            if DEBUG_UNREACHED_ZONES:
+                sorted_resp = sorted(responsibilities.items(), key=lambda x: -x[1])[:3]
+                penalized_zone_details.append({
+                    'zone_key': zone_key,
+                    'zone_bucket_int': zone_bucket_int,
+                    'zone_side': zone_side,
+                    'zone_price': round(zone_price, 2),
+                    'origin_src': round(origin_src, 2),
+                    'origin_minute_key': origin_minute_key,
+                    'top3_resp': [(lev, round(r, 4)) for lev, r in sorted_resp],
+                    'total_penalty_contrib': round(sum(responsibilities.values()), 4)
+                })
+
         # Compute summary stats
         if result['unreached_penalty_applied_count'] > 0:
             result['avg_unreached_resp'] = total_resp_sum / result['unreached_penalty_applied_count']
@@ -1232,6 +1328,12 @@ class LiquidationCalibrator:
             {'leverage': lev, 'penalty_mass': round(mass, 4)}
             for lev, mass in sorted_penalty if mass > 0
         ]
+
+        # Store top 10 penalized zones for debug logging
+        if DEBUG_UNREACHED_ZONES and penalized_zone_details:
+            # Sort by total_penalty_contrib descending, take top 10
+            penalized_zone_details.sort(key=lambda x: -x['total_penalty_contrib'])
+            result['debug_penalized_zones'] = penalized_zone_details[:10]
 
         return result
 
@@ -1411,6 +1513,17 @@ class LiquidationCalibrator:
         top_pen_str = ','.join([f"{p['leverage']}x:{p['penalty_mass']:.3f}" for p in top_penalized[:3]])
         print(f"  UNREACHED judged={unreached_count} penalized={penalty_applied} "
               f"avg_resp={avg_resp:.3f} top_pen=[{top_pen_str}]")
+
+        # Debug: Per-zone penalty details (top 10, behind DEBUG_UNREACHED_ZONES flag)
+        if DEBUG_UNREACHED_ZONES:
+            debug_zones = unreached_penalty_info.get('debug_penalized_zones', [])
+            if debug_zones:
+                print(f"  DEBUG_UNREACHED (top {len(debug_zones)} penalized zones):")
+                for z in debug_zones:
+                    resp_str = ','.join([f"{lev}x:{r:.3f}" for lev, r in z['top3_resp']])
+                    print(f"    zone=({z['zone_bucket_int']},{z['zone_side']}) "
+                          f"price={z['zone_price']} origin_src={z['origin_src']} "
+                          f"origin_min={z['origin_minute_key']} top3=[{resp_str}]")
 
         # Line 3: Floor enforcement stats (only if triggered)
         if floor_info.get('floor_triggered', False):
