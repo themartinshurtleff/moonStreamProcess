@@ -41,6 +41,7 @@ except ImportError:
 from ws_connectors import MultiExchangeConnector
 from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
+from rest_pollers import BinanceRESTPollerThread, PollerState
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -159,10 +160,54 @@ class FullMetricsProcessor:
         # Track if we've applied persisted weights
         self._applied_persisted_weights = False
 
+        # REST poller for OI and trader ratios (proxy-aware)
+        # Set proxy='http://your-proxy:port' if in restricted region
+        self.rest_poller = BinanceRESTPollerThread(
+            symbols=["BTCUSDT"],
+            proxy=None,  # Set to proxy URL if needed
+            oi_interval=10.0,      # Poll OI every 10s
+            ratio_interval=60.0,   # Poll ratios every 60s
+            on_update=self._on_rest_poller_update,
+            price_getter=self._get_price_for_symbol,
+            debug=True
+        )
+        self._prev_rest_oi: float = 0.0
+
+    def _get_price_for_symbol(self, symbol: str) -> float:
+        """Get current price for a symbol (used by REST poller for OI conversion)."""
+        # For BTCUSDT, return current BTC price
+        if "BTC" in symbol.upper():
+            return self.state.btc_price
+        # For other symbols, could add price tracking later
+        return 0.0
+
     def _on_calibrator_weights_updated(self, symbol: str, new_weights: list, new_buffer: float):
         """Callback when calibrator updates weights."""
         # Push updated weights to the liq engine
         self.liq_engine.update_leverage_weights(symbol, new_weights, new_buffer)
+
+    def _on_rest_poller_update(self, poller_state: PollerState):
+        """Callback when REST poller has new OI/ratio data."""
+        with self.lock:
+            # Update OI from REST (more reliable than websocket for Binance)
+            if poller_state.total_oi > 0:
+                # Compute OI change
+                if self._prev_rest_oi > 0:
+                    self.state.perp_oi_change = poller_state.total_oi - self._prev_rest_oi
+                self._prev_rest_oi = poller_state.total_oi
+                self.state.perp_total_oi = poller_state.total_oi
+
+                # Update per-instrument OI
+                for symbol, oi_data in poller_state.oi_data.items():
+                    self.state.perp_OIs_per_instrument[f"binance_{symbol}"] = oi_data.oi_value
+
+            # Update trader ratios (TTA, TTP, GTA)
+            if poller_state.weighted_tta > 0:
+                self.state.perp_TTA_ratio = poller_state.weighted_tta
+            if poller_state.weighted_ttp > 0:
+                self.state.perp_TTP_ratio = poller_state.weighted_ttp
+            if poller_state.weighted_gta > 0:
+                self.state.perp_GTA_ratio = poller_state.weighted_gta
 
     def process_message(self, msg_str: str):
         """Process incoming message."""
@@ -453,8 +498,12 @@ class FullMetricsProcessor:
                     steps=self.liq_engine.steps
                 )
 
-                # Per-minute OI/funding log line
-                print(f"BTC OI={self.state.perp_total_oi:,.0f} funding={self.state.perp_weighted_funding*100:.4f}%")
+                # Per-minute OI/funding/ratio log line
+                oi_str = f"OI={self.state.perp_total_oi:,.0f}"
+                oi_chg_str = f"Δ={self.state.perp_oi_change:+,.0f}" if self.state.perp_oi_change != 0 else ""
+                fund_str = f"F={self.state.perp_weighted_funding*100:.4f}%"
+                ratio_str = f"TTA={self.state.perp_TTA_ratio:.3f} TTP={self.state.perp_TTP_ratio:.3f} GTA={self.state.perp_GTA_ratio:.3f}"
+                print(f"[MIN] BTC {oi_str} {oi_chg_str} {fund_str} | {ratio_str}")
 
             # Reset minute metrics
             self.state.perp_buyVol = 0
@@ -735,12 +784,16 @@ def run_websocket_thread(connector, processor, stop_event):
 def main():
     console = Console()
     console.print("\n[bold blue]Full BTC Perpetual Metrics Viewer[/]")
-    console.print("Connecting to Binance futures websocket...\n")
+    console.print("Connecting to Binance futures websocket + REST pollers...\n")
 
     processor = FullMetricsProcessor()
     connector = MultiExchangeConnector(processor.process_message)
     start_time = time.time()
     stop_event = threading.Event()
+
+    # Start REST poller for OI and trader ratios
+    console.print("[cyan]Starting REST poller for OI and trader ratios...[/]")
+    processor.rest_poller.start()
 
     # Start websocket in background thread
     ws_thread = threading.Thread(
@@ -754,6 +807,7 @@ def main():
         console.print("\n[yellow]Shutting down...[/]")
         stop_event.set()
         connector.stop()
+        processor.rest_poller.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -772,6 +826,7 @@ def main():
     finally:
         stop_event.set()
         connector.stop()
+        processor.rest_poller.stop()
 
     console.print("[green]Goodbye![/]")
 
