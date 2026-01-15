@@ -76,6 +76,20 @@ APPROACH_HIT_MULT = 0.25  # approach hits += r(L) * S * APPROACH_HIT_MULT
 # Weight anchoring: w_new = (1-ANCHOR_LAMBDA)*w_old + ANCHOR_LAMBDA*w_update
 ANCHOR_LAMBDA = 0.10  # 10% toward new weights, 90% toward old
 
+# === ANTI-COLLAPSE CONSTANTS ===
+# Approach distance decay: S_eff = S * exp(-dist_pct / D0)
+APPROACH_DIST_DECAY_D0 = 0.002  # 0.2% - zones closer to price get more weight
+
+# Top-K approach selection: only top TOP_K zones by S_eff per minute contribute to learning
+APPROACH_TOP_K = 3
+
+# Unreached zone penalty: weak negative signal for zones judged reachable but never reached
+UNREACHED_PENALTY = 0.05  # hits[L] += r(L) * (-UNREACHED_PENALTY)
+
+# Mid-leverage mass floor: sum(weights for lev <= MID_LEV_THRESHOLD) >= MIN_MASS_MID
+MIN_MASS_MID = 0.25
+MID_LEV_THRESHOLD = 25  # Leverages <= 25x are considered "mid/low"
+
 # Epsilon for numerical stability
 EPS = 1e-9
 
@@ -153,6 +167,8 @@ class CalibrationStats:
     # Zone judgment stats
     zones_judged: int = 0
     zones_unreached: int = 0
+    # Reached zones tracking: set of (zone_price, zone_side) that were approached
+    reached_zones: set = field(default_factory=set)
 
 
 class LiquidationCalibrator:
@@ -608,10 +624,12 @@ class LiquidationCalibrator:
         """
         Check if price approached any predicted zones and update soft stats.
 
-        For each zone Z, if close price came within APPROACH_LEARN_PCT of Z:
-        - Compute stress score S with zone-local depth
-        - Attribute to leverages via soft attribution
-        - Update: totals[L] += r(L), hits[L] += r(L) * S
+        Anti-collapse throttling:
+        1. Compute S_eff = S * exp(-dist_pct / D0) for distance decay
+        2. Collect all approach candidates for this minute
+        3. Select top APPROACH_TOP_K zones by S_eff
+        4. Only apply learning updates for selected zones
+        5. Track reached zones for unreached penalty later
         """
         if not snapshot.ladder or not self.current_weights:
             return
@@ -634,20 +652,28 @@ class LiquidationCalibrator:
         soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
         tau_usd = soft_config["tau_usd"]
 
+        # === PHASE 1: Collect all approach candidates ===
+        candidates = []
         for zone_price, zone_strength, zone_side in all_zones:
             # Check if price approached this zone
-            approach_dist_pct = abs(close - zone_price) / close
-            if approach_dist_pct > APPROACH_LEARN_PCT:
+            dist_pct = abs(close - zone_price) / close
+            if dist_pct > APPROACH_LEARN_PCT:
                 continue  # Not approached
 
-            # Zone was approached - compute stress score with full breakdown
+            # Zone was approached - mark as reached for unreached penalty tracking
+            self.stats.reached_zones.add((zone_price, zone_side))
+
+            # Compute stress score with full breakdown
             stress_breakdown = self._compute_stress_score_with_breakdown(
                 cache_entry=cache_entry,
                 zone_price=zone_price,
                 prev_cache=prev_cache,
                 steps=snapshot.steps
             )
-            stress_score = stress_breakdown['S']
+            S = stress_breakdown['S']
+
+            # Apply distance decay: S_eff = S * exp(-dist_pct / D0)
+            S_eff = S * math.exp(-dist_pct / APPROACH_DIST_DECAY_D0)
 
             # Compute soft attribution: r(L) for each leverage
             responsibilities = {}
@@ -675,8 +701,33 @@ class LiquidationCalibrator:
                 for lev in snapshot.ladder:
                     responsibilities[lev] = 1.0 / len(snapshot.ladder)
 
-            # Update soft stats: totals[L] += r(L), hits[L] += r(L) * S * APPROACH_HIT_MULT
-            # Approach events contribute at reduced strength vs forceOrder events
+            # Get top-3 responsible leverages for logging
+            sorted_resp = sorted(responsibilities.items(), key=lambda x: -x[1])[:3]
+            resp_top3 = {lev: r for lev, r in sorted_resp}
+
+            candidates.append({
+                'zone_price': zone_price,
+                'zone_side': zone_side,
+                'zone_strength': zone_strength,
+                'dist_pct': dist_pct,
+                'S': S,
+                'S_eff': S_eff,
+                'stress_breakdown': stress_breakdown,
+                'responsibilities': responsibilities,
+                'resp_top3': resp_top3,
+                'distances': distances
+            })
+
+        # === PHASE 2: Select top-K by S_eff ===
+        candidates.sort(key=lambda c: -c['S_eff'])
+        selected = candidates[:APPROACH_TOP_K]
+        skipped = candidates[APPROACH_TOP_K:]
+
+        # === PHASE 3: Apply learning updates only for selected zones ===
+        for cand in selected:
+            responsibilities = cand['responsibilities']
+            S_eff = cand['S_eff']
+
             for lev in snapshot.ladder:
                 r_L = responsibilities[lev]
 
@@ -685,25 +736,22 @@ class LiquidationCalibrator:
                     self.stats.leverage_hits[lev] = 0.0
                     self.stats.leverage_notional[lev] = 0.0
 
+                # Use S_eff (distance-decayed) instead of raw S
                 self.stats.leverage_totals[lev] += r_L
-                self.stats.leverage_hits[lev] += r_L * stress_score * APPROACH_HIT_MULT
+                self.stats.leverage_hits[lev] += r_L * S_eff * APPROACH_HIT_MULT
 
             self.approach_events_count += 1
 
-            # Log approach event with full breakdown
-            if self.log_events and self.log_fh:
-                self._log_approach_event(
-                    snapshot=snapshot,
-                    zone_price=zone_price,
-                    zone_side=zone_side,
-                    zone_strength=zone_strength,
-                    stress_breakdown=stress_breakdown,
-                    close=close,
-                    approach_dist_pct=approach_dist_pct,
-                    responsibilities=responsibilities,
-                    distances=distances,
-                    cache_entry=cache_entry
-                )
+        # === PHASE 4: Log approach summary for this minute ===
+        if self.log_events and self.log_fh:
+            self._log_approach_minute_summary(
+                snapshot=snapshot,
+                cache_entry=cache_entry,
+                close=close,
+                candidates=candidates,
+                selected=selected,
+                skipped=skipped
+            )
 
     def _compute_stress_score_with_breakdown(
         self,
@@ -899,6 +947,64 @@ class LiquidationCalibrator:
         self.log_fh.write(json.dumps(log_entry) + '\n')
         self.log_fh.flush()
 
+    def _log_approach_minute_summary(
+        self,
+        snapshot: MinuteSnapshot,
+        cache_entry: MinuteCacheEntry,
+        close: float,
+        candidates: List[Dict],
+        selected: List[Dict],
+        skipped: List[Dict]
+    ) -> None:
+        """Log approach throttling summary for this minute with top-K selection details."""
+        if not self.log_fh:
+            return
+
+        # Build selected zone details
+        selected_details = []
+        for cand in selected:
+            selected_details.append({
+                'zone_price': round(cand['zone_price'], 2),
+                'zone_side': cand['zone_side'],
+                'dist_pct': round(cand['dist_pct'], 6),
+                'S': round(cand['S'], 4),
+                'S_eff': round(cand['S_eff'], 4),
+                'resp_top3': {str(k): round(v, 4) for k, v in cand['resp_top3'].items()},
+                'stress_breakdown': {
+                    'aggression': round(cand['stress_breakdown']['aggression'], 4),
+                    'oi_fuel': round(cand['stress_breakdown']['oi_fuel'], 4),
+                    'depth_thinning': round(cand['stress_breakdown']['depth_thinning'], 4)
+                }
+            })
+
+        # Build skipped zone summary (just basic info)
+        skipped_summary = []
+        for cand in skipped:
+            skipped_summary.append({
+                'zone_price': round(cand['zone_price'], 2),
+                'zone_side': cand['zone_side'],
+                'S_eff': round(cand['S_eff'], 4)
+            })
+
+        log_entry = {
+            'type': 'approach_minute_summary',
+            'symbol': self.symbol,
+            'minute_key': cache_entry.minute_key,
+            'timestamp': datetime.fromtimestamp(cache_entry.timestamp).isoformat(),
+            'close': round(close, 2),
+            # Throttling stats
+            'approach_candidates': len(candidates),
+            'approach_used': len(selected),
+            'approach_skipped': len(skipped),
+            # Selected zones with full details
+            'selected_zones': selected_details,
+            # Skipped zones (just summary)
+            'skipped_zones': skipped_summary
+        }
+
+        self.log_fh.write(json.dumps(log_entry) + '\n')
+        self.log_fh.flush()
+
     def _attribute_to_leverage(self, event: LiquidationEvent, snapshot: MinuteSnapshot) -> Optional[int]:
         """
         Attribute a liquidation event to the leverage level that best explains it.
@@ -931,6 +1037,204 @@ class LiquidationCalibrator:
 
         return best_leverage
 
+    def _enforce_mid_mass_floor(self, weights: List[float]) -> Tuple[List[float], Dict]:
+        """
+        Enforce minimum mass on low/mid leverage (<=MID_LEV_THRESHOLD) to prevent collapse.
+
+        If sum(weights for lev <= 25x) < MIN_MASS_MID:
+        - Compute deficit
+        - Proportionally remove mass from high leverage weights
+        - Add that mass proportionally to low/mid leverage weights
+
+        Returns (new_weights, floor_info) for logging.
+        """
+        floor_info = {
+            'floor_triggered': False,
+            'mid_mass_before': 0.0,
+            'mid_mass_after': 0.0,
+            'deficit': 0.0,
+            'drained_leverages': []
+        }
+
+        if not self.current_ladder or len(weights) != len(self.current_ladder):
+            return weights, floor_info
+
+        # Identify mid/low and high leverage indices
+        mid_indices = []
+        high_indices = []
+        for i, lev in enumerate(self.current_ladder):
+            if lev <= MID_LEV_THRESHOLD:
+                mid_indices.append(i)
+            else:
+                high_indices.append(i)
+
+        if not mid_indices or not high_indices:
+            return weights, floor_info
+
+        # Compute current mid mass
+        mid_mass = sum(weights[i] for i in mid_indices)
+        floor_info['mid_mass_before'] = mid_mass
+
+        if mid_mass >= MIN_MASS_MID:
+            floor_info['mid_mass_after'] = mid_mass
+            return weights, floor_info
+
+        # Need to enforce floor
+        floor_info['floor_triggered'] = True
+        deficit = MIN_MASS_MID - mid_mass
+        floor_info['deficit'] = deficit
+
+        new_weights = weights.copy()
+
+        # Compute how much we can drain from high leverage proportionally
+        high_mass = sum(new_weights[i] for i in high_indices)
+
+        if high_mass <= EPS:
+            # No mass to drain
+            floor_info['mid_mass_after'] = mid_mass
+            return new_weights, floor_info
+
+        # Drain proportionally from high leverage
+        drain_ratio = min(deficit / high_mass, 0.9)  # Don't drain more than 90%
+        actual_drain = 0.0
+        drained = []
+
+        for i in high_indices:
+            drain_amount = new_weights[i] * drain_ratio
+            new_weights[i] -= drain_amount
+            actual_drain += drain_amount
+            if drain_amount > EPS:
+                drained.append({
+                    'leverage': self.current_ladder[i],
+                    'drained': round(drain_amount, 6)
+                })
+
+        floor_info['drained_leverages'] = drained
+
+        # Add drained mass to mid/low leverage proportionally
+        if actual_drain > EPS:
+            # Proportional to current mid weights, or uniform if all near zero
+            mid_weight_sum = sum(new_weights[i] for i in mid_indices)
+            if mid_weight_sum > EPS:
+                for i in mid_indices:
+                    new_weights[i] += actual_drain * (new_weights[i] / mid_weight_sum)
+            else:
+                # Uniform distribution
+                per_mid = actual_drain / len(mid_indices)
+                for i in mid_indices:
+                    new_weights[i] += per_mid
+
+        # Re-normalize to ensure sum = 1
+        total = sum(new_weights)
+        if total > 0:
+            new_weights = [w / total for w in new_weights]
+
+        floor_info['mid_mass_after'] = sum(new_weights[i] for i in mid_indices)
+
+        return new_weights, floor_info
+
+    def _apply_unreached_penalty(self, snapshot: MinuteSnapshot) -> Dict:
+        """
+        Apply weak negative signal for zones that were judged reachable but never reached.
+
+        For each unreached zone:
+        - totals[L] += r(L)
+        - hits[L] += r(L) * (-UNREACHED_PENALTY)
+
+        Returns logging info about penalties applied.
+        """
+        result = {
+            'unreached_zones_count': 0,
+            'unreached_penalty_applied_count': 0,
+            'avg_unreached_resp': 0.0,
+            'top_penalized_leverages': [],
+            'penalty_mass_by_leverage': {}
+        }
+
+        if self.stats.window_high <= 0 or self.stats.window_low >= float('inf'):
+            return result
+
+        # Define the judged reachable range
+        approach_low = self.stats.window_low * (1 - APPROACH_PCT)
+        approach_high = self.stats.window_high * (1 + APPROACH_PCT)
+
+        # Collect all predicted zones
+        all_zones = []
+        for zone_price, strength in snapshot.pred_longs.items():
+            all_zones.append((zone_price, strength, "long"))
+        for zone_price, strength in snapshot.pred_shorts.items():
+            all_zones.append((zone_price, strength, "short"))
+
+        # Get soft attribution config
+        soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
+        tau_usd = soft_config["tau_usd"]
+
+        penalty_mass_by_lev = {lev: 0.0 for lev in self.current_ladder}
+        total_resp_sum = 0.0
+
+        for zone_price, zone_strength, zone_side in all_zones:
+            # Check if zone was judged reachable
+            if not (approach_low <= zone_price <= approach_high):
+                continue  # Not in judged range
+
+            result['unreached_zones_count'] += 1
+
+            # Check if zone was reached (approached during the window)
+            if (zone_price, zone_side) in self.stats.reached_zones:
+                continue  # Was reached, no penalty
+
+            # Zone was judged reachable but never reached - apply penalty
+            result['unreached_penalty_applied_count'] += 1
+
+            # Compute responsibility distribution for this zone
+            responsibilities = {}
+            for lev in self.current_ladder:
+                offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
+                if zone_side == "long":
+                    implied = snapshot.src * (1 - offset)
+                else:
+                    implied = snapshot.src * (1 + offset)
+                distance = abs(zone_price - implied)
+                responsibilities[lev] = math.exp(-distance / tau_usd)
+
+            # Normalize
+            total_resp = sum(responsibilities.values())
+            if total_resp > 0:
+                for lev in self.current_ladder:
+                    responsibilities[lev] /= total_resp
+            else:
+                for lev in self.current_ladder:
+                    responsibilities[lev] = 1.0 / len(self.current_ladder)
+
+            # Apply penalty
+            for lev in self.current_ladder:
+                r_L = responsibilities[lev]
+
+                if lev not in self.stats.leverage_totals:
+                    self.stats.leverage_totals[lev] = 0.0
+                    self.stats.leverage_hits[lev] = 0.0
+
+                self.stats.leverage_totals[lev] += r_L
+                self.stats.leverage_hits[lev] += r_L * (-UNREACHED_PENALTY)
+
+                penalty_mass_by_lev[lev] += r_L
+                total_resp_sum += r_L
+
+        # Compute summary stats
+        if result['unreached_penalty_applied_count'] > 0:
+            result['avg_unreached_resp'] = total_resp_sum / result['unreached_penalty_applied_count']
+
+        result['penalty_mass_by_leverage'] = penalty_mass_by_lev
+
+        # Top 3 penalized leverages by penalty mass
+        sorted_penalty = sorted(penalty_mass_by_lev.items(), key=lambda x: -x[1])[:3]
+        result['top_penalized_leverages'] = [
+            {'leverage': lev, 'penalty_mass': round(mass, 4)}
+            for lev, mass in sorted_penalty if mass > 0
+        ]
+
+        return result
+
     def _run_calibration(self, minute_key: int, snapshot: MinuteSnapshot) -> Dict:
         """Run the calibration update and return new params."""
         old_weights = self.current_weights.copy()
@@ -940,6 +1244,11 @@ class LiquidationCalibrator:
         hit_rate = self.stats.hits / max(self.stats.total_events, 1)
         avg_hit_strength = self.stats.total_hit_strength / max(self.stats.hits, 1)
         avg_miss_distance = self.stats.total_miss_distance / max(self.stats.misses, 1)
+
+        # === UNREACHED ZONE PENALTY ===
+        # Apply weak negative signal for zones judged reachable but never reached
+        # This prevents collapse toward CMP by penalizing over-prediction
+        unreached_penalty_info = self._apply_unreached_penalty(snapshot)
 
         # Calculate leverage scores using SOFT attribution stats
         leverage_scores = {}
@@ -951,6 +1260,7 @@ class LiquidationCalibrator:
 
         # Calculate new weights if we have data
         new_weights = old_weights.copy()
+        floor_info = {'floor_triggered': False, 'mid_mass_before': 0.0, 'mid_mass_after': 0.0}
         if leverage_scores and self.stats.total_events > 0:
             mean_score = sum(leverage_scores.values()) / len(leverage_scores)
 
@@ -982,6 +1292,10 @@ class LiquidationCalibrator:
             total = sum(new_weights)
             if total > 0:
                 new_weights = [w / total for w in new_weights]
+
+            # === MID-MASS FLOOR ===
+            # Enforce minimum mass on low/mid leverage (<=25x) to prevent collapse toward CMP
+            new_weights, floor_info = self._enforce_mid_mass_floor(new_weights)
 
             # NOTE: closer-level prior has been REMOVED to fix calibration collapse
 
@@ -1083,10 +1397,26 @@ class LiquidationCalibrator:
         else:
             approach_to_force = float('inf') if approach_events > 0 else 0.0
 
-        # Print cycle summary line
+        # Print cycle summary line with anti-collapse stats
+        # Line 1: Basic stats
         print(f"CYCLE {self.symbol} force={force_events} approach={approach_events} "
               f"a/f={approach_to_force:.2f} entropy={weight_entropy:.3f} "
               f"hit={hit_rate:.0%} buf={new_buffer:.4f}")
+
+        # Line 2: Unreached penalty stats
+        unreached_count = unreached_penalty_info.get('unreached_zones_count', 0)
+        penalty_applied = unreached_penalty_info.get('unreached_penalty_applied_count', 0)
+        avg_resp = unreached_penalty_info.get('avg_unreached_resp', 0.0)
+        top_penalized = unreached_penalty_info.get('top_penalized_leverages', [])
+        top_pen_str = ','.join([f"{p['leverage']}x:{p['penalty_mass']:.3f}" for p in top_penalized[:3]])
+        print(f"  UNREACHED judged={unreached_count} penalized={penalty_applied} "
+              f"avg_resp={avg_resp:.3f} top_pen=[{top_pen_str}]")
+
+        # Line 3: Floor enforcement stats (only if triggered)
+        if floor_info.get('floor_triggered', False):
+            drained_str = ','.join([f"{d['leverage']}x" for d in floor_info.get('drained_leverages', [])])
+            print(f"  FLOOR triggered mid_mass={floor_info['mid_mass_before']:.3f}->"
+                  f"{floor_info['mid_mass_after']:.3f} drained=[{drained_str}]")
 
         # Store approach events count before reset
         approach_events_this_window = self.approach_events_count
