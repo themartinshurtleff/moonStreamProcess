@@ -70,6 +70,12 @@ STRESS_WEIGHT_OI = 0.20
 # Rolling minute cache size
 MINUTE_CACHE_SIZE = 60  # ~60 minutes of history
 
+# Approach event hit multiplier: approach events contribute at reduced strength vs forceOrders
+APPROACH_HIT_MULT = 0.25  # approach hits += r(L) * S * APPROACH_HIT_MULT
+
+# Weight anchoring: w_new = (1-ANCHOR_LAMBDA)*w_old + ANCHOR_LAMBDA*w_update
+ANCHOR_LAMBDA = 0.10  # 10% toward new weights, 90% toward old
+
 # Epsilon for numerical stability
 EPS = 1e-9
 
@@ -669,7 +675,8 @@ class LiquidationCalibrator:
                 for lev in snapshot.ladder:
                     responsibilities[lev] = 1.0 / len(snapshot.ladder)
 
-            # Update soft stats: totals[L] += r(L), hits[L] += r(L) * S
+            # Update soft stats: totals[L] += r(L), hits[L] += r(L) * S * APPROACH_HIT_MULT
+            # Approach events contribute at reduced strength vs forceOrder events
             for lev in snapshot.ladder:
                 r_L = responsibilities[lev]
 
@@ -679,7 +686,7 @@ class LiquidationCalibrator:
                     self.stats.leverage_notional[lev] = 0.0
 
                 self.stats.leverage_totals[lev] += r_L
-                self.stats.leverage_hits[lev] += r_L * stress_score
+                self.stats.leverage_hits[lev] += r_L * stress_score * APPROACH_HIT_MULT
 
             self.approach_events_count += 1
 
@@ -965,7 +972,13 @@ class LiquidationCalibrator:
             # Max weight cap: new_w <= 0.35 per leverage
             new_weights = [min(0.35, w) for w in new_weights]
 
-            # Normalize weights after clamping
+            # === WEIGHT ANCHORING ===
+            # w_new = (1-ANCHOR_LAMBDA)*w_old + ANCHOR_LAMBDA*w_update
+            # Smooths weight changes by anchoring toward previous weights
+            new_weights = [(1 - ANCHOR_LAMBDA) * old_weights[i] + ANCHOR_LAMBDA * new_weights[i]
+                           for i in range(len(new_weights))]
+
+            # Normalize weights after clamping and anchoring
             total = sum(new_weights)
             if total > 0:
                 new_weights = [w / total for w in new_weights]
@@ -1054,10 +1067,26 @@ class LiquidationCalibrator:
             snapshot
         )
 
-        # Print debug line
-        print(f"CALIB {self.symbol} hit={hit_rate:.0%} events={self.stats.total_events} "
-              f"approach={self.approach_events_count} tol={new_tolerance} buf={new_buffer:.4f} "
-              f"long_off={self.long_offset_usd:+.0f} short_off={self.short_offset_usd:+.0f}")
+        # === CYCLE SUMMARY ===
+        # Compute weight entropy: H = -sum(w * log(w)) for w > 0
+        # Higher entropy = more uniform, lower = more concentrated (collapse warning)
+        weight_entropy = 0.0
+        for w in new_weights:
+            if w > EPS:
+                weight_entropy -= w * math.log(w)
+
+        # Compute approach-to-force ratio
+        force_events = self.stats.total_events
+        approach_events = self.approach_events_count
+        if force_events > 0:
+            approach_to_force = approach_events / force_events
+        else:
+            approach_to_force = float('inf') if approach_events > 0 else 0.0
+
+        # Print cycle summary line
+        print(f"CYCLE {self.symbol} force={force_events} approach={approach_events} "
+              f"a/f={approach_to_force:.2f} entropy={weight_entropy:.3f} "
+              f"hit={hit_rate:.0%} buf={new_buffer:.4f}")
 
         # Store approach events count before reset
         approach_events_this_window = self.approach_events_count
