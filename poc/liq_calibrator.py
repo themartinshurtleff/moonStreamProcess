@@ -54,10 +54,13 @@ APPROACH_PCT = 0.0075  # 0.75%
 # Approach learning: zone is "approached" when price comes within this % (for stress-based learning)
 APPROACH_LEARN_PCT = 0.0035  # 0.35% - tighter than gating
 
-# Stress score component scales (for sigmoid normalization)
-AGGRESSION_SCALE = 0.5      # scale for (buyVol - sellVol) / (buyVol + sellVol)
+# Stress score component scales
+IMB_K = 0.15                # imbalance decay constant for aggression = 1 - exp(-abs_imb / IMB_K)
 OI_SCALE = 1000.0           # scale for abs(oi_change) in contract units
 DEPTH_SCALE = 100.0         # scale for depth thinning in base units
+
+# Depth band coverage: store depth for buckets within this % of src price
+DEPTH_BAND_PCT = 0.02       # ±2% around src - wide enough for any approached zone
 
 # Stress score component weights (must sum to 1.0)
 STRESS_WEIGHT_DEPTH = 0.45
@@ -66,6 +69,9 @@ STRESS_WEIGHT_OI = 0.20
 
 # Rolling minute cache size
 MINUTE_CACHE_SIZE = 60  # ~60 minutes of history
+
+# Epsilon for numerical stability
+EPS = 1e-9
 
 
 @dataclass
@@ -80,8 +86,10 @@ class MinuteCacheEntry:
     perp_buy_vol: float
     perp_sell_vol: float
     perp_oi_change: float
-    # Reduced book representation: depth at nearest buckets around CMP
-    # Dict of bucket_offset -> size (e.g., {-2: 10.5, -1: 8.2, 0: 5.0, 1: 7.3, 2: 9.1})
+    # Depth band: price_bucket -> size for buckets within ±DEPTH_BAND_PCT of src
+    # This allows zone-local depth calculation for any approached zone
+    depth_band: Dict[float, float] = field(default_factory=dict)
+    # Keep depth_near_cmp for backward compatibility (deprecated, will be removed)
     depth_near_cmp: Dict[int, float] = field(default_factory=dict)
 
 
@@ -358,7 +366,8 @@ class LiquidationCalibrator:
         perp_buy_vol: float = None,
         perp_sell_vol: float = None,
         perp_oi_change: float = None,
-        depth_near_cmp: Dict[int, float] = None
+        depth_band: Dict[float, float] = None,
+        depth_near_cmp: Dict[int, float] = None  # deprecated, use depth_band
     ) -> Optional[Dict]:
         """
         Receive per-minute predictor snapshot and potentially trigger calibration.
@@ -379,7 +388,8 @@ class LiquidationCalibrator:
             perp_buy_vol: Perpetual buy volume (optional, for stress calc)
             perp_sell_vol: Perpetual sell volume (optional, for stress calc)
             perp_oi_change: Perpetual OI change (optional, for stress calc)
-            depth_near_cmp: Dict of bucket_offset -> size near CMP (optional)
+            depth_band: Dict of price_bucket -> size within ±2% of src (for zone-local depth)
+            depth_near_cmp: DEPRECATED - Dict of bucket_offset -> size near CMP
 
         Returns:
             Dict with updated weights/buffer if calibration occurred, None otherwise
@@ -420,7 +430,8 @@ class LiquidationCalibrator:
                 perp_buy_vol=perp_buy_vol if perp_buy_vol is not None else 0.0,
                 perp_sell_vol=perp_sell_vol if perp_sell_vol is not None else 0.0,
                 perp_oi_change=perp_oi_change if perp_oi_change is not None else 0.0,
-                depth_near_cmp=depth_near_cmp.copy() if depth_near_cmp else {}
+                depth_band=depth_band.copy() if depth_band else {},
+                depth_near_cmp=depth_near_cmp.copy() if depth_near_cmp else {}  # deprecated
             )
             self.minute_cache.append(cache_entry)
 
@@ -592,7 +603,7 @@ class LiquidationCalibrator:
         Check if price approached any predicted zones and update soft stats.
 
         For each zone Z, if close price came within APPROACH_LEARN_PCT of Z:
-        - Compute stress score S
+        - Compute stress score S with zone-local depth
         - Attribute to leverages via soft attribution
         - Update: totals[L] += r(L), hits[L] += r(L) * S
         """
@@ -603,8 +614,8 @@ class LiquidationCalibrator:
         if close <= 0:
             return
 
-        # Get previous depth for depth thinning calculation
-        prev_depth = self._get_previous_depth_near_zone()
+        # Get previous minute's depth_band for depth thinning calculation
+        prev_cache = self._get_previous_cache_entry()
 
         # Process both long and short zones
         all_zones = []
@@ -623,12 +634,14 @@ class LiquidationCalibrator:
             if approach_dist_pct > APPROACH_LEARN_PCT:
                 continue  # Not approached
 
-            # Zone was approached - compute stress score
-            stress_score = self._compute_stress_score(
+            # Zone was approached - compute stress score with full breakdown
+            stress_breakdown = self._compute_stress_score_with_breakdown(
                 cache_entry=cache_entry,
                 zone_price=zone_price,
-                prev_depth=prev_depth
+                prev_cache=prev_cache,
+                steps=snapshot.steps
             )
+            stress_score = stress_breakdown['S']
 
             # Compute soft attribution: r(L) for each leverage
             responsibilities = {}
@@ -670,13 +683,14 @@ class LiquidationCalibrator:
 
             self.approach_events_count += 1
 
-            # Log approach event
+            # Log approach event with full breakdown
             if self.log_events and self.log_fh:
                 self._log_approach_event(
+                    snapshot=snapshot,
                     zone_price=zone_price,
                     zone_side=zone_side,
                     zone_strength=zone_strength,
-                    stress_score=stress_score,
+                    stress_breakdown=stress_breakdown,
                     close=close,
                     approach_dist_pct=approach_dist_pct,
                     responsibilities=responsibilities,
@@ -684,106 +698,194 @@ class LiquidationCalibrator:
                     cache_entry=cache_entry
                 )
 
-    def _compute_stress_score(
+    def _compute_stress_score_with_breakdown(
         self,
         cache_entry: MinuteCacheEntry,
         zone_price: float,
-        prev_depth: Dict[int, float]
-    ) -> float:
+        prev_cache: Optional['MinuteCacheEntry'],
+        steps: float
+    ) -> Dict:
         """
-        Compute stress score S in [0, 1] using:
-        - aggression = sigmoid((buyVol - sellVol) / max(buyVol + sellVol, eps))
-        - oi_fuel = sigmoid(abs(oi_change) / oi_scale)
-        - depth_thinning = sigmoid(max(0, (depth_prev - depth_now)) / depth_scale)
+        Compute stress score S in [0, 1] with full breakdown:
+        - aggression = 1 - exp(-abs_imb / IMB_K) where abs_imb = |buyVol-sellVol|/(buyVol+sellVol)
+        - oi_fuel = 1 - exp(-oi_abs / OI_SCALE) where oi_abs = abs(oi_change)
+        - depth_thinning = 1 - exp(-thin_raw / DEPTH_SCALE) computed around ZONE price
 
         S = 0.45 * depth_thinning + 0.35 * aggression + 0.20 * oi_fuel
+
+        Returns dict with all components for logging.
         """
-        eps = 1e-9
+        # === AGGRESSION (proper 0-1 imbalance, no sigmoid) ===
+        buy_vol = cache_entry.perp_buy_vol
+        sell_vol = cache_entry.perp_sell_vol
+        total_vol = buy_vol + sell_vol
 
-        # Aggression: net buying/selling pressure
-        total_vol = cache_entry.perp_buy_vol + cache_entry.perp_sell_vol
-        if total_vol > eps:
-            net_vol = (cache_entry.perp_buy_vol - cache_entry.perp_sell_vol) / total_vol
+        if total_vol > EPS:
+            abs_imb = abs(buy_vol - sell_vol) / total_vol  # in [0, 1]
+            aggression = 1.0 - math.exp(-abs_imb / IMB_K)  # in [0, 1), monotone
         else:
-            net_vol = 0.0
-        aggression = self._sigmoid(net_vol / AGGRESSION_SCALE)
+            # Guard: no volume, force aggression = 0
+            abs_imb = 0.0
+            aggression = 0.0
 
-        # OI fuel: position building
-        oi_fuel = self._sigmoid(abs(cache_entry.perp_oi_change) / OI_SCALE)
+        # === OI FUEL ===
+        oi_abs = abs(cache_entry.perp_oi_change)
+        oi_fuel = 1.0 - math.exp(-oi_abs / OI_SCALE)
 
-        # Depth thinning: reduction in book depth near zone
-        # Sum depth in ±2 buckets around zone
-        current_depth = sum(cache_entry.depth_near_cmp.values()) if cache_entry.depth_near_cmp else 0.0
-        prev_depth_sum = sum(prev_depth.values()) if prev_depth else 0.0
+        # === DEPTH THINNING (zone-local) ===
+        # Compute depth around the ZONE price, not around CMP
+        zone_bucket = self._bucket_price(zone_price, steps)
 
-        depth_reduction = max(0.0, prev_depth_sum - current_depth)
-        depth_thinning = self._sigmoid(depth_reduction / DEPTH_SCALE)
+        # Get depth in ±2 buckets around zone from current depth_band
+        depth_now = self._get_depth_around_bucket(cache_entry.depth_band, zone_bucket, steps, radius=2)
 
-        # Combined stress score
-        stress = (
+        # Get depth from previous minute
+        if prev_cache is not None:
+            depth_prev = self._get_depth_around_bucket(prev_cache.depth_band, zone_bucket, steps, radius=2)
+        else:
+            # Guard: no previous depth, set depth_thinning = 0
+            depth_prev = 0.0
+
+        thin_raw = max(0.0, depth_prev - depth_now)
+
+        if depth_prev > EPS:
+            depth_thinning = 1.0 - math.exp(-thin_raw / DEPTH_SCALE)
+        else:
+            # Guard: no previous depth data, don't fabricate
+            depth_thinning = 0.0
+
+        # === COMBINED STRESS SCORE ===
+        S = (
             STRESS_WEIGHT_DEPTH * depth_thinning +
             STRESS_WEIGHT_AGGRESSION * aggression +
             STRESS_WEIGHT_OI * oi_fuel
         )
 
-        return stress
+        # Clamp to [0, 1]
+        S = max(0.0, min(1.0, S))
 
-    def _sigmoid(self, x: float) -> float:
-        """Sigmoid function mapping R -> [0, 1]."""
-        return 1.0 / (1.0 + math.exp(-x))
+        return {
+            'S': S,
+            'abs_imb': abs_imb,
+            'aggression': aggression,
+            'oi_abs': oi_abs,
+            'oi_fuel': oi_fuel,
+            'depth_prev': depth_prev,
+            'depth_now': depth_now,
+            'thin_raw': thin_raw,
+            'depth_thinning': depth_thinning,
+            'zone_bucket': zone_bucket
+        }
 
-    def _get_previous_depth_near_zone(self) -> Dict[int, float]:
-        """Get depth_near_cmp from the previous minute cache entry."""
+    def _bucket_price(self, price: float, steps: float = None) -> float:
+        """Bucket a price to the nearest step."""
+        if steps is None:
+            steps = self.steps
+        return round(price / steps) * steps
+
+    def _get_depth_around_bucket(
+        self,
+        depth_band: Dict[float, float],
+        center_bucket: float,
+        steps: float,
+        radius: int = 2
+    ) -> float:
+        """
+        Sum depth from depth_band for buckets within ±radius of center_bucket.
+
+        Args:
+            depth_band: Dict of price_bucket -> size
+            center_bucket: Center price bucket
+            steps: Bucket size
+            radius: Number of buckets on each side (default 2 = ±2 buckets)
+
+        Returns:
+            Total depth around the center bucket
+        """
+        if not depth_band:
+            return 0.0
+
+        total = 0.0
+        for offset in range(-radius, radius + 1):
+            bucket = center_bucket + (offset * steps)
+            if bucket in depth_band:
+                total += depth_band[bucket]
+
+        return total
+
+    def _get_previous_cache_entry(self) -> Optional[MinuteCacheEntry]:
+        """Get the previous minute's cache entry."""
         if len(self.minute_cache) < 2:
-            return {}
-        # Get second-to-last entry (previous minute)
-        return self.minute_cache[-2].depth_near_cmp.copy() if self.minute_cache[-2].depth_near_cmp else {}
+            return None
+        return self.minute_cache[-2]
 
     def _log_approach_event(
         self,
+        snapshot: MinuteSnapshot,
         zone_price: float,
         zone_side: str,
         zone_strength: float,
-        stress_score: float,
+        stress_breakdown: Dict,
         close: float,
         approach_dist_pct: float,
         responsibilities: Dict[int, float],
         distances: Dict[int, float],
         cache_entry: MinuteCacheEntry
     ) -> None:
-        """Log approach event with zone, stress score, and top-3 r(L)."""
+        """Log approach event with full stress breakdown and sanity info."""
         if not self.log_fh:
             return
 
-        # Get top 3 leverages by responsibility
-        top_3_by_resp = []
+        # Get top 3 leverages by responsibility with deltas
+        top_3_resp = []
         sorted_by_resp = sorted(responsibilities.items(), key=lambda x: x[1], reverse=True)[:3]
+        S = stress_breakdown['S']
+
         for lev, r_L in sorted_by_resp:
             d_L = distances.get(lev, 0.0)
-            top_3_by_resp.append({
+            top_3_resp.append({
                 'leverage': lev,
                 'responsibility': round(r_L, 4),
-                'distance_usd': round(d_L, 2)
+                'distance_usd': round(d_L, 2),
+                'delta_totals': round(r_L, 4),
+                'delta_hits': round(r_L * S, 4)
             })
 
         log_entry = {
             'type': 'approach_event',
-            'timestamp': datetime.fromtimestamp(cache_entry.timestamp).isoformat(),
             'symbol': self.symbol,
+            'minute_key': cache_entry.minute_key,
+            'timestamp': datetime.fromtimestamp(cache_entry.timestamp).isoformat(),
+            # Price info
+            'close': round(close, 2),
+            'src': round(cache_entry.src, 2),
+            # Zone info
             'zone_price': round(zone_price, 2),
+            'zone_bucket': round(stress_breakdown['zone_bucket'], 2),
             'zone_side': zone_side,
             'zone_strength': round(zone_strength, 4),
-            'stress_score': round(stress_score, 4),
-            'close_price': round(close, 2),
             'approach_dist_pct': round(approach_dist_pct, 6),
-            'top_3_by_responsibility': top_3_by_resp,
+            # Stress breakdown
+            'stress_breakdown': {
+                'abs_imb': round(stress_breakdown['abs_imb'], 4),
+                'aggression': round(stress_breakdown['aggression'], 4),
+                'oi_abs': round(stress_breakdown['oi_abs'], 4),
+                'oi_fuel': round(stress_breakdown['oi_fuel'], 4),
+                'depth_prev': round(stress_breakdown['depth_prev'], 4),
+                'depth_now': round(stress_breakdown['depth_now'], 4),
+                'thin_raw': round(stress_breakdown['thin_raw'], 4),
+                'depth_thinning': round(stress_breakdown['depth_thinning'], 4),
+                'S': round(S, 4)
+            },
+            # Top 3 responsibilities with updates applied
+            'top_3_responsibilities': top_3_resp,
+            # Raw market data
             'market_data': {
-                'src': round(cache_entry.src, 2),
-                'high': round(cache_entry.high, 2),
-                'low': round(cache_entry.low, 2),
                 'perp_buy_vol': round(cache_entry.perp_buy_vol, 4),
                 'perp_sell_vol': round(cache_entry.perp_sell_vol, 4),
-                'perp_oi_change': round(cache_entry.perp_oi_change, 4)
+                'perp_oi_change': round(cache_entry.perp_oi_change, 4),
+                'high': round(cache_entry.high, 2),
+                'low': round(cache_entry.low, 2)
             }
         }
 
@@ -1163,10 +1265,6 @@ class LiquidationCalibrator:
 
         self.log_fh.write(json.dumps(log_entry) + '\n')
         self.log_fh.flush()
-
-    def _bucket_price(self, price: float) -> float:
-        """Bucket a price to the nearest step."""
-        return round(price / self.steps) * self.steps
 
     def _get_snapshot_for_event(self, event: LiquidationEvent) -> Optional[MinuteSnapshot]:
         """Get the snapshot for an event's minute or the closest prior."""
