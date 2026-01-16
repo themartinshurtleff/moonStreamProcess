@@ -353,6 +353,8 @@ class FullMetricsProcessor:
         self.state.perp_VolProfile[level] = self.state.perp_VolProfile.get(level, 0) + qty
 
     def _process_liquidations(self, exchange: str, data: dict):
+        # DEBUG #1: Log raw forceOrder data to diagnose why total_events=0
+        print(f"[DEBUG LIQ] raw data keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}, o={data.get('o', 'MISSING') if isinstance(data, dict) else 'N/A'}")
         order = data.get("o", {})
         if not order or "BTC" not in order.get("s", ""):
             return
@@ -383,6 +385,8 @@ class FullMetricsProcessor:
             mid_price = (self.state.perp_best_bid + self.state.perp_best_ask) / 2
         last_price = self.state.btc_price  # Current BTC price from trades
 
+        # DEBUG #2: Confirm routing to calibrator with key values
+        print(f"[DEBUG LIQ->CALIB] side={calib_side} price={price:.2f} qty={qty:.6f} mark={mark_price:.2f}")
         self.calibrator.on_liquidation({
             'timestamp': time.time(),
             'symbol': 'BTC',
