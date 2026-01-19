@@ -367,15 +367,16 @@ class FullMetricsProcessor:
 
     def _process_liquidations(self, exchange: str, data: dict):
         # DEBUG #1: Log raw forceOrder data to diagnose why total_events=0
+        order = data.get("o", {})
+        symbol = order.get("s", "") if isinstance(order, dict) else ""
         _write_debug_log({
             "event": "raw_liquidation",
             "exchange": exchange,
-            "data_type": type(data).__name__,
-            "keys": list(data.keys()) if isinstance(data, dict) else None,
-            "has_o": "o" in data if isinstance(data, dict) else False,
-            "o_keys": list(data.get("o", {}).keys()) if isinstance(data, dict) and isinstance(data.get("o"), dict) else None
+            "symbol": symbol,
+            "is_btc": "BTC" in symbol,
+            "price": order.get("p") if isinstance(order, dict) else None,
+            "qty": order.get("q") if isinstance(order, dict) else None
         })
-        order = data.get("o", {})
         if not order or "BTC" not in order.get("s", ""):
             return
 
