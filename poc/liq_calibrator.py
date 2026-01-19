@@ -6,11 +6,15 @@ liquidation prints as feedback. Uses deterministic online calibration (no ML).
 
 The calibrator:
 1. Receives forceOrder liquidation events
-2. Uses SOFT ATTRIBUTION: distributes responsibility across leverage levels using
-   r(L) = exp(-d(L)/tau_usd), normalized, where d(L) = |event_price - implied_price(L)|
-3. Updates soft hit stats: hits[L] += r(L) * exp(-d(L)/delta_usd)
-4. Maintains rolling stats over a window
-5. Updates weights using bounded multiplicative rule with stabilization clamps:
+2. Uses SOFT ATTRIBUTION in percent-space: distributes responsibility across leverage levels using
+   d_pct(L) = |event_price - implied_price(L)| / event_src_price
+   r(L) = exp(-d_pct(L) / tau_pct), normalized
+3. Updates soft hit stats: hits[L] += r(L) * exp(-d_pct(L) / delta_pct)
+4. tau_pct and delta_pct are scaled by short-term EWMA volatility:
+   scale = clamp(vol_ewma / 0.0015, 0.7, 1.6)
+   tau_pct = 0.0012 * scale, delta_pct = 0.0008 * scale
+5. Maintains rolling stats over a window
+6. Updates weights using bounded multiplicative rule with stabilization clamps:
    - Per-update ratio clamp: new_w/old_w in [0.85, 1.20]
    - Max weight cap: 0.35 per leverage
    - Normalized after clamping
@@ -32,14 +36,18 @@ logger = logging.getLogger(__name__)
 # Default persistence file
 DEFAULT_WEIGHTS_FILE = "liq_calibrator_weights.json"
 
-# Soft attribution config constants per symbol
-# tau_usd: temperature for responsibility distribution (higher = more spread)
-# delta_usd: scale for hit contribution decay (higher = more lenient hits)
-SOFT_ATTRIBUTION_CONFIG = {
-    "BTC": {"tau_usd": 150.0, "delta_usd": 90.0},
-    "ETH": {"tau_usd": 8.0, "delta_usd": 5.0},
-    "SOL": {"tau_usd": 0.6, "delta_usd": 0.35},
-}
+# Percent-space soft attribution config (replaces USD-based)
+# tau_pct: temperature for responsibility distribution in percent space
+# delta_pct: scale for hit contribution decay in percent space
+# All values in decimal (0.0012 = 12 bps = 0.12%)
+TAU_PCT_BASE = 0.0012      # 12 bps - base temperature for responsibility
+DELTA_PCT_BASE = 0.0008    # 8 bps - base scale for hit contribution decay
+
+# Volatility scaling parameters
+VOL_BASELINE = 0.0015      # 15 bps - baseline vol for scaling (neutral point)
+VOL_SCALE_MIN = 0.7        # Min scaling factor (low vol environment)
+VOL_SCALE_MAX = 1.6        # Max scaling factor (high vol environment)
+VOL_EWMA_ALPHA = 0.1       # EWMA smoothing for volatility (10% weight to new)
 
 # Distance band thresholds (as fraction of src_price)
 # NEAR: dist_pct <= 0.010 (1%)
@@ -284,6 +292,11 @@ class LiquidationCalibrator:
         self.bias_pct_long: float = 0.0
         self.bias_pct_short: float = 0.0
 
+        # EWMA volatility tracking for adaptive tau/delta scaling
+        # vol_ewma tracks short-term volatility as EWMA of |return_pct|
+        self.vol_ewma: float = VOL_BASELINE  # Initialize at baseline
+        self.last_src_price: float = 0.0      # Last src price for return calculation
+
         # Tracking
         self.last_calibration_minute: int = 0
         self.calibration_count: int = 0
@@ -342,6 +355,31 @@ class LiquidationCalibrator:
         except Exception as e:
             logger.error(f"Error loading weights: {e}")
             return False
+
+    def _update_vol_ewma(self, src_price: float) -> None:
+        """Update EWMA volatility estimate from price change."""
+        if self.last_src_price > 0 and src_price > 0:
+            # Compute absolute return as percent
+            return_pct = abs(src_price - self.last_src_price) / self.last_src_price
+            # Update EWMA: vol_new = (1 - alpha) * vol_old + alpha * return_pct
+            self.vol_ewma = (1 - VOL_EWMA_ALPHA) * self.vol_ewma + VOL_EWMA_ALPHA * return_pct
+        self.last_src_price = src_price
+
+    def _get_scaled_tau_delta(self) -> tuple:
+        """
+        Get tau_pct and delta_pct scaled by current volatility.
+
+        Returns:
+            (tau_pct, delta_pct, vol_scale) - the scaled values and the scale factor used
+        """
+        # Scale factor: vol_ewma / baseline, clamped to [0.7, 1.6]
+        vol_scale = self.vol_ewma / VOL_BASELINE
+        vol_scale = max(VOL_SCALE_MIN, min(VOL_SCALE_MAX, vol_scale))
+
+        tau_pct = TAU_PCT_BASE * vol_scale
+        delta_pct = DELTA_PCT_BASE * vol_scale
+
+        return tau_pct, delta_pct, vol_scale
 
     def _save_weights(self) -> bool:
         """Save current weights to file."""
@@ -640,15 +678,16 @@ class LiquidationCalibrator:
             if updates_calibration and min_distance < float('inf'):
                 self.stats.miss_distances.append(min_distance)
 
-        # === SOFT ATTRIBUTION (using event-time src) ===
-        soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
-        tau_usd = soft_config["tau_usd"]
-        delta_usd = soft_config["delta_usd"]
+        # === SOFT ATTRIBUTION (using event-time src, percent-space) ===
+        # Update volatility EWMA and get scaled tau/delta
+        self._update_vol_ewma(src_used)
+        tau_pct, delta_pct, vol_scale = self._get_scaled_tau_delta()
 
         # Compute implied levels using EVENT-TIME src (not minute ohlc4)
         implied_levels_raw = {}     # lev -> implied_price (raw, no bias)
         implied_levels_corrected = {}  # lev -> implied_price (with bias correction)
         distances = {}              # lev -> d(L) in USD (from raw implied)
+        distances_pct = {}          # lev -> d_pct(L) = d(L) / src (percent-space)
         distances_corrected = {}    # lev -> d(L) in USD (from corrected implied)
         responsibilities = {}       # lev -> r(L) normalized
 
@@ -668,12 +707,15 @@ class LiquidationCalibrator:
             implied_levels_raw[lev] = implied_raw
             implied_levels_corrected[lev] = implied_corrected
             distances[lev] = abs(event.price - implied_raw)
+            # Percent-space distance: d_pct = |event_price - implied| / src
+            distances_pct[lev] = distances[lev] / src_used if src_used > 0 else 0.0
             distances_corrected[lev] = abs(event.price - implied_corrected)
 
-        # Compute responsibilities using RAW distances (bias is for hit evaluation)
+        # Compute responsibilities using percent-space distances
+        # r(L) ∝ exp(-d_pct(L) / tau_pct)
         unnorm_resp = {}
         for lev in snapshot.ladder:
-            unnorm_resp[lev] = math.exp(-distances[lev] / tau_usd)
+            unnorm_resp[lev] = math.exp(-distances_pct[lev] / tau_pct)
 
         total_resp = sum(unnorm_resp.values())
         if total_resp > 0:
@@ -705,8 +747,9 @@ class LiquidationCalibrator:
         if updates_calibration:
             for lev in snapshot.ladder:
                 r_L = responsibilities[lev]
-                d_L = distances[lev]
-                hit_contrib = r_L * math.exp(-d_L / delta_usd)
+                d_pct_L = distances_pct[lev]
+                # hit_credit ∝ exp(-d_pct / delta_pct)
+                hit_contrib = r_L * math.exp(-d_pct_L / delta_pct)
 
                 if lev not in self.stats.leverage_totals:
                     self.stats.leverage_totals[lev] = 0.0
@@ -761,7 +804,11 @@ class LiquidationCalibrator:
                 miss_usd=miss_usd,
                 bias_pct=bias_pct,
                 implied_levels_raw=implied_levels_raw,
-                implied_levels_corrected=implied_levels_corrected
+                implied_levels_corrected=implied_levels_corrected,
+                # Percent-space soft attribution params
+                tau_pct=tau_pct,
+                delta_pct=delta_pct,
+                vol_scale=vol_scale
             )
 
     def _process_approach_events(self, snapshot: MinuteSnapshot, cache_entry: MinuteCacheEntry) -> None:
@@ -792,9 +839,8 @@ class LiquidationCalibrator:
         for zone_price, strength in snapshot.pred_shorts.items():
             all_zones.append((zone_price, strength, "short"))
 
-        # Get soft attribution config
-        soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
-        tau_usd = soft_config["tau_usd"]
+        # Get percent-space tau (no delta needed for approach events)
+        tau_pct, _, _ = self._get_scaled_tau_delta()
 
         # === PHASE 1: Collect all approach candidates ===
         candidates = []
@@ -830,9 +876,10 @@ class LiquidationCalibrator:
             # Apply distance decay: S_eff = S * exp(-dist_pct / D0)
             S_eff = S * math.exp(-dist_pct / APPROACH_DIST_DECAY_D0)
 
-            # Compute soft attribution: r(L) for each leverage
+            # Compute soft attribution: r(L) for each leverage using percent-space
             responsibilities = {}
             distances = {}
+            distances_pct = {}
 
             for lev in snapshot.ladder:
                 offset = (1.0 / lev) + snapshot.buffer + (0.01 / lev)
@@ -841,11 +888,13 @@ class LiquidationCalibrator:
                 else:
                     implied = snapshot.src * (1 + offset)
                 distances[lev] = abs(zone_price - implied)
+                distances_pct[lev] = distances[lev] / snapshot.src if snapshot.src > 0 else 0.0
 
-            # Compute unnormalized responsibilities
+            # Compute unnormalized responsibilities using percent-space
+            # r(L) ∝ exp(-d_pct(L) / tau_pct)
             unnorm_resp = {}
             for lev in snapshot.ladder:
-                unnorm_resp[lev] = math.exp(-distances[lev] / tau_usd)
+                unnorm_resp[lev] = math.exp(-distances_pct[lev] / tau_pct)
 
             # Normalize
             total_resp = sum(unnorm_resp.values())
@@ -1336,9 +1385,8 @@ class LiquidationCalibrator:
             zone_bucket_int = self._zone_bucket_int(zone_price, snapshot.steps)
             all_zones.append((zone_price, zone_bucket_int, strength, "short"))
 
-        # Get soft attribution config
-        soft_config = SOFT_ATTRIBUTION_CONFIG.get(self.symbol, SOFT_ATTRIBUTION_CONFIG["BTC"])
-        tau_usd = soft_config["tau_usd"]
+        # Get percent-space tau for soft attribution
+        tau_pct, _, _ = self._get_scaled_tau_delta()
 
         penalty_mass_by_lev = {lev: 0.0 for lev in self.current_ladder}
         total_resp_sum = 0.0
@@ -1374,7 +1422,7 @@ class LiquidationCalibrator:
                 origin_buffer = snapshot.buffer
                 origin_minute_key = snapshot.minute_key
 
-            # Compute responsibility distribution using ORIGIN src/buffer
+            # Compute responsibility distribution using ORIGIN src/buffer in percent-space
             responsibilities = {}
             for lev in self.current_ladder:
                 offset = (1.0 / lev) + origin_buffer + (0.01 / lev)
@@ -1383,7 +1431,9 @@ class LiquidationCalibrator:
                 else:
                     implied = origin_src * (1 + offset)
                 distance = abs(zone_price - implied)
-                responsibilities[lev] = math.exp(-distance / tau_usd)
+                distance_pct = distance / origin_src if origin_src > 0 else 0.0
+                # r(L) ∝ exp(-d_pct(L) / tau_pct)
+                responsibilities[lev] = math.exp(-distance_pct / tau_pct)
 
             # Normalize
             total_resp = sum(responsibilities.values())
@@ -1948,7 +1998,11 @@ class LiquidationCalibrator:
         miss_usd: float,
         bias_pct: float,
         implied_levels_raw: Dict[int, float],
-        implied_levels_corrected: Dict[int, float]
+        implied_levels_corrected: Dict[int, float],
+        # Percent-space soft attribution params
+        tau_pct: float = 0.0,
+        delta_pct: float = 0.0,
+        vol_scale: float = 1.0
     ) -> None:
         """
         Log individual liquidation event with all Phase 0-4 fields.
@@ -1957,6 +2011,7 @@ class LiquidationCalibrator:
         Phase 1: Event-time src (src_used, src_source)
         Phase 3: Bias fields (miss_pct, miss_usd, bias_pct)
         Phase 4: Full verification outputs (ladder, implied_levels_raw, implied_levels_corrected)
+        Soft attribution: tau_pct, delta_pct, vol_scale
         """
         if not self.log_fh:
             return
@@ -2019,7 +2074,12 @@ class LiquidationCalibrator:
                 for l, w in zip(snapshot.ladder, snapshot.weights)
             },
             'current_buffer': round(snapshot.buffer, 5),
-            'hit_bucket_tolerance': self.hit_bucket_tolerance
+            'hit_bucket_tolerance': self.hit_bucket_tolerance,
+            # Percent-space soft attribution params
+            'tau_pct': round(tau_pct, 6),
+            'delta_pct': round(delta_pct, 6),
+            'vol_scale': round(vol_scale, 4),
+            'vol_ewma': round(self.vol_ewma, 6)
         }
 
         self.log_fh.write(json.dumps(log_entry) + '\n')
