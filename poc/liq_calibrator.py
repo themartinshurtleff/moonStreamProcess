@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 # Default persistence file
 DEFAULT_WEIGHTS_FILE = "liq_calibrator_weights.json"
 
+# Schema version for weights file (increment when format changes)
+WEIGHTS_SCHEMA_VERSION = 2
+
 # Percent-space soft attribution config (replaces USD-based)
 # tau_pct: temperature for responsibility distribution in percent space
 # delta_pct: scale for hit contribution decay in percent space
@@ -324,7 +327,12 @@ class LiquidationCalibrator:
             logger.info(f"  Loaded persisted weights: {self.current_weights}")
 
     def _load_weights(self) -> bool:
-        """Load persisted weights from file if available."""
+        """
+        Load persisted weights from file if available.
+
+        If the stored ladder differs from current, attempts to migrate weights
+        by interpolating in offset-space (1/L domain) and renormalizing.
+        """
         if not self.weights_file or not os.path.exists(self.weights_file):
             return False
 
@@ -336,18 +344,44 @@ class LiquidationCalibrator:
                 logger.warning(f"Weights file symbol mismatch: {data.get('symbol')} != {self.symbol}")
                 return False
 
-            self.current_ladder = data.get('ladder', [])
-            self.current_weights = data.get('weights', [])
+            stored_ladder = data.get('ladder', [])
+            stored_weights = data.get('weights', [])
+            schema_version = data.get('schema_version', 1)
+
+            # Load other params regardless of ladder match
             self.current_buffer = data.get('buffer', 0.002)
             self.hit_bucket_tolerance = data.get('tolerance', self.hit_bucket_tolerance)
             self.calibration_count = data.get('calibration_count', 0)
             self.long_offset_usd = data.get('long_offset_usd', 0.0)
             self.short_offset_usd = data.get('short_offset_usd', 0.0)
-            # Phase 3: Load percent-based bias
             self.bias_pct_long = data.get('bias_pct_long', 0.0)
             self.bias_pct_short = data.get('bias_pct_short', 0.0)
 
-            logger.info(f"Loaded weights from {self.weights_file}")
+            # Check if we need to migrate weights to a new ladder
+            if stored_ladder and stored_weights and len(stored_ladder) == len(stored_weights):
+                if stored_ladder == self.current_ladder or not self.current_ladder:
+                    # Exact match or no current ladder yet - use stored directly
+                    self.current_ladder = stored_ladder
+                    self.current_weights = stored_weights
+                    logger.info(f"Loaded weights from {self.weights_file} (schema v{schema_version})")
+                else:
+                    # Ladder differs - attempt migration via offset-space interpolation
+                    migrated = self._migrate_weights_to_new_ladder(
+                        stored_ladder, stored_weights, self.current_ladder
+                    )
+                    if migrated:
+                        self.current_weights = migrated
+                        logger.info(f"Migrated weights from ladder {stored_ladder} to {self.current_ladder}")
+                    else:
+                        logger.warning(
+                            f"Could not migrate weights from ladder {stored_ladder} to {self.current_ladder}. "
+                            f"Reinitializing with defaults."
+                        )
+                        return False
+            else:
+                logger.warning("Invalid stored weights/ladder, reinitializing with defaults")
+                return False
+
             logger.info(f"  Calibration count: {self.calibration_count}")
             logger.info(f"  Bias pct: long={self.bias_pct_long:.5f}, short={self.bias_pct_short:.5f}")
             return True
@@ -355,6 +389,71 @@ class LiquidationCalibrator:
         except Exception as e:
             logger.error(f"Error loading weights: {e}")
             return False
+
+    def _migrate_weights_to_new_ladder(
+        self,
+        old_ladder: List[int],
+        old_weights: List[float],
+        new_ladder: List[int]
+    ) -> Optional[List[float]]:
+        """
+        Migrate weights from old ladder to new ladder by interpolating in offset-space.
+
+        Offset-space uses 1/L as the x-axis, which is the theoretical liquidation
+        distance from entry. This provides more meaningful interpolation than
+        linear leverage interpolation.
+
+        Returns:
+            List of weights for new_ladder, or None if migration impossible.
+        """
+        if not old_ladder or not old_weights or not new_ladder:
+            return None
+        if len(old_ladder) != len(old_weights):
+            return None
+
+        try:
+            # Build offset -> weight mapping from old ladder
+            # offset = 1/L (ignoring buffer since it's constant)
+            old_offsets = [1.0 / lev for lev in old_ladder]
+
+            # Sort by offset for interpolation (ascending = higher leverage first)
+            sorted_pairs = sorted(zip(old_offsets, old_weights), key=lambda x: x[0])
+            old_offsets_sorted = [p[0] for p in sorted_pairs]
+            old_weights_sorted = [p[1] for p in sorted_pairs]
+
+            # Interpolate weights for new ladder
+            new_weights = []
+            for new_lev in new_ladder:
+                new_offset = 1.0 / new_lev
+
+                # Find bracketing offsets in old ladder
+                if new_offset <= old_offsets_sorted[0]:
+                    # Extrapolate from lowest offset (highest leverage)
+                    new_weights.append(old_weights_sorted[0])
+                elif new_offset >= old_offsets_sorted[-1]:
+                    # Extrapolate from highest offset (lowest leverage)
+                    new_weights.append(old_weights_sorted[-1])
+                else:
+                    # Linear interpolation in offset-space
+                    for i in range(len(old_offsets_sorted) - 1):
+                        if old_offsets_sorted[i] <= new_offset <= old_offsets_sorted[i + 1]:
+                            # Interpolate between i and i+1
+                            t = (new_offset - old_offsets_sorted[i]) / (old_offsets_sorted[i + 1] - old_offsets_sorted[i])
+                            interp_weight = old_weights_sorted[i] + t * (old_weights_sorted[i + 1] - old_weights_sorted[i])
+                            new_weights.append(max(0.0, interp_weight))
+                            break
+
+            # Renormalize to sum to 1
+            total = sum(new_weights)
+            if total <= 0:
+                return None
+            new_weights = [w / total for w in new_weights]
+
+            return new_weights
+
+        except Exception as e:
+            logger.error(f"Weight migration failed: {e}")
+            return None
 
     def _update_vol_ewma(self, src_price: float) -> None:
         """Update EWMA volatility estimate from price change."""
@@ -382,15 +481,23 @@ class LiquidationCalibrator:
         return tau_pct, delta_pct, vol_scale
 
     def _save_weights(self) -> bool:
-        """Save current weights to file."""
+        """
+        Save current weights to file atomically.
+
+        Uses write-to-tmp + flush + fsync + rename pattern to prevent
+        corruption from partial writes or crashes.
+        """
         if not self.weights_file:
             return False
 
+        tmp_file = self.weights_file + '.tmp'
+
         try:
             data = {
+                'schema_version': WEIGHTS_SCHEMA_VERSION,
                 'symbol': self.symbol,
                 'ladder': self.current_ladder,
-                'weights': self.current_weights,
+                'weights': [round(w, 6) for w in self.current_weights],
                 'buffer': self.current_buffer,
                 'tolerance': self.hit_bucket_tolerance,
                 'long_offset_usd': round(self.long_offset_usd, 2),
@@ -406,14 +513,26 @@ class LiquidationCalibrator:
                 }
             }
 
-            with open(self.weights_file, 'w') as f:
+            # Write to temp file with flush and fsync
+            with open(tmp_file, 'w') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
 
-            logger.debug(f"Saved weights to {self.weights_file}")
+            # Atomic rename (POSIX guarantees atomicity for same-filesystem rename)
+            os.rename(tmp_file, self.weights_file)
+
+            logger.debug(f"Saved weights to {self.weights_file} (schema v{WEIGHTS_SCHEMA_VERSION})")
             return True
 
         except Exception as e:
             logger.error(f"Error saving weights: {e}")
+            # Clean up temp file if it exists
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception:
+                pass
             return False
 
     def on_liquidation(self, event_data: dict) -> None:
