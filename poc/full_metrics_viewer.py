@@ -184,6 +184,10 @@ class FullMetricsProcessor:
         )
         self._prev_rest_oi: float = 0.0
 
+        # Event sanity validator - log first 50 liquidation events for verification
+        self._sanity_check_count = 0
+        self._sanity_check_limit = 50
+
     def _get_price_for_symbol(self, symbol: str) -> float:
         """Get current price for a symbol (used by REST poller for OI conversion)."""
         # For BTCUSDT, return current BTC price
@@ -366,32 +370,18 @@ class FullMetricsProcessor:
         self.state.perp_VolProfile[level] = self.state.perp_VolProfile.get(level, 0) + qty
 
     def _process_liquidations(self, exchange: str, data: dict):
-        # DEBUG #1: Log raw forceOrder data to diagnose why total_events=0
         order = data.get("o", {})
-        symbol = order.get("s", "") if isinstance(order, dict) else ""
-        _write_debug_log({
-            "event": "raw_liquidation",
-            "exchange": exchange,
-            "symbol": symbol,
-            "is_btc": "BTC" in symbol,
-            "price": order.get("p") if isinstance(order, dict) else None,
-            "qty": order.get("q") if isinstance(order, dict) else None
-        })
         if not order or "BTC" not in order.get("s", ""):
             return
 
-        # DEBUG: Wrap in try/except to catch silent failures
         try:
-            side = order.get("S", "").lower()
+            # Extract raw values
+            raw_symbol = order.get("s", "")
+            raw_side = order.get("S", "")
+            side = raw_side.lower()
             price = float(order.get("p", 0))
             qty = float(order.get("q", 0))
-
-            _write_debug_log({
-                "event": "btc_liq_passed_filter",
-                "side": side,
-                "price": price,
-                "qty": qty
-            })
+            notional = price * qty
 
             level = str(int(price / self.level_size) * self.level_size)
 
@@ -402,7 +392,6 @@ class FullMetricsProcessor:
                 self.state.perp_liquidations_shortsTotal += qty
                 self.state.perp_liquidations_shorts[level] = self.state.perp_liquidations_shorts.get(level, 0) + qty
 
-            # Send to calibrator for weight learning
             # Binance forceOrder: "S": "BUY" means shorts got liquidated (they had to buy back)
             # "S": "SELL" means longs got liquidated (they had to sell)
             calib_side = "short" if side == "buy" else "long"
@@ -410,36 +399,90 @@ class FullMetricsProcessor:
             # Phase 1: Compute event-time src prices for better attribution
             # Priority: markPrice > mid > last > fallback
             mark_price = self.state.perp_markPrice if hasattr(self.state, 'perp_markPrice') else 0.0
-            # Compute mid from orderbook if available
             mid_price = 0.0
             if self.state.best_bid > 0 and self.state.best_ask > 0:
                 mid_price = (self.state.best_bid + self.state.best_ask) / 2
-            last_price = self.state.btc_price  # Current BTC price from trades
+            last_price = self.state.btc_price
 
-            # DEBUG #2: Confirm routing to calibrator with key values
-            _write_debug_log({
-                "event": "to_calibrator",
-                "side": calib_side,
-                "price": price,
-                "qty": qty,
-                "mark_price": mark_price,
-                "mid_price": mid_price,
-                "last_price": last_price
-            })
+            # Determine event_src_price and src_source (same logic as calibrator)
+            if mark_price > 0:
+                event_src_price = mark_price
+                src_source = "mark"
+            elif mid_price > 0:
+                event_src_price = mid_price
+                src_source = "mid"
+            elif last_price > 0:
+                event_src_price = last_price
+                src_source = "last"
+            else:
+                event_src_price = 0.0
+                src_source = "none"
+
+            # Event sanity validator - log first N events for verification
+            if self._sanity_check_count < self._sanity_check_limit:
+                self._sanity_check_count += 1
+                sanity_failures = []
+
+                # Run assertions
+                if not (price > 0):
+                    sanity_failures.append(f"price<=0: {price}")
+                if not (qty > 0):
+                    sanity_failures.append(f"qty<=0: {qty}")
+                if not (event_src_price > 0):
+                    sanity_failures.append(f"event_src_price<=0: {event_src_price} (src_source={src_source})")
+                if calib_side not in {"long", "short"}:
+                    sanity_failures.append(f"invalid calib_side: {calib_side}")
+
+                if sanity_failures:
+                    # Log failure
+                    _write_debug_log({
+                        "type": "event_sanity_fail",
+                        "event_num": self._sanity_check_count,
+                        "failures": sanity_failures,
+                        "raw_symbol": raw_symbol,
+                        "raw_side": raw_side,
+                        "calib_side": calib_side,
+                        "price": price,
+                        "qty": qty,
+                        "notional": notional,
+                        "mark_price": mark_price,
+                        "mid_price": mid_price,
+                        "last_price": last_price,
+                        "event_src_price": event_src_price,
+                        "src_source": src_source
+                    })
+                else:
+                    # Log successful sanity check
+                    _write_debug_log({
+                        "type": "event_sanity_ok",
+                        "event_num": self._sanity_check_count,
+                        "raw_symbol": raw_symbol,
+                        "raw_side": raw_side,
+                        "calib_side": calib_side,
+                        "price": price,
+                        "qty": qty,
+                        "notional": notional,
+                        "mark_price": mark_price,
+                        "mid_price": mid_price,
+                        "last_price": last_price,
+                        "event_src_price": event_src_price,
+                        "src_source": src_source
+                    })
+
+            # Send to calibrator
             self.calibrator.on_liquidation({
                 'timestamp': time.time(),
                 'symbol': 'BTC',
                 'side': calib_side,
                 'price': price,
                 'qty': qty,
-                # Phase 1: Event-time src prices
                 'mark_price': mark_price,
                 'mid_price': mid_price,
                 'last_price': last_price
             })
         except Exception as e:
             _write_debug_log({
-                "event": "liq_processing_error",
+                "type": "liq_processing_error",
                 "error": str(e),
                 "error_type": type(e).__name__
             })
