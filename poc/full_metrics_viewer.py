@@ -412,8 +412,8 @@ class FullMetricsProcessor:
             mark_price = self.state.perp_markPrice if hasattr(self.state, 'perp_markPrice') else 0.0
             # Compute mid from orderbook if available
             mid_price = 0.0
-            if self.state.perp_best_bid > 0 and self.state.perp_best_ask > 0:
-                mid_price = (self.state.perp_best_bid + self.state.perp_best_ask) / 2
+            if self.state.best_bid > 0 and self.state.best_ask > 0:
+                mid_price = (self.state.best_bid + self.state.best_ask) / 2
             last_price = self.state.btc_price  # Current BTC price from trades
 
             # DEBUG #2: Confirm routing to calibrator with key values
