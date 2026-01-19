@@ -46,6 +46,19 @@ from rest_pollers import BinanceRESTPollerThread, PollerState
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Debug log for liquidation event flow diagnostics
+LIQ_DEBUG_LOG = os.path.join(POC_DIR, "liq_debug.jsonl")
+
+
+def _write_debug_log(entry: dict):
+    """Append a debug entry to liq_debug.jsonl."""
+    entry["ts"] = datetime.now().isoformat()
+    try:
+        with open(LIQ_DEBUG_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Don't crash on log failures
+
 
 @dataclass
 class FullMetricsState:
@@ -354,7 +367,14 @@ class FullMetricsProcessor:
 
     def _process_liquidations(self, exchange: str, data: dict):
         # DEBUG #1: Log raw forceOrder data to diagnose why total_events=0
-        print(f"[DEBUG LIQ] raw data keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}, o={data.get('o', 'MISSING') if isinstance(data, dict) else 'N/A'}")
+        _write_debug_log({
+            "event": "raw_liquidation",
+            "exchange": exchange,
+            "data_type": type(data).__name__,
+            "keys": list(data.keys()) if isinstance(data, dict) else None,
+            "has_o": "o" in data if isinstance(data, dict) else False,
+            "o_keys": list(data.get("o", {}).keys()) if isinstance(data, dict) and isinstance(data.get("o"), dict) else None
+        })
         order = data.get("o", {})
         if not order or "BTC" not in order.get("s", ""):
             return
@@ -386,7 +406,15 @@ class FullMetricsProcessor:
         last_price = self.state.btc_price  # Current BTC price from trades
 
         # DEBUG #2: Confirm routing to calibrator with key values
-        print(f"[DEBUG LIQ->CALIB] side={calib_side} price={price:.2f} qty={qty:.6f} mark={mark_price:.2f}")
+        _write_debug_log({
+            "event": "to_calibrator",
+            "side": calib_side,
+            "price": price,
+            "qty": qty,
+            "mark_price": mark_price,
+            "mid_price": mid_price,
+            "last_price": last_price
+        })
         self.calibrator.on_liquidation({
             'timestamp': time.time(),
             'symbol': 'BTC',
