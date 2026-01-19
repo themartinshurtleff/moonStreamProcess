@@ -380,53 +380,69 @@ class FullMetricsProcessor:
         if not order or "BTC" not in order.get("s", ""):
             return
 
-        side = order.get("S", "").lower()
-        price = float(order.get("p", 0))
-        qty = float(order.get("q", 0))
-        level = str(int(price / self.level_size) * self.level_size)
+        # DEBUG: Wrap in try/except to catch silent failures
+        try:
+            side = order.get("S", "").lower()
+            price = float(order.get("p", 0))
+            qty = float(order.get("q", 0))
 
-        if side == "buy":
-            self.state.perp_liquidations_longsTotal += qty
-            self.state.perp_liquidations_longs[level] = self.state.perp_liquidations_longs.get(level, 0) + qty
-        else:
-            self.state.perp_liquidations_shortsTotal += qty
-            self.state.perp_liquidations_shorts[level] = self.state.perp_liquidations_shorts.get(level, 0) + qty
+            _write_debug_log({
+                "event": "btc_liq_passed_filter",
+                "side": side,
+                "price": price,
+                "qty": qty
+            })
 
-        # Send to calibrator for weight learning
-        # Binance forceOrder: "S": "BUY" means shorts got liquidated (they had to buy back)
-        # "S": "SELL" means longs got liquidated (they had to sell)
-        calib_side = "short" if side == "buy" else "long"
+            level = str(int(price / self.level_size) * self.level_size)
 
-        # Phase 1: Compute event-time src prices for better attribution
-        # Priority: markPrice > mid > last > fallback
-        mark_price = self.state.perp_markPrice if hasattr(self.state, 'perp_markPrice') else 0.0
-        # Compute mid from orderbook if available
-        mid_price = 0.0
-        if self.state.perp_best_bid > 0 and self.state.perp_best_ask > 0:
-            mid_price = (self.state.perp_best_bid + self.state.perp_best_ask) / 2
-        last_price = self.state.btc_price  # Current BTC price from trades
+            if side == "buy":
+                self.state.perp_liquidations_longsTotal += qty
+                self.state.perp_liquidations_longs[level] = self.state.perp_liquidations_longs.get(level, 0) + qty
+            else:
+                self.state.perp_liquidations_shortsTotal += qty
+                self.state.perp_liquidations_shorts[level] = self.state.perp_liquidations_shorts.get(level, 0) + qty
 
-        # DEBUG #2: Confirm routing to calibrator with key values
-        _write_debug_log({
-            "event": "to_calibrator",
-            "side": calib_side,
-            "price": price,
-            "qty": qty,
-            "mark_price": mark_price,
-            "mid_price": mid_price,
-            "last_price": last_price
-        })
-        self.calibrator.on_liquidation({
-            'timestamp': time.time(),
-            'symbol': 'BTC',
-            'side': calib_side,
-            'price': price,
-            'qty': qty,
-            # Phase 1: Event-time src prices
-            'mark_price': mark_price,
-            'mid_price': mid_price,
-            'last_price': last_price
-        })
+            # Send to calibrator for weight learning
+            # Binance forceOrder: "S": "BUY" means shorts got liquidated (they had to buy back)
+            # "S": "SELL" means longs got liquidated (they had to sell)
+            calib_side = "short" if side == "buy" else "long"
+
+            # Phase 1: Compute event-time src prices for better attribution
+            # Priority: markPrice > mid > last > fallback
+            mark_price = self.state.perp_markPrice if hasattr(self.state, 'perp_markPrice') else 0.0
+            # Compute mid from orderbook if available
+            mid_price = 0.0
+            if self.state.perp_best_bid > 0 and self.state.perp_best_ask > 0:
+                mid_price = (self.state.perp_best_bid + self.state.perp_best_ask) / 2
+            last_price = self.state.btc_price  # Current BTC price from trades
+
+            # DEBUG #2: Confirm routing to calibrator with key values
+            _write_debug_log({
+                "event": "to_calibrator",
+                "side": calib_side,
+                "price": price,
+                "qty": qty,
+                "mark_price": mark_price,
+                "mid_price": mid_price,
+                "last_price": last_price
+            })
+            self.calibrator.on_liquidation({
+                'timestamp': time.time(),
+                'symbol': 'BTC',
+                'side': calib_side,
+                'price': price,
+                'qty': qty,
+                # Phase 1: Event-time src prices
+                'mark_price': mark_price,
+                'mid_price': mid_price,
+                'last_price': last_price
+            })
+        except Exception as e:
+            _write_debug_log({
+                "event": "liq_processing_error",
+                "error": str(e),
+                "error_type": type(e).__name__
+            })
 
     def _process_funding(self, exchange: str, data: dict):
         if "r" in data:
