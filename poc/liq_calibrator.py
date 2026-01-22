@@ -708,6 +708,43 @@ class LiquidationCalibrator:
             )
             self.minute_cache.append(cache_entry)
 
+            # === DIAGNOSTIC: Log minute_inputs to verify fields are populated ===
+            missing_fields = []
+            if high is None:
+                missing_fields.append("high")
+            if low is None:
+                missing_fields.append("low")
+            if close is None:
+                missing_fields.append("close")
+            if perp_buy_vol is None:
+                missing_fields.append("perp_buy_vol")
+            if perp_sell_vol is None:
+                missing_fields.append("perp_sell_vol")
+            if perp_oi_change is None:
+                missing_fields.append("perp_oi_change")
+            if depth_band is None:
+                missing_fields.append("depth_band")
+
+            inputs_ok = len(missing_fields) == 0 or missing_fields == ["depth_band"]  # depth_band not implemented yet
+
+            if self.log_fh:
+                minute_inputs_entry = {
+                    "type": "minute_inputs",
+                    "minute_key": minute_key,
+                    "timestamp": datetime.fromtimestamp(timestamp).isoformat(),
+                    "src": round(src, 2),
+                    "high": round(high, 2) if high is not None else None,
+                    "low": round(low, 2) if low is not None else None,
+                    "close": round(close, 2) if close is not None else None,
+                    "buy_vol": round(perp_buy_vol, 4) if perp_buy_vol is not None else None,
+                    "sell_vol": round(perp_sell_vol, 4) if perp_sell_vol is not None else None,
+                    "oi_change": round(perp_oi_change, 4) if perp_oi_change is not None else None,
+                    "ok": inputs_ok,
+                    "missing": missing_fields if missing_fields else []
+                }
+                self.log_fh.write(json.dumps(minute_inputs_entry) + '\n')
+                self.log_fh.flush()
+
             # === PROCESS APPROACH EVENTS FOR ZONES ===
             # Check if price approached any predicted zones and update soft stats
             self._process_approach_events(snapshot, cache_entry)

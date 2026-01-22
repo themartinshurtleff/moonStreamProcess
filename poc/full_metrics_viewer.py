@@ -599,7 +599,14 @@ class FullMetricsProcessor:
                     ladder=config.ladder if config else [],
                     weights=config.weights if config else [],
                     buffer=self.liq_engine.buffer,
-                    steps=self.liq_engine.steps
+                    steps=self.liq_engine.steps,
+                    # Market data for approach stress calculation
+                    high=self.state.perp_high,
+                    low=self.state.perp_low,
+                    close=self.state.perp_close,
+                    perp_buy_vol=self.state.perp_buyVol,
+                    perp_sell_vol=self.state.perp_sellVol,
+                    perp_oi_change=self.state.perp_oi_change
                 )
 
                 # Per-minute OI/funding/ratio log line
