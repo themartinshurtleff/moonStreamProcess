@@ -725,7 +725,7 @@ class LiquidationCalibrator:
             if depth_band is None:
                 missing_fields.append("depth_band")
 
-            inputs_ok = len(missing_fields) == 0 or missing_fields == ["depth_band"]  # depth_band not implemented yet
+            inputs_ok = len(missing_fields) == 0  # All fields should be present now
 
             if self.log_fh:
                 minute_inputs_entry = {
@@ -744,6 +744,53 @@ class LiquidationCalibrator:
                 }
                 self.log_fh.write(json.dumps(minute_inputs_entry) + '\n')
                 self.log_fh.flush()
+
+            # === DIAGNOSTIC: Log depth_band stats ===
+            if self.log_fh:
+                band_pct = 0.02
+                low_bound = src * (1 - band_pct)
+                high_bound = src * (1 + band_pct)
+
+                if depth_band and len(depth_band) > 0:
+                    n_buckets = len(depth_band)
+                    notional_values = sorted(depth_band.values())
+                    notional_total = sum(notional_values)
+
+                    # Compute p50 and p95
+                    p50_idx = int(n_buckets * 0.50)
+                    p95_idx = min(int(n_buckets * 0.95), n_buckets - 1)
+                    notional_p50 = notional_values[p50_idx] if n_buckets > 0 else 0.0
+                    notional_p95 = notional_values[p95_idx] if n_buckets > 0 else 0.0
+
+                    depth_band_stats_entry = {
+                        "type": "depth_band_stats",
+                        "minute_key": minute_key,
+                        "src": round(src, 2),
+                        "n_buckets": n_buckets,
+                        "notional_total": round(notional_total, 2),
+                        "notional_p50": round(notional_p50, 2),
+                        "notional_p95": round(notional_p95, 2),
+                        "bounds": [round(low_bound, 2), round(high_bound, 2)]
+                    }
+                    self.log_fh.write(json.dumps(depth_band_stats_entry) + '\n')
+                    self.log_fh.flush()
+                else:
+                    # Determine reason for empty depth_band
+                    if depth_band is None:
+                        reason = "state_missing"
+                    elif len(depth_band) == 0:
+                        reason = "no_book"  # Caller returned empty dict
+                    else:
+                        reason = "bounds_mismatch"
+
+                    depth_band_empty_entry = {
+                        "type": "depth_band_empty",
+                        "minute_key": minute_key,
+                        "reason": reason,
+                        "src": round(src, 2)
+                    }
+                    self.log_fh.write(json.dumps(depth_band_empty_entry) + '\n')
+                    self.log_fh.flush()
 
             # === PROCESS APPROACH EVENTS FOR ZONES ===
             # Check if price approached any predicted zones and update soft stats

@@ -343,6 +343,61 @@ class FullMetricsProcessor:
 
         self.prev_books = books_heatmap.copy()
 
+    def _build_depth_band(self, src: float, steps: float) -> Dict[float, float]:
+        """
+        Build depth_band dict: price_bucket -> notional USD within ±2% of src.
+
+        Returns empty dict if no orderbook data available.
+        """
+        if src <= 0 or steps <= 0:
+            return {}
+
+        # Collect all bids and asks from all orderbooks
+        all_bids = []
+        all_asks = []
+        for book in self.orderbooks.values():
+            for price, qty in book.get("bids", {}).items():
+                all_bids.append((price, qty))
+            for price, qty in book.get("asks", {}).items():
+                all_asks.append((price, qty))
+
+        if not all_bids and not all_asks:
+            # Log once per minute if no book data
+            if not hasattr(self, '_depth_band_warned_minute'):
+                self._depth_band_warned_minute = -1
+            current_minute = int(time.time() // 60)
+            if self._depth_band_warned_minute != current_minute:
+                self._depth_band_warned_minute = current_minute
+                _write_debug_log({
+                    "type": "depth_band_no_book",
+                    "minute_key": current_minute,
+                    "reason": "no orderbook data in self.orderbooks"
+                })
+            return {}
+
+        # Define bounds: ±2% of src
+        band_pct = 0.02
+        low_bound = src * (1 - band_pct)
+        high_bound = src * (1 + band_pct)
+
+        depth_band = {}
+
+        # Process bids - notional = price * size
+        for price, size in all_bids:
+            if low_bound <= price <= high_bound:
+                bucket = round(price / steps) * steps
+                notional = price * size
+                depth_band[bucket] = depth_band.get(bucket, 0.0) + notional
+
+        # Process asks - notional = price * size
+        for price, size in all_asks:
+            if low_bound <= price <= high_bound:
+                bucket = round(price / steps) * steps
+                notional = price * size
+                depth_band[bucket] = depth_band.get(bucket, 0.0) + notional
+
+        return depth_band
+
     def _process_trades(self, exchange: str, data: dict):
         if "p" not in data:
             return
@@ -590,6 +645,10 @@ class FullMetricsProcessor:
                 src = (self.state.perp_open + self.state.perp_high +
                        self.state.perp_low + self.state.perp_close) / 4
                 config = self.liq_engine.get_leverage_config("BTC")
+
+                # Build depth band for stress calculation
+                depth_band = self._build_depth_band(src, self.liq_engine.steps)
+
                 self.calibrator.on_minute_snapshot(
                     symbol="BTC",
                     timestamp=time.time(),
@@ -606,7 +665,8 @@ class FullMetricsProcessor:
                     close=self.state.perp_close,
                     perp_buy_vol=self.state.perp_buyVol,
                     perp_sell_vol=self.state.perp_sellVol,
-                    perp_oi_change=self.state.perp_oi_change
+                    perp_oi_change=self.state.perp_oi_change,
+                    depth_band=depth_band
                 )
 
                 # Per-minute OI/funding/ratio log line
