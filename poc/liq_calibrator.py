@@ -52,12 +52,19 @@ VOL_SCALE_MIN = 0.7        # Min scaling factor (low vol environment)
 VOL_SCALE_MAX = 1.6        # Max scaling factor (high vol environment)
 VOL_EWMA_ALPHA = 0.1       # EWMA smoothing for volatility (10% weight to new)
 
-# Distance band thresholds (as fraction of src_price)
+# Distance band thresholds (as fraction of src_price) - "src_band"
 # NEAR: dist_pct <= 0.010 (1%)
 # MID:  0.010 < dist_pct <= 0.025 (1-2.5%)
 # FAR:  dist_pct > 0.025 (>2.5%)
 DIST_BAND_NEAR = 0.010
 DIST_BAND_MID = 0.025
+
+# Implied distance band thresholds (distance from nearest implied level / src) - "implied_band"
+# IMPLIED_NEAR: <= 0.25% (very close to predicted level)
+# IMPLIED_MID:  (0.25%, 0.75%] (reasonably close)
+# IMPLIED_FAR:  > 0.75% (far from any predicted level)
+IMPLIED_BAND_NEAR = 0.0025
+IMPLIED_BAND_MID = 0.0075
 
 # Approach gating: predicted zone must have been approached within this % to be judged
 APPROACH_PCT = 0.0075  # 0.75%
@@ -199,8 +206,10 @@ class CalibrationStats:
     short_miss_pct: List[float] = field(default_factory=list)
     # Attributed leverage histogram for cycle summary
     attributed_leverage_counts: Dict[int, int] = field(default_factory=dict)
-    # Distance band counts (NEAR/MID/FAR)
+    # Distance band counts (NEAR/MID/FAR) - based on distance from src_price
     band_counts: Dict[str, int] = field(default_factory=lambda: {"NEAR": 0, "MID": 0, "FAR": 0})
+    # Implied band counts (IMPLIED_NEAR/IMPLIED_MID/IMPLIED_FAR) - based on distance from nearest implied level
+    implied_band_counts: Dict[str, int] = field(default_factory=lambda: {"IMPLIED_NEAR": 0, "IMPLIED_MID": 0, "IMPLIED_FAR": 0})
     # Window price range for approach gating
     window_high: float = 0.0
     window_low: float = float('inf')
@@ -942,6 +951,18 @@ class LiquidationCalibrator:
         nearest_implied_corrected = implied_levels_corrected[best_lev]
         nearest_implied_dist_pct = abs(event.price - nearest_implied_raw) / src_used if src_used > 0 else 0.0
 
+        # === IMPLIED BAND CLASSIFICATION ===
+        # Based on distance from nearest implied level (not src price)
+        if nearest_implied_dist_pct <= IMPLIED_BAND_NEAR:
+            implied_band = "IMPLIED_NEAR"
+        elif nearest_implied_dist_pct <= IMPLIED_BAND_MID:
+            implied_band = "IMPLIED_MID"
+        else:
+            implied_band = "IMPLIED_FAR"
+
+        # Track implied band counts
+        self.stats.implied_band_counts[implied_band] += 1
+
         # Compute miss values
         miss_usd = event.price - nearest_implied_corrected
         miss_pct = miss_usd / src_used if src_used > 0 else 0.0
@@ -993,7 +1014,8 @@ class LiquidationCalibrator:
                 responsibilities=responsibilities,
                 distances=distances,
                 dist_pct_event=dist_pct_event,
-                band=band,
+                src_band=band,
+                implied_band=implied_band,
                 updates_calibration=updates_calibration,
                 # Phase 1 fields
                 src_used=src_used,
@@ -2031,8 +2053,9 @@ class LiquidationCalibrator:
             },
             # Phase 4: Attributed leverage histogram
             'attributed_leverage_counts': lev_hist,
-            # Distance band counts
-            'band_counts': self.stats.band_counts.copy(),
+            # Distance band counts (src_band: dist from src, implied_band: dist from nearest implied)
+            'src_band_counts': self.stats.band_counts.copy(),
+            'implied_band_counts': self.stats.implied_band_counts.copy(),
             # Approach events (stress-based learning)
             'approach_events': self.approach_events_count,
             # Zone judgment stats
@@ -2187,7 +2210,8 @@ class LiquidationCalibrator:
         responsibilities: Dict[int, float],
         distances: Dict[int, float],
         dist_pct_event: float,
-        band: str,
+        src_band: str,
+        implied_band: str,
         updates_calibration: bool,
         # Phase 1 fields
         src_used: float,
@@ -2246,7 +2270,9 @@ class LiquidationCalibrator:
             # Phase 0: Diagnostic dist_pct computed from event_src_price
             'dist_pct_event': round(dist_pct_event, 6),
             'nearest_implied_dist_pct': round(nearest_implied_dist_pct, 6),
-            'band': band,
+            # Banding: src_band (dist from src), implied_band (dist from nearest implied)
+            'src_band': src_band,
+            'implied_band': implied_band,
             'updates_calibration': updates_calibration,
             'event_qty': round(event.qty, 6),
             'event_notional': round(event.notional, 2),
