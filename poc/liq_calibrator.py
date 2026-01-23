@@ -221,6 +221,10 @@ class CalibrationStats:
     reached_zones: set = field(default_factory=set)
     # Zone metadata: (zone_bucket_int, side) -> ZoneMeta for correct attribution
     zone_meta: Dict[Tuple[int, str], 'ZoneMeta'] = field(default_factory=dict)
+    # Identifiability diagnostics: track how distinguishable leverage levels are
+    ident_best_L: List[int] = field(default_factory=list)      # best leverage per event
+    ident_gap_pct: List[float] = field(default_factory=list)   # gap between best and second best d_pct
+    ident_resp_best: List[float] = field(default_factory=list) # max responsibility per event
 
 
 class LiquidationCalibrator:
@@ -944,6 +948,25 @@ class LiquidationCalibrator:
         if best_lev not in self.stats.attributed_leverage_counts:
             self.stats.attributed_leverage_counts[best_lev] = 0
         self.stats.attributed_leverage_counts[best_lev] += 1
+
+        # === IDENTIFIABILITY DIAGNOSTICS ===
+        # Compute gap between best and second-best leverage by d_pct
+        sorted_by_d_pct = sorted(distances_pct.items(), key=lambda x: x[1])
+        best_L = sorted_by_d_pct[0][0]
+        best_d_pct = sorted_by_d_pct[0][1]
+        if len(sorted_by_d_pct) > 1:
+            second_L = sorted_by_d_pct[1][0]
+            second_d_pct = sorted_by_d_pct[1][1]
+            gap_pct = second_d_pct - best_d_pct
+        else:
+            second_L = best_L
+            gap_pct = 0.0
+        resp_best = responsibilities[best_lev]
+
+        # Track for cycle-level aggregation
+        self.stats.ident_best_L.append(best_L)
+        self.stats.ident_gap_pct.append(gap_pct)
+        self.stats.ident_resp_best.append(resp_best)
 
         # === PHASE 0: DIAGNOSTIC LOGGING ===
         # Compute nearest_implied_distance_pct for diagnosis
@@ -1903,6 +1926,38 @@ class LiquidationCalibrator:
             old_bias_pct_long=old_bias_pct_long,
             old_bias_pct_short=old_bias_pct_short
         )
+
+        # === IDENTIFIABILITY DIAGNOSTICS LOG ===
+        if self.log_fh and len(self.stats.ident_best_L) > 0:
+            n_events = len(self.stats.ident_best_L)
+
+            # Build best_L histogram
+            best_L_hist = {}
+            for lev in self.stats.ident_best_L:
+                best_L_hist[lev] = best_L_hist.get(lev, 0) + 1
+
+            # Compute percentiles for gap_pct
+            sorted_gap = sorted(self.stats.ident_gap_pct)
+            gap_p50 = sorted_gap[int(n_events * 0.50)] if n_events > 0 else 0.0
+            gap_p95 = sorted_gap[min(int(n_events * 0.95), n_events - 1)] if n_events > 0 else 0.0
+
+            # Compute percentiles for resp_best
+            sorted_resp = sorted(self.stats.ident_resp_best)
+            resp_p50 = sorted_resp[int(n_events * 0.50)] if n_events > 0 else 0.0
+            resp_p95 = sorted_resp[min(int(n_events * 0.95), n_events - 1)] if n_events > 0 else 0.0
+
+            ident_diag_entry = {
+                "type": "ident_diag",
+                "minute_key": minute_key,
+                "n": n_events,
+                "best_L_hist": {str(k): v for k, v in sorted(best_L_hist.items())},
+                "gap_pct_p50": round(gap_p50, 6),
+                "gap_pct_p95": round(gap_p95, 6),
+                "resp_best_p50": round(resp_p50, 4),
+                "resp_best_p95": round(resp_p95, 4)
+            }
+            self.log_fh.write(json.dumps(ident_diag_entry) + '\n')
+            self.log_fh.flush()
 
         # === CYCLE SUMMARY ===
         # Compute weight entropy: H = -sum(w * log(w)) for w > 0
