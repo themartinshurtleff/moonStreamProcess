@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 import threading
 import signal
 
@@ -58,6 +58,265 @@ def _write_debug_log(entry: dict):
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass  # Don't crash on log failures
+
+
+# =============================================================================
+# ZoneTracker: UI Stability for Liquidation Zones
+# =============================================================================
+# Provides hysteresis and TTL-based stability to prevent zone flicker.
+# - Identity matching: zones within ±1 bucket are considered the same
+# - Hysteresis: enter_margin=0.07, exit_margin=0.05
+# - TTL: 10 minutes unless strength drops >70% from trailing peak
+
+@dataclass
+class DisplayedZone:
+    """A zone currently being displayed with stability tracking."""
+    price: float           # Bucket price
+    strength: float        # Current strength
+    entry_minute: int      # Minute when zone entered display
+    peak_strength: float   # Trailing peak strength since entry
+    side: str              # "long" or "short"
+
+    def age_minutes(self, current_minute: int) -> int:
+        """How many minutes this zone has been displayed."""
+        return current_minute - self.entry_minute
+
+
+class ZoneTracker:
+    """
+    Maintains stable displayed zones using hysteresis and TTL.
+
+    Rules:
+    - Identity: zone is same if side matches and price within ±1 bucket (steps)
+    - Enter: new zone must beat weakest displayed by enter_margin (0.07)
+    - Exit: zone exits if strength < (best non-displayed - exit_margin) OR < min_threshold
+    - TTL: keep zone for 10 minutes unless strength drops >70% from peak
+    """
+
+    def __init__(
+        self,
+        steps: float = 20.0,
+        max_zones: int = 5,
+        enter_margin: float = 0.07,
+        exit_margin: float = 0.05,
+        ttl_minutes: int = 10,
+        peak_drop_threshold: float = 0.70,
+        min_strength_threshold: float = 0.01,
+        debug_log: bool = True
+    ):
+        self.steps = steps
+        self.max_zones = max_zones
+        self.enter_margin = enter_margin
+        self.exit_margin = exit_margin
+        self.ttl_minutes = ttl_minutes
+        self.peak_drop_threshold = peak_drop_threshold
+        self.min_strength_threshold = min_strength_threshold
+        self.debug_log = debug_log
+
+        # Separate tracking for long and short zones
+        self.displayed_long: List[DisplayedZone] = []
+        self.displayed_short: List[DisplayedZone] = []
+
+        # Track current minute for TTL
+        self._current_minute: int = 0
+        self._last_log_minute: int = -1
+
+    def _find_matching_zone(
+        self,
+        price: float,
+        displayed: List[DisplayedZone]
+    ) -> Optional[int]:
+        """
+        Find index of displayed zone matching price within ±1 bucket.
+        Returns nearest match if multiple, else None.
+        """
+        best_idx = None
+        best_dist = float('inf')
+
+        for i, zone in enumerate(displayed):
+            dist = abs(zone.price - price)
+            if dist <= self.steps and dist < best_dist:
+                best_idx = i
+                best_dist = dist
+
+        return best_idx
+
+    def _get_weakest_strength(self, displayed: List[DisplayedZone]) -> float:
+        """Get strength of weakest displayed zone."""
+        if not displayed:
+            return 0.0
+        return min(z.strength for z in displayed)
+
+    def _get_best_non_displayed_strength(
+        self,
+        candidates: List[Tuple[float, float]],
+        displayed: List[DisplayedZone]
+    ) -> float:
+        """Get highest strength among candidates not currently displayed."""
+        best = 0.0
+        for price, strength in candidates:
+            # Check if this candidate is displayed
+            match_idx = self._find_matching_zone(price, displayed)
+            if match_idx is None:
+                best = max(best, strength)
+        return best
+
+    def update(
+        self,
+        current_minute: int,
+        long_zones: List[Tuple[float, float]],
+        short_zones: List[Tuple[float, float]]
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """
+        Update displayed zones with new candidates.
+
+        Args:
+            current_minute: Current minute for TTL tracking
+            long_zones: [(price, strength), ...] from engine
+            short_zones: [(price, strength), ...] from engine
+
+        Returns:
+            (stable_long_zones, stable_short_zones) for display
+        """
+        self._current_minute = current_minute
+
+        # Update each side
+        self.displayed_long = self._update_side(
+            "long", self.displayed_long, long_zones, current_minute
+        )
+        self.displayed_short = self._update_side(
+            "short", self.displayed_short, short_zones, current_minute
+        )
+
+        # Log debug info once per minute
+        if self.debug_log and current_minute != self._last_log_minute:
+            self._log_debug(current_minute)
+            self._last_log_minute = current_minute
+
+        # Return stable zones for display
+        stable_long = [(z.price, z.strength) for z in sorted(
+            self.displayed_long, key=lambda x: x.strength, reverse=True
+        )]
+        stable_short = [(z.price, z.strength) for z in sorted(
+            self.displayed_short, key=lambda x: x.strength, reverse=True
+        )]
+
+        return stable_long, stable_short
+
+    def _update_side(
+        self,
+        side: str,
+        displayed: List[DisplayedZone],
+        candidates: List[Tuple[float, float]],
+        current_minute: int
+    ) -> List[DisplayedZone]:
+        """Update displayed zones for one side (long or short)."""
+
+        # Step 1: Update existing zones with new strengths
+        updated_zones = []
+        for zone in displayed:
+            # Find matching candidate
+            match_strength = None
+            for price, strength in candidates:
+                if abs(price - zone.price) <= self.steps:
+                    match_strength = strength
+                    break
+
+            if match_strength is not None:
+                # Update strength and peak
+                zone.strength = match_strength
+                zone.peak_strength = max(zone.peak_strength, match_strength)
+                updated_zones.append(zone)
+            else:
+                # Candidate disappeared - keep with decayed strength if TTL allows
+                zone.strength = zone.strength * 0.95  # Gentle decay
+                updated_zones.append(zone)
+
+        # Step 2: Apply exit rules
+        best_non_displayed = self._get_best_non_displayed_strength(candidates, updated_zones)
+        surviving_zones = []
+
+        for zone in updated_zones:
+            age = zone.age_minutes(current_minute)
+            peak_drop = (zone.peak_strength - zone.strength) / zone.peak_strength if zone.peak_strength > 0 else 0
+
+            # Exit conditions:
+            # 1. Below minimum threshold
+            if zone.strength < self.min_strength_threshold:
+                continue
+
+            # 2. TTL expired AND significant peak drop (>70%)
+            if age >= self.ttl_minutes and peak_drop > self.peak_drop_threshold:
+                continue
+
+            # 3. Falls below best non-displayed by exit_margin (only if TTL expired)
+            if age >= self.ttl_minutes:
+                if zone.strength < best_non_displayed - self.exit_margin:
+                    continue
+
+            surviving_zones.append(zone)
+
+        # Step 3: Apply entry rules for new zones
+        for price, strength in candidates:
+            # Skip if already displayed
+            if self._find_matching_zone(price, surviving_zones) is not None:
+                continue
+
+            # Check entry condition
+            weakest = self._get_weakest_strength(surviving_zones)
+
+            # Can enter if:
+            # - We have room (< max_zones)
+            # - OR we beat weakest by enter_margin
+            can_enter = False
+
+            if len(surviving_zones) < self.max_zones:
+                can_enter = True
+            elif strength > weakest + self.enter_margin:
+                can_enter = True
+
+            if can_enter:
+                # Add new zone
+                new_zone = DisplayedZone(
+                    price=price,
+                    strength=strength,
+                    entry_minute=current_minute,
+                    peak_strength=strength,
+                    side=side
+                )
+                surviving_zones.append(new_zone)
+
+                # If over max, remove weakest
+                if len(surviving_zones) > self.max_zones:
+                    surviving_zones.sort(key=lambda z: z.strength)
+                    surviving_zones = surviving_zones[1:]  # Remove weakest
+
+        return surviving_zones
+
+    def _log_debug(self, current_minute: int):
+        """Log debug info about displayed zones."""
+        long_info = [
+            (z.price, round(z.strength, 3), z.age_minutes(current_minute))
+            for z in sorted(self.displayed_long, key=lambda x: x.strength, reverse=True)
+        ]
+        short_info = [
+            (z.price, round(z.strength, 3), z.age_minutes(current_minute))
+            for z in sorted(self.displayed_short, key=lambda x: x.strength, reverse=True)
+        ]
+
+        _write_debug_log({
+            "type": "zone_tracker_debug",
+            "minute": current_minute,
+            "displayed_long": long_info,
+            "displayed_short": short_info,
+            "config": {
+                "steps": self.steps,
+                "max_zones": self.max_zones,
+                "enter_margin": self.enter_margin,
+                "exit_margin": self.exit_margin,
+                "ttl_minutes": self.ttl_minutes
+            }
+        })
 
 
 @dataclass
@@ -187,6 +446,18 @@ class FullMetricsProcessor:
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
         self._sanity_check_limit = 50
+
+        # ZoneTracker for UI stability (hysteresis + TTL)
+        self.zone_tracker = ZoneTracker(
+            steps=20.0,              # Match liq_engine bucket size
+            max_zones=5,             # Display top 5 zones per side
+            enter_margin=0.07,       # New zone must beat weakest by 7%
+            exit_margin=0.05,        # Exit if below best non-displayed by 5%
+            ttl_minutes=10,          # Keep zones for 10 minutes minimum
+            peak_drop_threshold=0.70,  # Exit early if drops >70% from peak
+            min_strength_threshold=0.01,  # Minimum strength to display
+            debug_log=True           # Log displayed zones per minute
+        )
 
     def _get_price_for_symbol(self, symbol: str) -> float:
         """Get current price for a symbol (used by REST poller for OI conversion)."""
@@ -635,10 +906,22 @@ class FullMetricsProcessor:
                         print(f"Loaded persisted weights (calibration #{persisted['calibration_count']})")
                     self._applied_persisted_weights = True
 
-                # Get top predicted liquidation zones
-                self.state.pred_liq_longs_top = self.liq_engine.top_levels("BTC", "long", 5)
-                self.state.pred_liq_shorts_top = self.liq_engine.top_levels("BTC", "short", 5)
+                # Get top predicted liquidation zones from engine (raw)
+                raw_longs = self.liq_engine.top_levels("BTC", "long", 10)  # Get more for tracker
+                raw_shorts = self.liq_engine.top_levels("BTC", "short", 10)
                 self.state.liq_engine_stats = self.liq_engine.get_stats("BTC")
+
+                # Pass through ZoneTracker for UI stability
+                current_minute_ts = int(time.time() // 60)
+                stable_longs, stable_shorts = self.zone_tracker.update(
+                    current_minute=current_minute_ts,
+                    long_zones=raw_longs,
+                    short_zones=raw_shorts
+                )
+
+                # Store stable zones for display (limited to 5)
+                self.state.pred_liq_longs_top = stable_longs[:5]
+                self.state.pred_liq_shorts_top = stable_shorts[:5]
 
                 # Send snapshot to calibrator for learning
                 # ohlc4 = (open + high + low + close) / 4
