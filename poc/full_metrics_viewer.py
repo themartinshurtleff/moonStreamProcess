@@ -49,6 +49,9 @@ POC_DIR = os.path.dirname(os.path.abspath(__file__))
 # Debug log for liquidation event flow diagnostics
 LIQ_DEBUG_LOG = os.path.join(POC_DIR, "liq_debug.jsonl")
 
+# Plot feed for real-time chart (OHLC + zones per minute)
+PLOT_FEED_FILE = os.path.join(POC_DIR, "plot_feed.jsonl")
+
 
 def _write_debug_log(entry: dict):
     """Append a debug entry to liq_debug.jsonl."""
@@ -58,6 +61,15 @@ def _write_debug_log(entry: dict):
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass  # Don't crash on log failures
+
+
+def _write_plot_feed(entry: dict):
+    """Append a plot feed entry for the live chart."""
+    try:
+        with open(PLOT_FEED_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Don't crash on write failures
 
 
 # =============================================================================
@@ -922,6 +934,31 @@ class FullMetricsProcessor:
                 # Store stable zones for display (limited to 5)
                 self.state.pred_liq_longs_top = stable_longs[:5]
                 self.state.pred_liq_shorts_top = stable_shorts[:5]
+
+                # Write plot feed entry for live chart
+                # Include zone ages from tracker for HUD display
+                long_zones_with_age = []
+                for z in self.zone_tracker.displayed_long:
+                    age = z.age_minutes(current_minute_ts)
+                    long_zones_with_age.append((z.price, z.strength, age))
+                long_zones_with_age.sort(key=lambda x: x[1], reverse=True)
+
+                short_zones_with_age = []
+                for z in self.zone_tracker.displayed_short:
+                    age = z.age_minutes(current_minute_ts)
+                    short_zones_with_age.append((z.price, z.strength, age))
+                short_zones_with_age.sort(key=lambda x: x[1], reverse=True)
+
+                _write_plot_feed({
+                    "ts": time.time(),
+                    "minute": current_minute_ts,
+                    "o": round(self.state.perp_open, 2),
+                    "h": round(self.state.perp_high, 2),
+                    "l": round(self.state.perp_low, 2),
+                    "c": round(self.state.perp_close, 2),
+                    "long_zones": [(round(p, 2), round(s, 4), a) for p, s, a in long_zones_with_age[:5]],
+                    "short_zones": [(round(p, 2), round(s, 4), a) for p, s, a in short_zones_with_age[:5]]
+                })
 
                 # Send snapshot to calibrator for learning
                 # ohlc4 = (open + high + low + close) / 4
