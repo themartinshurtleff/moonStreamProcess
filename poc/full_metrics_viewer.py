@@ -52,6 +52,9 @@ LIQ_DEBUG_LOG = os.path.join(POC_DIR, "liq_debug.jsonl")
 # Plot feed for real-time chart (OHLC + zones per minute)
 PLOT_FEED_FILE = os.path.join(POC_DIR, "plot_feed.jsonl")
 
+# API snapshot file for terminal integration
+LIQ_API_SNAPSHOT = os.path.join(POC_DIR, "liq_api_snapshot.json")
+
 # Log rotation thresholds
 LOG_ROTATION_MAX_MB = 200
 LOG_ROTATION_MAX_AGE_HOURS = 24
@@ -94,6 +97,15 @@ def _write_plot_feed(entry: dict):
     try:
         with open(PLOT_FEED_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Don't crash on write failures
+
+
+def _write_api_snapshot(snapshot: dict):
+    """Write API snapshot for terminal integration (overwrites each time)."""
+    try:
+        with open(LIQ_API_SNAPSHOT, "w") as f:
+            json.dump(snapshot, f)
     except Exception:
         pass  # Don't crash on write failures
 
@@ -986,6 +998,13 @@ class FullMetricsProcessor:
                     "short_zones": [(round(p, 2), round(s, 4), a) for p, s, a in short_zones_with_age[:5]]
                 })
 
+                # Write API snapshot for terminal integration
+                self._write_api_heatmap_snapshot(
+                    current_minute_ts,
+                    long_zones_with_age,
+                    short_zones_with_age
+                )
+
                 # Send snapshot to calibrator for learning
                 # ohlc4 = (open + high + low + close) / 4
                 src = (self.state.perp_open + self.state.perp_high +
@@ -1043,6 +1062,98 @@ class FullMetricsProcessor:
             self.state.perp_open = self.state.btc_price
             self.prices_this_minute = [self.state.btc_price] if self.state.btc_price > 0 else []
             self.current_minute = current_minute
+
+    def _write_api_heatmap_snapshot(
+        self,
+        current_minute: int,
+        long_zones_with_age: list,
+        short_zones_with_age: list
+    ):
+        """Write comprehensive heatmap snapshot for API consumption."""
+        src = self.state.perp_close
+        if src <= 0:
+            return
+
+        steps = self.liq_engine.steps
+
+        # Build price range: ±8% around src, bucketed by steps
+        band_pct = 0.08
+        price_min = round((src * (1 - band_pct)) / steps) * steps
+        price_max = round((src * (1 + band_pct)) / steps) * steps
+
+        # Generate price buckets
+        prices = []
+        p = price_min
+        while p <= price_max:
+            prices.append(p)
+            p += steps
+
+        # Get all zone strengths from engine
+        all_longs = self.liq_engine.get_all_levels("BTC", "long")
+        all_shorts = self.liq_engine.get_all_levels("BTC", "short")
+
+        # Build intensity arrays (raw strengths)
+        long_intensity_raw = []
+        short_intensity_raw = []
+
+        for price in prices:
+            long_intensity_raw.append(all_longs.get(price, 0.0))
+            short_intensity_raw.append(all_shorts.get(price, 0.0))
+
+        # Compute rolling normalization using all non-zero strengths
+        all_strengths = [s for s in long_intensity_raw + short_intensity_raw if s > 0]
+
+        if all_strengths:
+            sorted_s = sorted(all_strengths)
+            n = len(sorted_s)
+            p50 = sorted_s[int(n * 0.5)]
+            p95 = sorted_s[min(int(n * 0.95), n - 1)]
+            if p95 <= p50:
+                p95 = p50 + 0.01
+        else:
+            p50, p95 = 0.0, 1.0
+
+        # Normalize intensities to 0..1 using p50/p95
+        def normalize(val):
+            if val <= 0:
+                return 0.0
+            norm = (val - p50) / (p95 - p50)
+            return max(0.0, min(1.0, norm))
+
+        long_intensity = [round(normalize(s), 4) for s in long_intensity_raw]
+        short_intensity = [round(normalize(s), 4) for s in short_intensity_raw]
+
+        # Build top zones with age
+        top_long_zones = [
+            {"price": round(p, 2), "strength": round(s, 4), "age_min": a}
+            for p, s, a in long_zones_with_age[:5]
+        ]
+        top_short_zones = [
+            {"price": round(p, 2), "strength": round(s, 4), "age_min": a}
+            for p, s, a in short_zones_with_age[:5]
+        ]
+
+        snapshot = {
+            "schema_version": 1,
+            "symbol": "BTC",
+            "ts": time.time(),
+            "src": round(src, 2),
+            "step": steps,
+            "price_min": price_min,
+            "price_max": price_max,
+            "prices": prices,
+            "long_intensity": long_intensity,
+            "short_intensity": short_intensity,
+            "top_long_zones": top_long_zones,
+            "top_short_zones": top_short_zones,
+            "norm": {
+                "method": "p50_p95",
+                "p50": round(p50, 6),
+                "p95": round(p95, 6)
+            }
+        }
+
+        _write_api_snapshot(snapshot)
 
     def get_state(self) -> FullMetricsState:
         with self.lock:
