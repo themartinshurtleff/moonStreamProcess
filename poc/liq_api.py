@@ -96,9 +96,11 @@ class HistoryBuffer:
         if ts <= 0:
             return False
 
-        # Only add if timestamp is new (at least 30s newer to handle jitter)
+        # Only add if we're in a new minute (floor to minute)
+        ts_minute = int(ts // 60)
         with self._lock:
-            if ts <= self._last_ts + 30:
+            last_minute = int(self._last_ts // 60) if self._last_ts > 0 else -1
+            if ts_minute <= last_minute:
                 return False
 
             # Extract and encode intensities
@@ -391,8 +393,8 @@ def create_app() -> FastAPI:
     @app.get("/v1/liq_heatmap_history")
     async def liq_heatmap_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
-        minutes: int = Query(default=60, ge=1, le=HISTORY_MINUTES, description="Minutes of history"),
-        stride: int = Query(default=1, ge=1, le=60, description="Downsample stride (1=all frames)")
+        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
     ):
         """
         Get historical liquidation heatmap data.
@@ -407,34 +409,81 @@ def create_app() -> FastAPI:
         - long: 2D array [frames x prices] of u8 intensities
         - short: 2D array [frames x prices] of u8 intensities
         """
+        # Clamp parameters
+        minutes = max(5, min(720, minutes))
+        stride = max(1, min(30, stride))
+
         if not _cache:
             raise HTTPException(status_code=503, detail="Cache not initialized")
 
-        # Get current snapshot for reference
+        # Get current snapshot for reference (needed for grid params)
         current = _cache.get(symbol)
-        if not current:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No snapshot available for {symbol}. Is the viewer running?"
-            )
 
         # Get historical frames
         frames = _cache.history.get_frames(minutes=minutes, stride=stride)
-        if not frames:
-            raise HTTPException(
-                status_code=404,
-                detail="No history available yet. Wait for data to accumulate."
-            )
 
-        # Build unified grid based on current src
-        current_src = current.get('src', 0)
-        step = current.get('step', DEFAULT_STEP)
+        # Debug output
+        frame_count = len(frames)
+        total_frames = _cache.history.frame_count()
+        print(f"[liq_heatmap_history] symbol={symbol} minutes={minutes} stride={stride}")
+        print(f"[liq_heatmap_history] frames_returned={frame_count} total_in_buffer={total_frames}")
+
+        # If no frames yet, return empty response (not 404)
+        if not frames:
+            # Use current snapshot for grid params if available
+            if current:
+                step = current.get('step', DEFAULT_STEP)
+                src = current.get('src', 100000)
+                price_min = round((src * (1 - DEFAULT_BAND_PCT)) / step) * step
+                price_max = round((src * (1 + DEFAULT_BAND_PCT)) / step) * step
+                prices = []
+                p = price_min
+                while p <= price_max:
+                    prices.append(p)
+                    p += step
+            else:
+                step = DEFAULT_STEP
+                price_min = 92000.0
+                price_max = 108000.0
+                prices = list(range(int(price_min), int(price_max) + 1, int(step)))
+
+            print(f"[liq_heatmap_history] returning empty: prices={len(prices)} buckets")
+
+            return JSONResponse(content={
+                "schema_version": 1,
+                "symbol": symbol,
+                "step": step,
+                "price_min": price_min,
+                "price_max": price_max,
+                "minutes": 0,
+                "stride": stride,
+                "t": [],
+                "src": [],
+                "prices": prices,
+                "long": [],
+                "short": [],
+                "encoding": "u8",
+                "scale": 255
+            })
+
+        # Build unified grid based on current src (or most recent frame)
+        if current:
+            current_src = current.get('src', 0)
+            step = current.get('step', DEFAULT_STEP)
+        else:
+            current_src = frames[-1].src
+            step = DEFAULT_STEP
+
         prices, price_min, price_max = build_unified_grid(
             frames, current_src, step, DEFAULT_BAND_PCT
         )
 
         if not prices:
-            raise HTTPException(status_code=500, detail="Could not build price grid")
+            # Fallback grid
+            price_min = 92000.0
+            price_max = 108000.0
+            step = DEFAULT_STEP
+            prices = list(range(int(price_min), int(price_max) + 1, int(step)))
 
         # Build response arrays
         t_arr = []
@@ -450,6 +499,8 @@ def create_app() -> FastAPI:
             long_row, short_row = map_frame_to_grid(frame, prices, step)
             long_matrix.append(long_row)
             short_matrix.append(short_row)
+
+        print(f"[liq_heatmap_history] response: frames={len(t_arr)} prices={len(prices)} long_shape={len(long_matrix)}x{len(long_matrix[0]) if long_matrix else 0}")
 
         response = {
             "schema_version": 1,
