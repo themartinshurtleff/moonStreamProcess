@@ -52,6 +52,32 @@ LIQ_DEBUG_LOG = os.path.join(POC_DIR, "liq_debug.jsonl")
 # Plot feed for real-time chart (OHLC + zones per minute)
 PLOT_FEED_FILE = os.path.join(POC_DIR, "plot_feed.jsonl")
 
+# Log rotation thresholds
+LOG_ROTATION_MAX_MB = 200
+LOG_ROTATION_MAX_AGE_HOURS = 24
+
+
+def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: float = 24) -> bool:
+    """Rotate log file if it exceeds size or age limits."""
+    if not log_path or not os.path.exists(log_path):
+        return False
+
+    try:
+        stat = os.stat(log_path)
+        size_mb = stat.st_size / (1024 * 1024)
+        age_hours = (time.time() - stat.st_mtime) / 3600
+
+        if size_mb > max_mb or age_hours > max_age_hours:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            base, ext = os.path.splitext(log_path)
+            backup_path = f"{base}.{timestamp}{ext}"
+            os.rename(log_path, backup_path)
+            print(f"Rotated log: {log_path} -> {backup_path}")
+            return True
+    except Exception as e:
+        print(f"Log rotation failed: {e}")
+    return False
+
 
 def _write_debug_log(entry: dict):
     """Append a debug entry to liq_debug.jsonl."""
@@ -1276,6 +1302,10 @@ def main():
     console = Console()
     console.print("\n[bold blue]Full BTC Perpetual Metrics Viewer[/]")
     console.print("Connecting to Binance futures websocket + REST pollers...\n")
+
+    # Log rotation on startup
+    _rotate_log_if_needed(LIQ_DEBUG_LOG, LOG_ROTATION_MAX_MB, LOG_ROTATION_MAX_AGE_HOURS)
+    _rotate_log_if_needed(PLOT_FEED_FILE, LOG_ROTATION_MAX_MB, LOG_ROTATION_MAX_AGE_HOURS)
 
     processor = FullMetricsProcessor()
     connector = MultiExchangeConnector(processor.process_message)

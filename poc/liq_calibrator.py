@@ -33,6 +33,48 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: float = 24) -> bool:
+    """
+    Rotate log file if it exceeds size or age limits.
+
+    Returns True if rotation occurred.
+    """
+    if not log_path or not os.path.exists(log_path):
+        return False
+
+    try:
+        stat = os.stat(log_path)
+        size_mb = stat.st_size / (1024 * 1024)
+        age_hours = (time.time() - stat.st_mtime) / 3600
+
+        should_rotate = False
+        reason = None
+
+        if size_mb > max_mb:
+            should_rotate = True
+            reason = f"size={size_mb:.1f}MB > {max_mb}MB"
+        elif age_hours > max_age_hours:
+            should_rotate = True
+            reason = f"age={age_hours:.1f}h > {max_age_hours}h"
+
+        if should_rotate:
+            # Generate timestamped backup name
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            base, ext = os.path.splitext(log_path)
+            backup_path = f"{base}.{timestamp}{ext}"
+
+            # Rename existing file
+            os.rename(log_path, backup_path)
+            logger.info(f"Rotated log: {log_path} -> {backup_path} ({reason})")
+            return True
+
+    except Exception as e:
+        logger.warning(f"Log rotation failed for {log_path}: {e}")
+
+    return False
+
+
 # Default persistence file
 DEFAULT_WEIGHTS_FILE = "liq_calibrator_weights.json"
 
@@ -121,6 +163,23 @@ MIN_BIAS_SAMPLES = 10
 
 # Epsilon for numerical stability
 EPS = 1e-9
+
+# =============================================================================
+# SAFETY GUARDRAILS: Kill-switch thresholds for unattended calibration
+# =============================================================================
+# Log rotation
+LOG_ROTATION_MAX_MB = 200           # Rotate if log exceeds this size
+LOG_ROTATION_MAX_AGE_HOURS = 24     # Rotate if log older than this
+
+# Kill-switch thresholds
+SAFETY_ENTROPY_MIN = 1.6            # Minimum weight entropy (below = collapse)
+SAFETY_MAX_WEIGHT_CAP = 0.35        # Max weight cap (hitting this repeatedly = bad)
+SAFETY_CONSECUTIVE_ENTROPY_TRIP = 3 # Consecutive cycles with H < SAFETY_ENTROPY_MIN
+SAFETY_CONSECUTIVE_CLAMP_TRIP = 3   # Consecutive cycles with max_weight at cap
+SAFETY_CONSECUTIVE_BOUNDS_TRIP = 6  # Consecutive cycles with buffer/tolerance at bounds
+
+# Src quality sentinel
+SAFETY_MARK_MISSING_WARN_MINUTES = 1440  # Warn if mark=0% for this many minutes (24h)
 
 
 @dataclass
@@ -324,8 +383,32 @@ class LiquidationCalibrator:
         # Approach event tracking for this calibration window
         self.approach_events_count: int = 0
 
-        # Setup logging
+        # =================================================================
+        # SAFETY GUARDRAILS: Kill-switch tracking
+        # =================================================================
+        # Calibration enabled flag - can be tripped by safety checks
+        self.calibration_enabled: bool = True
+        self.safety_trip_reason: Optional[str] = None
+
+        # Consecutive trip counters
+        self._consecutive_low_entropy: int = 0
+        self._consecutive_max_weight_cap: int = 0
+        self._consecutive_buffer_at_bounds: int = 0
+        self._consecutive_tolerance_at_bounds: int = 0
+
+        # Src quality tracking (per-cycle counts, reset after logging)
+        self._src_source_counts: Dict[str, int] = {"mark": 0, "mid": 0, "last": 0, "fallback": 0}
+        self._total_minutes_no_mark: int = 0  # Running counter across sessions
+        self._mark_warning_emitted: bool = False
+
+        # Setup logging with rotation
         if log_file:
+            # Rotate log if too large or too old
+            _rotate_log_if_needed(
+                log_file,
+                max_mb=LOG_ROTATION_MAX_MB,
+                max_age_hours=LOG_ROTATION_MAX_AGE_HOURS
+            )
             self.log_fh = open(log_file, 'a')
         else:
             self.log_fh = None
@@ -852,6 +935,13 @@ class LiquidationCalibrator:
 
         # Track band counts
         self.stats.band_counts[band] += 1
+
+        # Track src_source for quality sentinel
+        src_key = src_source.replace("_ohlc4", "")  # Normalize fallback_ohlc4 -> fallback
+        if src_key in self._src_source_counts:
+            self._src_source_counts[src_key] += 1
+        else:
+            self._src_source_counts["fallback"] += 1
 
         # Update window high/low for approach gating
         self.stats.window_high = max(self.stats.window_high, event.price)
@@ -2027,19 +2117,131 @@ class LiquidationCalibrator:
         # Store approach events count before reset
         approach_events_this_window = self.approach_events_count
 
+        # =================================================================
+        # SAFETY GUARDRAILS: Check for dangerous conditions
+        # =================================================================
+        max_weight = max(new_weights) if new_weights else 0
+        min_weight = min(new_weights) if new_weights else 0
+        buffer_at_min = abs(new_buffer - self.min_buffer) < 1e-6
+        buffer_at_max = abs(new_buffer - self.max_buffer) < 1e-6
+        tolerance_at_min = new_tolerance <= self.min_tolerance
+        tolerance_at_max = new_tolerance >= self.max_tolerance
+
+        # Track consecutive safety conditions
+        if weight_entropy < SAFETY_ENTROPY_MIN:
+            self._consecutive_low_entropy += 1
+        else:
+            self._consecutive_low_entropy = 0
+
+        if max_weight >= self.max_weight - 0.01:  # Within 1% of cap
+            self._consecutive_max_weight_cap += 1
+        else:
+            self._consecutive_max_weight_cap = 0
+
+        if buffer_at_min or buffer_at_max:
+            self._consecutive_buffer_at_bounds += 1
+        else:
+            self._consecutive_buffer_at_bounds = 0
+
+        if tolerance_at_min or tolerance_at_max:
+            self._consecutive_tolerance_at_bounds += 1
+        else:
+            self._consecutive_tolerance_at_bounds = 0
+
+        # Check for kill-switch conditions
+        safety_trip_triggered = False
+        safety_trip_reason = None
+
+        if self._consecutive_low_entropy >= SAFETY_CONSECUTIVE_ENTROPY_TRIP:
+            safety_trip_triggered = True
+            safety_trip_reason = f"entropy_collapse: H={weight_entropy:.3f} < {SAFETY_ENTROPY_MIN} for {self._consecutive_low_entropy} cycles"
+
+        elif self._consecutive_max_weight_cap >= SAFETY_CONSECUTIVE_CLAMP_TRIP:
+            safety_trip_triggered = True
+            safety_trip_reason = f"max_weight_cap: max_w={max_weight:.4f} at cap for {self._consecutive_max_weight_cap} cycles"
+
+        elif (self._consecutive_buffer_at_bounds >= SAFETY_CONSECUTIVE_BOUNDS_TRIP or
+              self._consecutive_tolerance_at_bounds >= SAFETY_CONSECUTIVE_BOUNDS_TRIP):
+            safety_trip_triggered = True
+            bounds_info = []
+            if self._consecutive_buffer_at_bounds >= SAFETY_CONSECUTIVE_BOUNDS_TRIP:
+                bounds_info.append(f"buffer_at_bounds={self._consecutive_buffer_at_bounds}")
+            if self._consecutive_tolerance_at_bounds >= SAFETY_CONSECUTIVE_BOUNDS_TRIP:
+                bounds_info.append(f"tolerance_at_bounds={self._consecutive_tolerance_at_bounds}")
+            safety_trip_reason = f"bounds_pinned: {', '.join(bounds_info)}"
+
+        # Log safety trip if triggered
+        if safety_trip_triggered and self.calibration_enabled:
+            self.calibration_enabled = False
+            self.safety_trip_reason = safety_trip_reason
+            print(f"  SAFETY_TRIP: {safety_trip_reason}")
+            print(f"  Calibration DISABLED - weights/buffer/tolerance will not be updated")
+
+            if self.log_fh:
+                safety_entry = {
+                    "type": "safety_trip",
+                    "timestamp": datetime.now().isoformat(),
+                    "minute_key": minute_key,
+                    "cycle": self.calibration_count,
+                    "reason": safety_trip_reason,
+                    "entropy": round(weight_entropy, 4),
+                    "max_weight": round(max_weight, 4),
+                    "min_weight": round(min_weight, 6),
+                    "buffer": round(new_buffer, 6),
+                    "tolerance": new_tolerance,
+                    "consecutive_low_entropy": self._consecutive_low_entropy,
+                    "consecutive_max_weight_cap": self._consecutive_max_weight_cap,
+                    "consecutive_buffer_at_bounds": self._consecutive_buffer_at_bounds,
+                    "consecutive_tolerance_at_bounds": self._consecutive_tolerance_at_bounds
+                }
+                self.log_fh.write(json.dumps(safety_entry) + '\n')
+                self.log_fh.flush()
+
+        # =================================================================
+        # SRC QUALITY SENTINEL: Check for missing mark price
+        # =================================================================
+        total_src_events = sum(self._src_source_counts.values())
+        mark_count = self._src_source_counts.get("mark", 0)
+
+        if total_src_events > 0 and mark_count == 0:
+            self._total_minutes_no_mark += self.window_minutes
+        else:
+            self._total_minutes_no_mark = 0
+
+        # Emit warning if mark has been missing for a full day
+        if self._total_minutes_no_mark >= SAFETY_MARK_MISSING_WARN_MINUTES and not self._mark_warning_emitted:
+            self._mark_warning_emitted = True
+            if self.log_fh:
+                mark_warning = {
+                    "type": "mark_stream_missing",
+                    "timestamp": datetime.now().isoformat(),
+                    "minute_key": minute_key,
+                    "minutes_no_mark": self._total_minutes_no_mark,
+                    "action": "continue_using_mid",
+                    "src_source_counts": self._src_source_counts.copy()
+                }
+                self.log_fh.write(json.dumps(mark_warning) + '\n')
+                self.log_fh.flush()
+            print(f"  WARN: mark_price stream missing for {self._total_minutes_no_mark} minutes, using mid_price")
+
         # Reset stats for next window
         self.stats = CalibrationStats()
         self.approach_events_count = 0
+        self._src_source_counts = {"mark": 0, "mid": 0, "last": 0, "fallback": 0}  # Reset per-cycle
         self.minutes_since_calibration = 0
         self.calibration_count += 1
         self.last_calibration_minute = minute_key
 
-        # Update current params
-        self.current_weights = new_weights
-        self.current_buffer = new_buffer
-
-        # Persist weights to file
-        self._save_weights()
+        # Update current params ONLY if calibration is still enabled
+        if self.calibration_enabled:
+            self.current_weights = new_weights
+            self.current_buffer = new_buffer
+            # Persist weights to file
+            self._save_weights()
+        else:
+            # Keep old weights, just log that we're not updating
+            new_weights = self.current_weights
+            new_buffer = self.current_buffer
 
         # Notify callback
         result = {
@@ -2140,7 +2342,26 @@ class LiquidationCalibrator:
             'ladder': self.current_ladder,
             'src_price': round(snapshot.src, 2),
             'top_long_zones': [[p, round(s, 3)] for p, s in top_longs],
-            'top_short_zones': [[p, round(s, 3)] for p, s in top_shorts]
+            'top_short_zones': [[p, round(s, 3)] for p, s in top_shorts],
+            # =================================================================
+            # SAFETY GUARDRAILS: Per-cycle safety metrics
+            # =================================================================
+            'safety': {
+                'calibration_enabled': self.calibration_enabled,
+                'entropy': round(-sum(w * math.log(w) if w > EPS else 0 for w in new_weights), 4),
+                'max_weight': round(max(new_weights) if new_weights else 0, 4),
+                'min_weight': round(min(new_weights) if new_weights else 0, 6),
+                'buffer_at_min': abs(new_buffer - self.min_buffer) < 1e-6,
+                'buffer_at_max': abs(new_buffer - self.max_buffer) < 1e-6,
+                'tolerance_at_min': new_tolerance <= self.min_tolerance,
+                'tolerance_at_max': new_tolerance >= self.max_tolerance,
+                'consecutive_low_entropy': self._consecutive_low_entropy,
+                'consecutive_max_weight_cap': self._consecutive_max_weight_cap,
+                'consecutive_buffer_at_bounds': self._consecutive_buffer_at_bounds,
+                'consecutive_tolerance_at_bounds': self._consecutive_tolerance_at_bounds,
+                'src_source_counts': self._src_source_counts.copy(),
+                'minutes_no_mark': self._total_minutes_no_mark
+            }
         }
 
         self.log_fh.write(json.dumps(log_entry) + '\n')
