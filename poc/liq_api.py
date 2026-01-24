@@ -400,14 +400,15 @@ def create_app() -> FastAPI:
         Get historical liquidation heatmap data.
 
         Returns time-series of intensity values for backfilling charts.
-        Intensities are u8 encoded (0-255) for efficiency.
+        Intensities are u8 encoded (0-255) in flat row-major arrays.
 
         Response format:
-        - t: array of timestamps
-        - src: array of source prices
+        - t: array of timestamps (int milliseconds)
         - prices: unified price grid
-        - long: 2D array [frames x prices] of u8 intensities
-        - short: 2D array [frames x prices] of u8 intensities
+        - long: flat row-major array [frames * prices] of u8 intensities
+        - short: flat row-major array [frames * prices] of u8 intensities
+        - step: price bucket size
+        - scale: 255 (max intensity value)
         """
         # Clamp parameters
         minutes = max(5, min(720, minutes))
@@ -421,12 +422,6 @@ def create_app() -> FastAPI:
 
         # Get historical frames
         frames = _cache.history.get_frames(minutes=minutes, stride=stride)
-
-        # Debug output
-        frame_count = len(frames)
-        total_frames = _cache.history.frame_count()
-        print(f"[liq_heatmap_history] symbol={symbol} minutes={minutes} stride={stride}")
-        print(f"[liq_heatmap_history] frames_returned={frame_count} total_in_buffer={total_frames}")
 
         # If no frames yet, return empty response (not 404)
         if not frames:
@@ -445,24 +440,16 @@ def create_app() -> FastAPI:
                 step = DEFAULT_STEP
                 price_min = 92000.0
                 price_max = 108000.0
-                prices = list(range(int(price_min), int(price_max) + 1, int(step)))
+                prices = [float(p) for p in range(int(price_min), int(price_max) + int(step), int(step))]
 
-            print(f"[liq_heatmap_history] returning empty: prices={len(prices)} buckets")
+            print(f"[liq_heatmap_history] EMPTY: frames=0 prices_len={len(prices)}")
 
             return JSONResponse(content={
-                "schema_version": 1,
-                "symbol": symbol,
-                "step": step,
-                "price_min": price_min,
-                "price_max": price_max,
-                "minutes": 0,
-                "stride": stride,
                 "t": [],
-                "src": [],
                 "prices": prices,
                 "long": [],
                 "short": [],
-                "encoding": "u8",
+                "step": step,
                 "scale": 255
             })
 
@@ -483,39 +470,49 @@ def create_app() -> FastAPI:
             price_min = 92000.0
             price_max = 108000.0
             step = DEFAULT_STEP
-            prices = list(range(int(price_min), int(price_max) + 1, int(step)))
+            prices = [float(p) for p in range(int(price_min), int(price_max) + int(step), int(step))]
 
-        # Build response arrays
+        prices_len = len(prices)
+
+        # Build flat row-major arrays
         t_arr = []
-        src_arr = []
-        long_matrix = []
-        short_matrix = []
+        long_flat = []
+        short_flat = []
 
         for frame in frames:
-            t_arr.append(frame.ts)
-            src_arr.append(frame.src)
+            # Timestamp in milliseconds (int)
+            t_arr.append(int(frame.ts * 1000))
 
-            # Map frame to unified grid
+            # Map frame to unified grid and append to flat arrays
             long_row, short_row = map_frame_to_grid(frame, prices, step)
-            long_matrix.append(long_row)
-            short_matrix.append(short_row)
+            long_flat.extend(long_row)
+            short_flat.extend(short_row)
 
-        print(f"[liq_heatmap_history] response: frames={len(t_arr)} prices={len(prices)} long_shape={len(long_matrix)}x{len(long_matrix[0]) if long_matrix else 0}")
+        # Debug stats
+        num_frames = len(t_arr)
+        long_len = len(long_flat)
+        short_len = len(short_flat)
+        expected_len = num_frames * prices_len
+
+        max_long = max(long_flat) if long_flat else 0
+        max_short = max(short_flat) if short_flat else 0
+        nonzero_long = sum(1 for v in long_flat if v > 0)
+        nonzero_short = sum(1 for v in short_flat if v > 0)
+
+        first_ts_ms = t_arr[0] if t_arr else 0
+        last_ts_ms = t_arr[-1] if t_arr else 0
+
+        print(f"[liq_heatmap_history] frames={num_frames} prices_len={prices_len} long_len={long_len} short_len={short_len}")
+        print(f"[liq_heatmap_history] max_long={max_long} max_short={max_short} nonzero_long={nonzero_long} nonzero_short={nonzero_short}")
+        print(f"[liq_heatmap_history] first_ts_ms={first_ts_ms} last_ts_ms={last_ts_ms}")
+        print(f"[liq_heatmap_history] len_check: expected={expected_len} actual_long={long_len} actual_short={short_len} OK={long_len == expected_len and short_len == expected_len}")
 
         response = {
-            "schema_version": 1,
-            "symbol": symbol,
-            "step": step,
-            "price_min": price_min,
-            "price_max": price_max,
-            "minutes": len(frames),
-            "stride": stride,
             "t": t_arr,
-            "src": src_arr,
             "prices": prices,
-            "long": long_matrix,
-            "short": short_matrix,
-            "encoding": "u8",
+            "long": long_flat,
+            "short": short_flat,
+            "step": step,
             "scale": 255
         }
 
