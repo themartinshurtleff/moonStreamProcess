@@ -45,10 +45,15 @@ def setup_debug_logging(log_file: str = None):
 
 @dataclass
 class LiqBucket:
-    """A single liquidation zone bucket."""
+    """A single liquidation zone bucket with fixed placement."""
     price: float
     strength: float
     last_updated_minute: int
+    # Fixed placement: track the src price when this zone was created
+    origin_src: float = 0.0
+    origin_minute: int = 0
+    # Track which leverage tier(s) contributed to this zone
+    leverage_contributions: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -154,9 +159,21 @@ class LiquidationStressEngine:
         else:  # down
             return math.ceil(price / self.steps) * self.steps
 
+    # Zone creation threshold: only create/strengthen zones when volume is above this ratio
+    ZONE_CREATION_THRESHOLD = 0.5  # Create zones even at 50% of average volume
+
+    # Minimum strength to add (prevents micro-zones from low volume)
+    MIN_STRENGTH_ADD = 0.01
+
     def update(self, symbol: str, minute_metrics: dict) -> None:
         """
         Update liquidation predictions for a symbol based on new minute metrics.
+
+        FIXED-ZONE MODEL:
+        - Zones are placed at fixed prices based on src at time of creation
+        - Zones stay at their price until swept (price crosses them)
+        - Zones decay over time but don't move
+        - New zones are only created when volume is significant
 
         Args:
             symbol: Symbol name (e.g., "BTC", "ETH", "SOL")
@@ -198,13 +215,25 @@ class LiquidationStressEngine:
             buy_ratio = math.log(buy_ratio + 1)
             sell_ratio = math.log(sell_ratio + 1)
 
-        # Step 3: Apply decay to all existing buckets
+        # Step 3: Apply decay to all existing buckets (zones stay in place, just weaken)
         self._apply_decay(state)
 
-        # Step 4: Remove buckets that price has crossed
-        self._remove_crossed_buckets(state, perp_high, perp_low)
+        # Step 4: Remove buckets that price has crossed (SWEEP - immediate deletion)
+        swept = self._remove_crossed_buckets(state, perp_high, perp_low)
 
-        # Step 5: Calculate new liquidation zones for each leverage with weights
+        # Step 5: Only create/strengthen zones if volume is significant
+        # This prevents constant zone creation at every price tick
+        should_create_zones = (buy_ratio >= self.ZONE_CREATION_THRESHOLD or
+                               sell_ratio >= self.ZONE_CREATION_THRESHOLD)
+
+        if not should_create_zones:
+            # Still do debug logging but skip zone creation
+            if self.debug_enabled and symbol == self.debug_symbol:
+                logger.debug(f"[{symbol}] Minute {state.current_minute}: Low volume, skipping zone creation "
+                           f"(buy_ratio={buy_ratio:.2f}, sell_ratio={sell_ratio:.2f})")
+            return
+
+        # Step 6: Calculate new liquidation zones for each leverage with weights
         # Get the weighted ladder for this symbol
         weighted_ladder = state.leverage_config.get_weighted_ladder()
 
@@ -229,25 +258,42 @@ class LiquidationStressEngine:
             short_strength_add = sell_ratio * weight
             long_strength_add = buy_ratio * weight
 
-            # Add to short zones (weighted by sell ratio * leverage weight)
-            if bucket_up not in state.short_zones:
-                state.short_zones[bucket_up] = LiqBucket(
-                    price=bucket_up,
-                    strength=0.0,
-                    last_updated_minute=state.current_minute
-                )
-            state.short_zones[bucket_up].strength += short_strength_add
-            state.short_zones[bucket_up].last_updated_minute = state.current_minute
+            # Only add if strength is meaningful
+            if short_strength_add >= self.MIN_STRENGTH_ADD:
+                # Add to short zones (weighted by sell ratio * leverage weight)
+                if bucket_up not in state.short_zones:
+                    state.short_zones[bucket_up] = LiqBucket(
+                        price=bucket_up,
+                        strength=0.0,
+                        last_updated_minute=state.current_minute,
+                        origin_src=src,
+                        origin_minute=state.current_minute,
+                        leverage_contributions={}
+                    )
+                state.short_zones[bucket_up].strength += short_strength_add
+                state.short_zones[bucket_up].last_updated_minute = state.current_minute
+                # Track leverage contribution
+                if lev not in state.short_zones[bucket_up].leverage_contributions:
+                    state.short_zones[bucket_up].leverage_contributions[lev] = 0.0
+                state.short_zones[bucket_up].leverage_contributions[lev] += short_strength_add
 
-            # Add to long zones (weighted by buy ratio * leverage weight)
-            if bucket_dn not in state.long_zones:
-                state.long_zones[bucket_dn] = LiqBucket(
-                    price=bucket_dn,
-                    strength=0.0,
-                    last_updated_minute=state.current_minute
-                )
-            state.long_zones[bucket_dn].strength += long_strength_add
-            state.long_zones[bucket_dn].last_updated_minute = state.current_minute
+            if long_strength_add >= self.MIN_STRENGTH_ADD:
+                # Add to long zones (weighted by buy ratio * leverage weight)
+                if bucket_dn not in state.long_zones:
+                    state.long_zones[bucket_dn] = LiqBucket(
+                        price=bucket_dn,
+                        strength=0.0,
+                        last_updated_minute=state.current_minute,
+                        origin_src=src,
+                        origin_minute=state.current_minute,
+                        leverage_contributions={}
+                    )
+                state.long_zones[bucket_dn].strength += long_strength_add
+                state.long_zones[bucket_dn].last_updated_minute = state.current_minute
+                # Track leverage contribution
+                if lev not in state.long_zones[bucket_dn].leverage_contributions:
+                    state.long_zones[bucket_dn].leverage_contributions[lev] = 0.0
+                state.long_zones[bucket_dn].leverage_contributions[lev] += long_strength_add
 
             # Track for debug
             if self.debug_enabled and symbol == self.debug_symbol:
@@ -258,7 +304,8 @@ class LiquidationStressEngine:
         if self.debug_enabled and symbol == self.debug_symbol:
             self._log_debug_update(
                 symbol, state, src, buy_ratio, sell_ratio,
-                debug_projected_longs, debug_projected_shorts
+                debug_projected_longs, debug_projected_shorts,
+                swept_count=swept
             )
 
     def _log_debug_update(
@@ -269,11 +316,14 @@ class LiquidationStressEngine:
         buy_ratio: float,
         sell_ratio: float,
         projected_longs: List[Tuple],
-        projected_shorts: List[Tuple]
+        projected_shorts: List[Tuple],
+        swept_count: int = 0
     ):
         """Log detailed debug output for an update."""
         logger.debug("=" * 80)
         logger.debug(f"[{symbol}] MINUTE {state.current_minute} UPDATE")
+        if swept_count > 0:
+            logger.debug(f"  *** {swept_count} ZONES SWEPT THIS MINUTE ***")
         logger.debug("=" * 80)
         logger.debug(f"  src (ohlc4) = ${src:,.2f}")
         logger.debug(f"  buyRatio = {buy_ratio:.4f}, sellRatio = {sell_ratio:.4f}")
@@ -335,17 +385,36 @@ class LiquidationStressEngine:
         state: SymbolState,
         high: float,
         low: float
-    ) -> None:
-        """Remove buckets that price has crossed (liquidations triggered)."""
+    ) -> int:
+        """
+        Remove buckets that price has crossed (liquidations triggered / swept).
+
+        Returns:
+            Number of zones swept
+        """
+        swept_count = 0
+
         # Remove short zones where price went above (shorts got liquidated)
         to_remove = [p for p in state.short_zones if high >= p]
         for price in to_remove:
+            if self.debug_enabled:
+                zone = state.short_zones[price]
+                logger.debug(f"SWEPT SHORT zone at ${price:,.0f} (strength={zone.strength:.3f}, "
+                           f"age={state.current_minute - zone.origin_minute} min)")
             del state.short_zones[price]
+            swept_count += 1
 
         # Remove long zones where price went below (longs got liquidated)
         to_remove = [p for p in state.long_zones if low <= p]
         for price in to_remove:
+            if self.debug_enabled:
+                zone = state.long_zones[price]
+                logger.debug(f"SWEPT LONG zone at ${price:,.0f} (strength={zone.strength:.3f}, "
+                           f"age={state.current_minute - zone.origin_minute} min)")
             del state.long_zones[price]
+            swept_count += 1
+
+        return swept_count
 
     def top_levels(
         self,
