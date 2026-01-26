@@ -10,6 +10,8 @@ Uses per-symbol leverage ladders with weights for realistic liquidation zone est
 import math
 import logging
 import os
+import json
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
@@ -101,7 +103,8 @@ class LiquidationStressEngine:
         log_scale: bool = LOG_SCALE,
         debug_symbol: str = "BTC",
         debug_enabled: bool = False,
-        debug_log_file: str = None
+        debug_log_file: str = None,
+        sweep_log_file: str = None  # JSONL file for sweep events
     ):
         self.steps = steps
         self.vol_length = vol_length
@@ -111,6 +114,8 @@ class LiquidationStressEngine:
         self.debug_symbol = debug_symbol
         self.debug_enabled = debug_enabled
         self.debug_log_file = debug_log_file
+        self.sweep_log_file = sweep_log_file
+        self._sweep_log_fh = None
 
         # Per-symbol state
         self.symbols: Dict[str, SymbolState] = {}
@@ -121,6 +126,13 @@ class LiquidationStressEngine:
             if log_path:
                 logger.debug(f"Debug logging to file: {log_path}")
             logger.debug(f"LiquidationStressEngine initialized with debug_symbol={debug_symbol}")
+
+        # Setup sweep log file
+        if sweep_log_file:
+            try:
+                self._sweep_log_fh = open(sweep_log_file, 'a')
+            except Exception as e:
+                logger.warning(f"Could not open sweep log file: {e}")
 
     def _get_or_create_state(self, symbol: str) -> SymbolState:
         """Get or create state for a symbol."""
@@ -393,24 +405,61 @@ class LiquidationStressEngine:
             Number of zones swept
         """
         swept_count = 0
+        ts_now = time.time()
 
         # Remove short zones where price went above (shorts got liquidated)
         to_remove = [p for p in state.short_zones if high >= p]
         for price in to_remove:
+            zone = state.short_zones[price]
+            age_min = state.current_minute - zone.origin_minute
+
             if self.debug_enabled:
-                zone = state.short_zones[price]
                 logger.debug(f"SWEPT SHORT zone at ${price:,.0f} (strength={zone.strength:.3f}, "
-                           f"age={state.current_minute - zone.origin_minute} min)")
+                           f"age={age_min} min)")
+
+            # Log sweep to JSONL
+            if self._sweep_log_fh:
+                sweep_entry = {
+                    "type": "sweep",
+                    "ts": ts_now,
+                    "side": "short",
+                    "price": price,
+                    "strength": round(zone.strength, 4),
+                    "age_min": age_min,
+                    "trigger_high": high,
+                    "minute_key": state.current_minute
+                }
+                self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
+                self._sweep_log_fh.flush()
+
             del state.short_zones[price]
             swept_count += 1
 
         # Remove long zones where price went below (longs got liquidated)
         to_remove = [p for p in state.long_zones if low <= p]
         for price in to_remove:
+            zone = state.long_zones[price]
+            age_min = state.current_minute - zone.origin_minute
+
             if self.debug_enabled:
-                zone = state.long_zones[price]
                 logger.debug(f"SWEPT LONG zone at ${price:,.0f} (strength={zone.strength:.3f}, "
-                           f"age={state.current_minute - zone.origin_minute} min)")
+                           f"age={age_min} min)")
+
+            # Log sweep to JSONL
+            if self._sweep_log_fh:
+                sweep_entry = {
+                    "type": "sweep",
+                    "ts": ts_now,
+                    "side": "long",
+                    "price": price,
+                    "strength": round(zone.strength, 4),
+                    "age_min": age_min,
+                    "trigger_low": low,
+                    "minute_key": state.current_minute
+                }
+                self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
+                self._sweep_log_fh.flush()
+
             del state.long_zones[price]
             swept_count += 1
 

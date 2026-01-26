@@ -459,7 +459,8 @@ class FullMetricsProcessor:
             fade=0.97,         # Decay factor
             debug_symbol="BTC",
             debug_enabled=True,
-            debug_log_file=os.path.join(POC_DIR, "liq_engine_debug.log")
+            debug_log_file=os.path.join(POC_DIR, "liq_engine_debug.log"),
+            sweep_log_file=os.path.join(POC_DIR, "liq_sweeps.jsonl")  # JSONL sweep log
         )
 
         # Self-calibrating system for leverage weights
@@ -1100,8 +1101,31 @@ class FullMetricsProcessor:
             long_intensity_raw.append(all_longs.get(price, 0.0))
             short_intensity_raw.append(all_shorts.get(price, 0.0))
 
-        # Compute rolling normalization using all non-zero strengths
-        all_strengths = [s for s in long_intensity_raw + short_intensity_raw if s > 0]
+        # === SPATIAL SMOOTHING ===
+        # Apply ±2 bucket weighted average to reduce noise while preserving clusters
+        # Weights: [0.1, 0.2, 0.4, 0.2, 0.1] = center-weighted
+        def smooth_array(arr, radius=2):
+            """Apply weighted spatial smoothing to intensity array."""
+            if len(arr) < 2 * radius + 1:
+                return arr
+            weights = [0.1, 0.2, 0.4, 0.2, 0.1]  # Must sum to 1.0
+            smoothed = []
+            for i in range(len(arr)):
+                total = 0.0
+                weight_sum = 0.0
+                for j, w in enumerate(weights):
+                    idx = i - radius + j
+                    if 0 <= idx < len(arr):
+                        total += arr[idx] * w
+                        weight_sum += w
+                smoothed.append(total / weight_sum if weight_sum > 0 else 0.0)
+            return smoothed
+
+        long_intensity_smooth = smooth_array(long_intensity_raw)
+        short_intensity_smooth = smooth_array(short_intensity_raw)
+
+        # Compute rolling normalization using all non-zero SMOOTHED strengths
+        all_strengths = [s for s in long_intensity_smooth + short_intensity_smooth if s > 0]
 
         if all_strengths:
             sorted_s = sorted(all_strengths)
@@ -1114,14 +1138,17 @@ class FullMetricsProcessor:
             p50, p95 = 0.0, 1.0
 
         # Normalize intensities to 0..1 using p50/p95
+        # Also apply threshold: only show if normalized value > 0.1
         def normalize(val):
             if val <= 0:
                 return 0.0
             norm = (val - p50) / (p95 - p50)
-            return max(0.0, min(1.0, norm))
+            norm = max(0.0, min(1.0, norm))
+            # Threshold filter: suppress very weak signals
+            return norm if norm > 0.1 else 0.0
 
-        long_intensity = [round(normalize(s), 4) for s in long_intensity_raw]
-        short_intensity = [round(normalize(s), 4) for s in short_intensity_raw]
+        long_intensity = [round(normalize(s), 4) for s in long_intensity_smooth]
+        short_intensity = [round(normalize(s), 4) for s in short_intensity_smooth]
 
         # Build top zones with age
         top_long_zones = [
