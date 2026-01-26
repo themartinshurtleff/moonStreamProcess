@@ -117,7 +117,10 @@ APPROACH_LEARN_PCT = 0.0035  # 0.35% - tighter than gating
 # Stress score component scales
 IMB_K = 0.15                # imbalance decay constant for aggression = 1 - exp(-abs_imb / IMB_K)
 OI_SCALE = 1000.0           # scale for abs(oi_change) in contract units
-DEPTH_SCALE = 100.0         # scale for depth thinning in base units
+# DEPTH_SCALE removed - now using fractional thinning (0-1 range naturally)
+
+# Depth window: number of buckets on each side for zone-local depth calculation
+DEPTH_WINDOW_BUCKETS = 3    # ±3 buckets = 7 total buckets around zone
 
 # Depth band coverage: store depth for buckets within this % of src price
 DEPTH_BAND_PCT = 0.02       # ±2% around src - wide enough for any approached zone
@@ -1306,7 +1309,7 @@ class LiquidationCalibrator:
         Compute stress score S in [0, 1] with full breakdown:
         - aggression = 1 - exp(-abs_imb / IMB_K) where abs_imb = |buyVol-sellVol|/(buyVol+sellVol)
         - oi_fuel = 1 - exp(-oi_abs / OI_SCALE) where oi_abs = abs(oi_change)
-        - depth_thinning = 1 - exp(-thin_raw / DEPTH_SCALE) computed around ZONE price
+        - depth_thinning = FRACTIONAL thinning: (depth_prev - depth_now) / depth_prev, clamped [0,1]
 
         S = 0.45 * depth_thinning + 0.35 * aggression + 0.20 * oi_fuel
 
@@ -1329,26 +1332,32 @@ class LiquidationCalibrator:
         oi_abs = abs(cache_entry.perp_oi_change)
         oi_fuel = 1.0 - math.exp(-oi_abs / OI_SCALE)
 
-        # === DEPTH THINNING (zone-local) ===
-        # Compute depth around the ZONE price, not around CMP
-        zone_bucket = self._bucket_price(zone_price, steps)
+        # === DEPTH THINNING (zone-local, fractional) ===
+        # Use robust window-based depth lookup around zone_price
+        radius = DEPTH_WINDOW_BUCKETS
 
-        # Get depth in ±2 buckets around zone from current depth_band
-        depth_now = self._get_depth_around_bucket(cache_entry.depth_band, zone_bucket, steps, radius=2)
+        # Get depth in ±W buckets around zone from current and previous depth_band
+        depth_now, n_buckets_now = self._get_depth_around_zone(
+            cache_entry.depth_band, zone_price, steps, radius=radius
+        )
 
-        # Get depth from previous minute
         if prev_cache is not None:
-            depth_prev = self._get_depth_around_bucket(prev_cache.depth_band, zone_bucket, steps, radius=2)
+            depth_prev, n_buckets_prev = self._get_depth_around_zone(
+                prev_cache.depth_band, zone_price, steps, radius=radius
+            )
         else:
             # Guard: no previous depth, set depth_thinning = 0
             depth_prev = 0.0
+            n_buckets_prev = 0
 
-        thin_raw = max(0.0, depth_prev - depth_now)
-
+        # Compute FRACTIONAL thinning (not exponential)
+        # thin_frac = (depth_prev - depth_now) / depth_prev, clamped to [0, 1]
         if depth_prev > EPS:
-            depth_thinning = 1.0 - math.exp(-thin_raw / DEPTH_SCALE)
+            thin_frac = (depth_prev - depth_now) / depth_prev
+            depth_thinning = max(0.0, min(1.0, thin_frac))
         else:
             # Guard: no previous depth data, don't fabricate
+            thin_frac = 0.0
             depth_thinning = 0.0
 
         # === COMBINED STRESS SCORE ===
@@ -1369,9 +1378,12 @@ class LiquidationCalibrator:
             'oi_fuel': oi_fuel,
             'depth_prev': depth_prev,
             'depth_now': depth_now,
-            'thin_raw': thin_raw,
+            'thin_frac': thin_frac,
             'depth_thinning': depth_thinning,
-            'zone_bucket': zone_bucket
+            'zone_price': zone_price,
+            'depth_window': radius,
+            'n_buckets_prev': n_buckets_prev,
+            'n_buckets_now': n_buckets_now
         }
 
     def _bucket_price(self, price: float, steps: float = None) -> float:
@@ -1391,35 +1403,47 @@ class LiquidationCalibrator:
             steps = self.steps
         return int(round(zone_price / steps))
 
-    def _get_depth_around_bucket(
+    def _get_depth_around_zone(
         self,
         depth_band: Dict[float, float],
-        center_bucket: float,
+        zone_price: float,
         steps: float,
-        radius: int = 2
-    ) -> float:
+        radius: int = DEPTH_WINDOW_BUCKETS
+    ) -> Tuple[float, int]:
         """
-        Sum depth from depth_band for buckets within ±radius of center_bucket.
+        Sum depth from depth_band for buckets within ±radius of zone_price.
+
+        Uses fuzzy bucket matching to avoid float key comparison issues:
+        - Computes the price window: [zone_price - radius*steps, zone_price + radius*steps]
+        - Sums all depth_band entries whose keys fall within this window
 
         Args:
-            depth_band: Dict of price_bucket -> size
-            center_bucket: Center price bucket
+            depth_band: Dict of price_bucket -> notional_size
+            zone_price: Target zone price (not necessarily a bucket key)
             steps: Bucket size
-            radius: Number of buckets on each side (default 2 = ±2 buckets)
+            radius: Number of buckets on each side (default DEPTH_WINDOW_BUCKETS)
 
         Returns:
-            Total depth around the center bucket
+            Tuple of (total_depth, n_buckets_found)
         """
         if not depth_band:
-            return 0.0
+            return 0.0, 0
+
+        # Define price window around zone
+        window_half = radius * steps
+        low_bound = zone_price - window_half
+        high_bound = zone_price + window_half
 
         total = 0.0
-        for offset in range(-radius, radius + 1):
-            bucket = center_bucket + (offset * steps)
-            if bucket in depth_band:
-                total += depth_band[bucket]
+        n_found = 0
 
-        return total
+        # Sum all depth_band entries within the window
+        for bucket_price, notional in depth_band.items():
+            if low_bound <= bucket_price <= high_bound:
+                total += notional
+                n_found += 1
+
+        return total, n_found
 
     def _get_previous_cache_entry(self) -> Optional[MinuteCacheEntry]:
         """Get the previous minute's cache entry."""
@@ -1469,20 +1493,22 @@ class LiquidationCalibrator:
             'src': round(cache_entry.src, 2),
             # Zone info
             'zone_price': round(zone_price, 2),
-            'zone_bucket': round(stress_breakdown['zone_bucket'], 2),
             'zone_side': zone_side,
             'zone_strength': round(zone_strength, 4),
             'approach_dist_pct': round(approach_dist_pct, 6),
-            # Stress breakdown
+            # Stress breakdown (updated for fractional thinning)
             'stress_breakdown': {
                 'abs_imb': round(stress_breakdown['abs_imb'], 4),
                 'aggression': round(stress_breakdown['aggression'], 4),
                 'oi_abs': round(stress_breakdown['oi_abs'], 4),
                 'oi_fuel': round(stress_breakdown['oi_fuel'], 4),
-                'depth_prev': round(stress_breakdown['depth_prev'], 4),
-                'depth_now': round(stress_breakdown['depth_now'], 4),
-                'thin_raw': round(stress_breakdown['thin_raw'], 4),
+                'depth_prev': round(stress_breakdown['depth_prev'], 2),
+                'depth_now': round(stress_breakdown['depth_now'], 2),
+                'thin_frac': round(stress_breakdown['thin_frac'], 4),
                 'depth_thinning': round(stress_breakdown['depth_thinning'], 4),
+                'depth_window': stress_breakdown.get('depth_window', 0),
+                'n_buckets_prev': stress_breakdown.get('n_buckets_prev', 0),
+                'n_buckets_now': stress_breakdown.get('n_buckets_now', 0),
                 'S': round(S, 4)
             },
             # Top 3 responsibilities with updates applied
@@ -1513,9 +1539,10 @@ class LiquidationCalibrator:
         if not self.log_fh:
             return
 
-        # Build selected zone details
+        # Build selected zone details with depth debug info
         selected_details = []
         for cand in selected:
+            sb = cand['stress_breakdown']
             selected_details.append({
                 'zone_price': round(cand['zone_price'], 2),
                 'zone_side': cand['zone_side'],
@@ -1524,9 +1551,18 @@ class LiquidationCalibrator:
                 'S_eff': round(cand['S_eff'], 4),
                 'resp_top3': {str(k): round(v, 4) for k, v in cand['resp_top3'].items()},
                 'stress_breakdown': {
-                    'aggression': round(cand['stress_breakdown']['aggression'], 4),
-                    'oi_fuel': round(cand['stress_breakdown']['oi_fuel'], 4),
-                    'depth_thinning': round(cand['stress_breakdown']['depth_thinning'], 4)
+                    'aggression': round(sb['aggression'], 4),
+                    'oi_fuel': round(sb['oi_fuel'], 4),
+                    'depth_thinning': round(sb['depth_thinning'], 4)
+                },
+                # Depth debug fields (new)
+                'depth_debug': {
+                    'depth_prev': round(sb.get('depth_prev', 0), 2),
+                    'depth_now': round(sb.get('depth_now', 0), 2),
+                    'thin_frac': round(sb.get('thin_frac', 0), 4),
+                    'window': sb.get('depth_window', 0),
+                    'n_buckets_prev': sb.get('n_buckets_prev', 0),
+                    'n_buckets_now': sb.get('n_buckets_now', 0)
                 }
             })
 
