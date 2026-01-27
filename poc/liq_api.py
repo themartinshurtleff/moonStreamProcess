@@ -65,7 +65,8 @@ OB_HEATMAP_IMPORT_ERROR = None
 try:
     from ob_heatmap import (
         OrderbookHeatmapBuffer, OrderbookFrame,
-        build_unified_grid, resample_frame_to_grid,
+        build_unified_grid as ob_build_unified_grid,
+        resample_frame_to_grid,
         DEFAULT_STEP, DEFAULT_RANGE_PCT
     )
     HAS_OB_HEATMAP = True
@@ -1166,10 +1167,10 @@ def create_app() -> FastAPI:
 
         # Use frame's grid or resample if overrides provided
         if price_min is not None or price_max is not None:
-            # Build custom grid
+            # Build custom grid (using ob_heatmap version for OrderbookFrame)
             p_min = price_min if price_min is not None else frame.price_min
             p_max = price_max if price_max is not None else frame.price_max
-            prices, p_min, p_max = build_unified_grid([frame], p_min, p_max, step)
+            prices, p_min, p_max = ob_build_unified_grid([frame], p_min, p_max, step)
             bid_u8, ask_u8 = resample_frame_to_grid(frame, prices, step)
         else:
             prices = frame.get_prices()
@@ -1249,8 +1250,8 @@ def create_app() -> FastAPI:
                 "norm_method": "p50_p95"
             })
 
-        # Build unified grid
-        prices, p_min, p_max = build_unified_grid(
+        # Build unified grid (using ob_heatmap version for OrderbookFrame)
+        prices, p_min, p_max = ob_build_unified_grid(
             frames,
             price_min=price_min,
             price_max=price_max,
