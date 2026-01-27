@@ -18,10 +18,14 @@ import json
 import os
 import sys
 import time
+import struct
 import threading
 from collections import deque
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Add parent to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,6 +54,10 @@ OB_HEATMAP_FILE = os.path.join(POC_DIR, "ob_heatmap_30s.bin")
 # Orderbook reconstructor stats file
 OB_RECON_STATS_FILE = os.path.join(POC_DIR, "ob_recon_stats.json")
 
+# Liquidation heatmap persistence files (V1 and V2)
+LIQ_HEATMAP_V1_FILE = os.path.join(POC_DIR, "liq_heatmap_v1.bin")
+LIQ_HEATMAP_V2_FILE = os.path.join(POC_DIR, "liq_heatmap_v2.bin")
+
 # Import orderbook heatmap module
 try:
     from ob_heatmap import (
@@ -73,6 +81,295 @@ HISTORY_MINUTES = 720
 # Default grid parameters
 DEFAULT_STEP = 20.0
 DEFAULT_BAND_PCT = 0.08  # ±8% around src
+
+# Liquidation heatmap persistence constants
+LIQ_FRAME_RECORD_SIZE = 4096  # Fixed 4KB per frame for fast seek
+LIQ_MAX_BUCKETS = 1000  # Max price buckets per frame
+
+# Binary record header format for liquidation heatmap (48 bytes)
+# ts(d) + src(d) + price_min(d) + price_max(d) + step(d) + n_buckets(I)
+LIQ_HEADER_FORMAT = '<dddddI'
+LIQ_HEADER_SIZE = struct.calcsize(LIQ_HEADER_FORMAT)  # 48 bytes
+
+
+class LiquidationHeatmapBuffer:
+    """
+    Persistent ring buffer for liquidation heatmap history.
+
+    Stores frames to disk for persistence across restarts.
+    Uses fixed-size binary records for efficient random access.
+
+    Binary format per frame (4096 bytes):
+    - Header (48 bytes): ts, src, price_min, price_max, step, n_buckets
+    - Long intensity (1000 bytes): u8 array
+    - Short intensity (1000 bytes): u8 array
+    - Padding to 4096 bytes
+    """
+
+    def __init__(self, persistence_path: str, max_frames: int = HISTORY_MINUTES):
+        self.persistence_path = persistence_path
+        self.max_frames = max_frames
+        self._lock = threading.RLock()
+        self._frames: deque = deque(maxlen=max_frames)
+        self._last_ts: float = 0
+        self._frames_written_since_compact = 0
+        self._compact_threshold = 100  # Compact every 100 frames
+
+        # Load existing frames on init
+        self._load_from_disk()
+
+    def _load_from_disk(self):
+        """Load frames from persistence file on startup."""
+        if not os.path.exists(self.persistence_path):
+            logger.info(f"[LIQ_BUFFER] No persistence file found at {self.persistence_path}")
+            return
+
+        file_size = os.path.getsize(self.persistence_path)
+        total_frames = file_size // LIQ_FRAME_RECORD_SIZE
+
+        if total_frames == 0:
+            logger.info("[LIQ_BUFFER] Persistence file is empty")
+            return
+
+        # Calculate how many frames to load (last max_frames)
+        frames_to_load = min(total_frames, self.max_frames)
+        start_offset = (total_frames - frames_to_load) * LIQ_FRAME_RECORD_SIZE
+
+        loaded = 0
+        oldest_ts = None
+        newest_ts = None
+
+        try:
+            with open(self.persistence_path, 'rb') as f:
+                f.seek(start_offset)
+                for _ in range(frames_to_load):
+                    record = f.read(LIQ_FRAME_RECORD_SIZE)
+                    if len(record) < LIQ_FRAME_RECORD_SIZE:
+                        break
+                    try:
+                        frame = self._frame_from_bytes(record)
+                        if frame is not None:
+                            self._frames.append(frame)
+                            loaded += 1
+                            if oldest_ts is None:
+                                oldest_ts = frame.ts
+                            newest_ts = frame.ts
+                            self._last_ts = frame.ts
+                    except Exception as e:
+                        logger.warning(f"[LIQ_BUFFER] Failed to parse frame: {e}")
+        except Exception as e:
+            logger.error(f"[LIQ_BUFFER] Failed to load from disk: {e}")
+            return
+
+        logger.info(
+            f"[LIQ_BUFFER] Loaded {loaded} frames from disk, "
+            f"oldest={oldest_ts}, newest={newest_ts}"
+        )
+
+    def _frame_to_bytes(self, frame: 'HistoryFrame') -> bytes:
+        """Serialize frame to fixed-size binary record."""
+        # Compute step from prices if available
+        if len(frame.prices) >= 2:
+            step = frame.prices[1] - frame.prices[0]
+        else:
+            step = DEFAULT_STEP
+
+        n_buckets = len(frame.long_intensity)
+
+        header = struct.pack(
+            LIQ_HEADER_FORMAT,
+            frame.ts, frame.src, frame.price_min, frame.price_max,
+            step, n_buckets
+        )
+
+        # Pad intensity arrays to LIQ_MAX_BUCKETS
+        long_padded = frame.long_intensity.ljust(LIQ_MAX_BUCKETS, b'\x00')[:LIQ_MAX_BUCKETS]
+        short_padded = frame.short_intensity.ljust(LIQ_MAX_BUCKETS, b'\x00')[:LIQ_MAX_BUCKETS]
+
+        # Total: 48 + 1000 + 1000 = 2048, pad to 4096
+        record = header + long_padded + short_padded
+        record = record.ljust(LIQ_FRAME_RECORD_SIZE, b'\x00')
+        return record
+
+    def _frame_from_bytes(self, data: bytes) -> Optional['HistoryFrame']:
+        """Deserialize frame from binary record."""
+        if len(data) < LIQ_HEADER_SIZE:
+            return None
+
+        header = struct.unpack(LIQ_HEADER_FORMAT, data[:LIQ_HEADER_SIZE])
+        ts, src, price_min, price_max, step, n_buckets = header
+
+        if ts <= 0 or n_buckets == 0:
+            return None
+
+        # Extract intensity arrays
+        long_start = LIQ_HEADER_SIZE
+        short_start = LIQ_HEADER_SIZE + LIQ_MAX_BUCKETS
+        long_intensity = data[long_start:long_start + n_buckets]
+        short_intensity = data[short_start:short_start + n_buckets]
+
+        # Reconstruct prices array from bounds and step
+        prices = []
+        p = price_min
+        while p <= price_max + 0.01 and len(prices) < n_buckets:
+            prices.append(p)
+            p += step
+
+        return HistoryFrame(
+            ts=ts,
+            src=src,
+            price_min=price_min,
+            price_max=price_max,
+            long_intensity=long_intensity,
+            short_intensity=short_intensity,
+            prices=prices
+        )
+
+    def add_frame(self, snapshot: Dict) -> bool:
+        """
+        Add a frame from a snapshot dict.
+        Returns True if frame was added (new timestamp).
+        """
+        ts = snapshot.get('ts', 0)
+        if ts <= 0:
+            return False
+
+        # Only add if we're in a new minute (floor to minute)
+        ts_minute = int(ts // 60)
+
+        with self._lock:
+            last_minute = int(self._last_ts // 60) if self._last_ts > 0 else -1
+            if ts_minute <= last_minute:
+                return False
+
+            # Extract and encode intensities
+            long_raw = snapshot.get('long_intensity', [])
+            short_raw = snapshot.get('short_intensity', [])
+
+            # Convert float 0..1 to u8 0..255
+            long_u8 = bytes([min(255, max(0, int(v * 255))) for v in long_raw])
+            short_u8 = bytes([min(255, max(0, int(v * 255))) for v in short_raw])
+
+            frame = HistoryFrame(
+                ts=ts,
+                src=snapshot.get('src', 0),
+                price_min=snapshot.get('price_min', 0),
+                price_max=snapshot.get('price_max', 0),
+                long_intensity=long_u8,
+                short_intensity=short_u8,
+                prices=snapshot.get('prices', [])
+            )
+
+            self._frames.append(frame)
+            self._last_ts = ts
+
+            # Persist to disk
+            self._persist_frame(frame)
+
+            self._frames_written_since_compact += 1
+            if self._frames_written_since_compact >= self._compact_threshold:
+                self._maybe_compact()
+                self._frames_written_since_compact = 0
+
+            return True
+
+    def _persist_frame(self, frame: 'HistoryFrame'):
+        """Append frame to persistence file."""
+        try:
+            with open(self.persistence_path, 'ab') as f:
+                f.write(self._frame_to_bytes(frame))
+        except Exception as e:
+            logger.error(f"[LIQ_BUFFER] Failed to persist frame: {e}")
+
+    def _maybe_compact(self):
+        """Compact file if it exceeds max_frames."""
+        if not os.path.exists(self.persistence_path):
+            return
+
+        file_size = os.path.getsize(self.persistence_path)
+        total_frames = file_size // LIQ_FRAME_RECORD_SIZE
+
+        if total_frames <= self.max_frames:
+            return
+
+        # Rewrite with only last max_frames
+        logger.info(f"[LIQ_BUFFER] Compacting file from {total_frames} to {self.max_frames} frames")
+
+        try:
+            start_offset = (total_frames - self.max_frames) * LIQ_FRAME_RECORD_SIZE
+            with open(self.persistence_path, 'rb') as f:
+                f.seek(start_offset)
+                data = f.read()
+
+            with open(self.persistence_path, 'wb') as f:
+                f.write(data)
+
+            logger.info(f"[LIQ_BUFFER] Compaction complete, file now {len(data)} bytes")
+        except Exception as e:
+            logger.error(f"[LIQ_BUFFER] Compaction failed: {e}")
+
+    def get_frames(
+        self,
+        minutes: int = 60,
+        stride: int = 1
+    ) -> List['HistoryFrame']:
+        """
+        Get recent frames with optional downsampling.
+
+        Args:
+            minutes: Number of minutes to return
+            stride: Return every Nth frame (1 = all frames)
+        """
+        with self._lock:
+            n_frames = min(minutes, len(self._frames))
+            if n_frames == 0:
+                return []
+
+            frames = list(self._frames)[-n_frames:]
+
+            if stride > 1:
+                frames = frames[::stride]
+
+            return frames
+
+    def frame_count(self) -> int:
+        """Get current frame count."""
+        with self._lock:
+            return len(self._frames)
+
+    def time_range(self) -> Tuple[float, float]:
+        """Get (oldest_ts, newest_ts) or (0, 0) if empty."""
+        with self._lock:
+            if not self._frames:
+                return (0, 0)
+            return (self._frames[0].ts, self._frames[-1].ts)
+
+    def get_time_range(self) -> Tuple[float, float]:
+        """Alias for time_range() for compatibility with HistoryBuffer."""
+        return self.time_range()
+
+    def get_stats(self) -> dict:
+        """Get buffer statistics."""
+        with self._lock:
+            frames_in_memory = len(self._frames)
+            last_ts = self._frames[-1].ts if self._frames else 0
+            oldest_ts = self._frames[0].ts if self._frames else 0
+
+        file_size = 0
+        frames_on_disk = 0
+        if os.path.exists(self.persistence_path):
+            file_size = os.path.getsize(self.persistence_path)
+            frames_on_disk = file_size // LIQ_FRAME_RECORD_SIZE
+
+        return {
+            "frames_in_memory": frames_in_memory,
+            "frames_on_disk": frames_on_disk,
+            "max_frames": self.max_frames,
+            "last_ts": last_ts,
+            "oldest_ts": oldest_ts,
+            "file_size_bytes": file_size,
+            "persistence_path": self.persistence_path
+        }
 
 
 @dataclass
@@ -264,18 +561,26 @@ class SnapshotCache:
         self,
         snapshot_file: str,
         refresh_interval: float = 1.0,
-        history_minutes: int = HISTORY_MINUTES
+        history_minutes: int = HISTORY_MINUTES,
+        persistence_path: Optional[str] = None
     ):
         self.snapshot_file = snapshot_file
         self.refresh_interval = refresh_interval
+        self.persistence_path = persistence_path
         self._cache: Optional[Dict] = None
         self._cache_time: float = 0
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-        # History buffer
-        self.history = HistoryBuffer(max_frames=history_minutes)
+        # History buffer - use persistent version if path provided
+        if persistence_path:
+            self.history = LiquidationHeatmapBuffer(
+                persistence_path=persistence_path,
+                max_frames=history_minutes
+            )
+        else:
+            self.history = HistoryBuffer(max_frames=history_minutes)
 
     def start(self):
         """Start background refresh thread."""
@@ -351,18 +656,40 @@ def create_app() -> FastAPI:
     async def startup():
         global _cache, _cache_v2, _ob_buffer, _start_time
         _start_time = time.time()
-        _cache = SnapshotCache(SNAPSHOT_FILE, CACHE_REFRESH_INTERVAL, HISTORY_MINUTES)
+
+        # V1 cache with disk persistence
+        _cache = SnapshotCache(
+            SNAPSHOT_FILE,
+            CACHE_REFRESH_INTERVAL,
+            HISTORY_MINUTES,
+            persistence_path=LIQ_HEATMAP_V1_FILE
+        )
         _cache.start()
-        _cache_v2 = SnapshotCache(SNAPSHOT_V2_FILE, CACHE_REFRESH_INTERVAL, HISTORY_MINUTES)
+        v1_stats = _cache.history.get_stats() if hasattr(_cache.history, 'get_stats') else {}
+        v1_loaded = v1_stats.get('frames_in_memory', 0)
+
+        # V2 cache with disk persistence
+        _cache_v2 = SnapshotCache(
+            SNAPSHOT_V2_FILE,
+            CACHE_REFRESH_INTERVAL,
+            HISTORY_MINUTES,
+            persistence_path=LIQ_HEATMAP_V2_FILE
+        )
         _cache_v2.start()
+        v2_stats = _cache_v2.history.get_stats() if hasattr(_cache_v2.history, 'get_stats') else {}
+        v2_loaded = v2_stats.get('frames_in_memory', 0)
+
         # Initialize orderbook heatmap buffer (loads from disk)
         if HAS_OB_HEATMAP:
             _ob_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
             ob_stats = _ob_buffer.get_stats()
             print(f"Orderbook heatmap: {ob_stats['frames_in_memory']} frames loaded from {OB_HEATMAP_FILE}")
+
         print(f"API started, reading from: {SNAPSHOT_FILE}")
         print(f"V2 snapshot file: {SNAPSHOT_V2_FILE}")
         print(f"History buffer: {HISTORY_MINUTES} minutes ({HISTORY_MINUTES / 60:.1f} hours)")
+        print(f"V1 liq heatmap: {v1_loaded} frames loaded from {LIQ_HEATMAP_V1_FILE}")
+        print(f"V2 liq heatmap: {v2_loaded} frames loaded from {LIQ_HEATMAP_V2_FILE}")
 
     @app.on_event("shutdown")
     async def shutdown():
