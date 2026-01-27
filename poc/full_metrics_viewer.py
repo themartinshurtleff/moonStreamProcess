@@ -692,7 +692,9 @@ class FullMetricsProcessor:
 
     def _on_ob_frame_emitted(self, frame):
         """Callback when orderbook accumulator emits a 30s frame."""
+        print(f"[OB_DEBUG] Frame emitted! ts={frame.ts} src={frame.src:.2f} n_prices={frame.n_prices}")
         self.ob_heatmap_buffer.add_frame(frame)
+        print(f"[OB_DEBUG] Frame added to buffer. Buffer stats: {self.ob_heatmap_buffer.get_stats()}")
 
     def _on_reconstructor_update(self, reconstructor: OrderbookReconstructor):
         """
@@ -720,6 +722,16 @@ class FullMetricsProcessor:
 
         # Feed to accumulator (will emit frame on 30s boundary)
         if mid > 0 and bids and asks:
+            # Debug: track accumulator state (throttled to every 10s)
+            now = time.time()
+            if not hasattr(self, '_last_accum_debug'):
+                self._last_accum_debug = 0.0
+            if now - self._last_accum_debug > 10.0:
+                self._last_accum_debug = now
+                slot = int(now // 30)
+                print(f"[OB_DEBUG] Feeding accumulator: mid={mid:.2f} bids={len(bids)} asks={len(asks)} "
+                      f"current_slot={self.ob_accumulator._current_slot} new_slot={slot}")
+
             self.ob_accumulator.on_depth_update(
                 bids=bids,
                 asks=asks,

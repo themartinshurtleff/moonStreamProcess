@@ -628,10 +628,13 @@ class OrderbookAccumulator:
             # Check for slot rollover
             if self._current_slot > 0 and current_slot > self._current_slot:
                 # Emit frame for completed slot
+                print(f"[OB_ACCUM_DEBUG] Slot boundary crossed! old={self._current_slot} new={current_slot}, emitting frame")
                 emitted_frame = self._emit_frame()
                 # Reset for new slot
                 self._bid_notional.clear()
                 self._ask_notional.clear()
+            elif self._current_slot == 0:
+                print(f"[OB_ACCUM_DEBUG] First update, setting initial slot={current_slot}")
 
             self._current_slot = current_slot
             self._src = src_price
@@ -813,8 +816,10 @@ class OrderbookHeatmapBuffer:
 
     def add_frame(self, frame: OrderbookFrame):
         """Add a new frame to buffer and persist."""
+        print(f"[OB_BUFFER_DEBUG] add_frame called: ts={frame.ts} src={frame.src:.2f}")
         with self._lock:
             self._frames.append(frame)
+            print(f"[OB_BUFFER_DEBUG] Frame appended to memory, now {len(self._frames)} frames")
             self._persist_frame(frame)
 
             self._frames_written_since_compact += 1
@@ -825,9 +830,15 @@ class OrderbookHeatmapBuffer:
     def _persist_frame(self, frame: OrderbookFrame):
         """Append frame to persistence file."""
         try:
+            frame_bytes = frame.to_bytes()
+            print(f"[OB_BUFFER_DEBUG] Persisting frame to {self.persistence_path}, {len(frame_bytes)} bytes")
             with open(self.persistence_path, 'ab') as f:
-                f.write(frame.to_bytes())
+                f.write(frame_bytes)
+            import os
+            new_size = os.path.getsize(self.persistence_path)
+            print(f"[OB_BUFFER_DEBUG] File size after write: {new_size} bytes")
         except Exception as e:
+            print(f"[OB_BUFFER_DEBUG] PERSIST ERROR: {e}")
             logger.error(f"[OB_HEATMAP] Failed to persist frame: {e}")
 
     def _maybe_compact(self):
