@@ -491,7 +491,8 @@ class OrderbookReconstructor:
 # Binary record header format (76 bytes)
 # ts(d) + src(d) + step(d) + price_min(d) + price_max(d) + n_prices(I) +
 # norm_p50(d) + norm_p95(d) + total_bid(d) + total_ask(d)
-HEADER_FORMAT = '<ddddddIddd'
+# 5 doubles (40 bytes) + 1 uint (4 bytes) + 4 doubles (32 bytes) = 76 bytes
+HEADER_FORMAT = '<dddddIdddd'
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 76 bytes
 
 
