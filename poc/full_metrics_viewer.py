@@ -1117,20 +1117,28 @@ class FullMetricsProcessor:
                 # Fallback to perp_buyVol/perp_sellVol if aggTrade data missing
                 prev_aggression = self.taker_aggression.get_previous_minute_data()
                 fallback_used = False
+                perp_buyVol_btc = None
+                perp_sellVol_btc = None
 
                 if prev_aggression is not None and prev_aggression.trade_count > 0:
-                    # Use real-time aggTrade data (notional USD)
-                    v2_buy_vol = prev_aggression.taker_buy_notional
-                    v2_sell_vol = prev_aggression.taker_sell_notional
+                    # Use real-time aggTrade data (already in USD notional)
+                    taker_buy_notional_usd = prev_aggression.taker_buy_notional
+                    taker_sell_notional_usd = prev_aggression.taker_sell_notional
                     agg_trade_count = prev_aggression.trade_count
                     agg_minute_key = prev_aggression.minute_key
                 else:
-                    # Fallback: convert BTC volume to notional USD
-                    v2_buy_vol = self.state.perp_buyVol * v2_src
-                    v2_sell_vol = self.state.perp_sellVol * v2_src
+                    # Fallback: convert BTC volume to USD notional
+                    perp_buyVol_btc = self.state.perp_buyVol
+                    perp_sellVol_btc = self.state.perp_sellVol
+                    taker_buy_notional_usd = perp_buyVol_btc * v2_src
+                    taker_sell_notional_usd = perp_sellVol_btc * v2_src
                     fallback_used = True
                     agg_trade_count = 0
                     agg_minute_key = v2_minute_key - 1  # Estimate
+
+                # Compute derived values for logging
+                total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
+                buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
 
                 self.heatmap_v2.on_minute(
                     minute_key=v2_minute_key,
@@ -1138,22 +1146,30 @@ class FullMetricsProcessor:
                     high=self.state.perp_high,
                     low=self.state.perp_low,
                     oi=self.state.perp_total_oi,
-                    buy_vol=v2_buy_vol,
-                    sell_vol=v2_sell_vol
+                    taker_buy_notional_usd=taker_buy_notional_usd,
+                    taker_sell_notional_usd=taker_sell_notional_usd
                 )
 
-                # Log aggression diagnostics (last 5 minutes)
+                # Log aggression diagnostics with full unit verification
                 agg_history = self.taker_aggression.get_last_n_minutes(5)
-                _write_debug_log({
+                debug_entry = {
                     "type": "aggression_minute",
                     "minute_key": agg_minute_key,
                     "v2_minute_key": v2_minute_key,
+                    "src": round(v2_src, 2),
                     "trade_count": agg_trade_count,
-                    "taker_buy_notional": round(v2_buy_vol, 2),
-                    "taker_sell_notional": round(v2_sell_vol, 2),
+                    "buy_notional_usd": round(taker_buy_notional_usd, 2),
+                    "sell_notional_usd": round(taker_sell_notional_usd, 2),
+                    "total_notional_usd": round(total_notional_usd, 2),
+                    "buy_pct": round(buy_pct, 4),
                     "fallback_used": fallback_used,
                     "history_last_5": agg_history
-                })
+                }
+                # If fallback was used, include raw BTC volumes for unit verification
+                if fallback_used:
+                    debug_entry["perp_buyVol_btc"] = round(perp_buyVol_btc, 6)
+                    debug_entry["perp_sellVol_btc"] = round(perp_sellVol_btc, 6)
+                _write_debug_log(debug_entry)
 
                 # Write V2 API snapshot
                 v2_snapshot = self.heatmap_v2.get_api_response(

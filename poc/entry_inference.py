@@ -148,8 +148,8 @@ class EntryInference:
         minute_key: int,
         src_price: float,
         oi: float,
-        buy_vol: float,
-        sell_vol: float,
+        taker_buy_notional_usd: float,
+        taker_sell_notional_usd: float,
         high: float = None,
         low: float = None
     ) -> List[InferredEntry]:
@@ -160,8 +160,8 @@ class EntryInference:
             minute_key: Minute timestamp
             src_price: Reference price (OHLC4)
             oi: Current open interest (in contracts or USD)
-            buy_vol: Buy volume this minute
-            sell_vol: Sell volume this minute
+            taker_buy_notional_usd: Taker buy volume in USD (from aggTrade)
+            taker_sell_notional_usd: Taker sell volume in USD (from aggTrade)
             high: Minute high (for sweep detection)
             low: Minute low (for sweep detection)
 
@@ -186,16 +186,22 @@ class EntryInference:
         if high and low:
             self._sweep(high, low)
 
-        # Skip inference if OI change too small
-        total_vol = buy_vol + sell_vol
-        if total_vol < 1 or abs(oi_delta) < self.last_oi * self.MIN_OI_CHANGE_PCT:
+        # Compute aggression from USD notional
+        total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
+
+        # Skip inference if volume too small (< $1000 USD)
+        if total_notional_usd < 1000 or abs(oi_delta) < self.last_oi * self.MIN_OI_CHANGE_PCT:
             return inferences
 
-        # Determine aggression direction
-        if total_vol > 0:
-            buy_pct = buy_vol / total_vol
-        else:
-            buy_pct = 0.5
+        # Determine aggression direction from USD notional ratio
+        buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
+
+        # Debug log: units verification
+        logger.debug(
+            f"[{self.symbol}] minute={minute_key} src={src_price:.2f} "
+            f"buy_usd={taker_buy_notional_usd:.0f} sell_usd={taker_sell_notional_usd:.0f} "
+            f"total_usd={total_notional_usd:.0f} buy_pct={buy_pct:.3f}"
+        )
 
         # Infer direction from OI change + aggression
         # OI↑ + buy aggression → longs opening

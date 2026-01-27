@@ -147,8 +147,8 @@ class LiquidationHeatmap:
         high: float,
         low: float,
         oi: float,
-        buy_vol: float,
-        sell_vol: float
+        taker_buy_notional_usd: float,
+        taker_sell_notional_usd: float
     ) -> None:
         """
         Process minute-level market data.
@@ -161,8 +161,8 @@ class LiquidationHeatmap:
             high: Minute high
             low: Minute low
             oi: Open interest
-            buy_vol: Buy volume
-            sell_vol: Sell volume
+            taker_buy_notional_usd: Taker buy volume in USD (from aggTrade)
+            taker_sell_notional_usd: Taker sell volume in USD (from aggTrade)
         """
         self.current_minute = minute_key
         self.current_price = src_price
@@ -176,8 +176,8 @@ class LiquidationHeatmap:
             minute_key=minute_key,
             src_price=src_price,
             oi=oi,
-            buy_vol=buy_vol,
-            sell_vol=sell_vol,
+            taker_buy_notional_usd=taker_buy_notional_usd,
+            taker_sell_notional_usd=taker_sell_notional_usd,
             high=high,
             low=low
         )
