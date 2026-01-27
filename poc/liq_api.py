@@ -27,8 +27,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Add parent to path for imports
+# Add parent and current directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # Add poc/ for ob_heatmap
 
 try:
     from fastapi import FastAPI, Query, HTTPException
