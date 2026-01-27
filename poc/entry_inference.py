@@ -78,7 +78,9 @@ class EntryInference:
     DEFAULT_DECAY = 0.998     # Per-minute decay for projected zones (slower for persistence)
 
     # Minimum OI change to trigger inference (as fraction of position size)
-    MIN_OI_CHANGE_PCT = 0.001  # 0.1% of OI
+    # For BTC with ~$10B OI, 0.001 = $10M/min threshold (way too high)
+    # Lowered to 0.00005 = $500K/min for BTC - more realistic
+    MIN_OI_CHANGE_PCT = 0.00005  # 0.005% of OI
 
     # Aggression imbalance threshold
     AGGRESSION_THRESHOLD = 0.55  # 55% skew needed to classify direction
@@ -189,8 +191,21 @@ class EntryInference:
         # Compute aggression from USD notional
         total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
 
+        # Debug: log OI delta and thresholds
+        oi_threshold = self.last_oi * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
+        logger.debug(
+            f"[{self.symbol}] OI check: oi={oi:,.0f} last_oi={self.last_oi:,.0f} "
+            f"delta={oi_delta:+,.0f} threshold={oi_threshold:,.0f} "
+            f"volume_usd={total_notional_usd:,.0f}"
+        )
+
         # Skip inference if volume too small (< $1000 USD)
-        if total_notional_usd < 1000 or abs(oi_delta) < self.last_oi * self.MIN_OI_CHANGE_PCT:
+        if total_notional_usd < 1000:
+            logger.debug(f"[{self.symbol}] Skip: volume too small ({total_notional_usd:.0f} < 1000)")
+            return inferences
+
+        if abs(oi_delta) < oi_threshold:
+            logger.debug(f"[{self.symbol}] Skip: OI delta too small ({abs(oi_delta):,.0f} < {oi_threshold:,.0f})")
             return inferences
 
         # Determine aggression direction from USD notional ratio
@@ -221,7 +236,17 @@ class EntryInference:
             else:
                 # Mixed/unclear - split proportionally
                 # Don't infer when signal is ambiguous
+                logger.debug(
+                    f"[{self.symbol}] Skip: ambiguous aggression (buy_pct={buy_pct:.3f}, "
+                    f"need <{1-self.AGGRESSION_THRESHOLD:.2f} or >{self.AGGRESSION_THRESHOLD:.2f})"
+                )
                 return inferences
+
+            # Log successful inference trigger
+            logger.info(
+                f"[{self.symbol}] INFERENCE: side={side} oi_delta={oi_delta:+,.0f} "
+                f"buy_pct={buy_pct:.3f} confidence={confidence:.3f}"
+            )
 
             # Estimate notional size from OI delta
             # Assuming OI is in contracts and we need to convert
