@@ -76,7 +76,7 @@ def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: flo
 
 
 # Default persistence file
-DEFAULT_WEIGHTS_FILE = "liq_calibrator_weights.json"
+DEFAULT_WEIGHTS_FILE = "old_log/liq_calibrator_weights.json"
 
 # Schema version for weights file (increment when format changes)
 WEIGHTS_SCHEMA_VERSION = 2
