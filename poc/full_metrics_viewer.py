@@ -1185,6 +1185,38 @@ class FullMetricsProcessor:
                     min_notional_usd=1000.0    # Low threshold, UI can filter
                 )
                 v2_snapshot['stats'] = self.heatmap_v2.get_stats()
+
+                # Add intensity arrays for history buffer (same format as V1)
+                # Build price grid and map pools to intensity arrays
+                v2_steps = self.heatmap_v2.config.steps
+                band_pct = 0.10
+                price_min = round((v2_src * (1 - band_pct)) / v2_steps) * v2_steps
+                price_max = round((v2_src * (1 + band_pct)) / v2_steps) * v2_steps
+                v2_prices = []
+                p = price_min
+                while p <= price_max:
+                    v2_prices.append(p)
+                    p += v2_steps
+
+                # Get raw heatmap data for intensity arrays
+                v2_heatmap = self.heatmap_v2.get_heatmap()
+                v2_all_longs = v2_heatmap.get("long", {})
+                v2_all_shorts = v2_heatmap.get("short", {})
+
+                # Build intensity arrays
+                v2_long_intensity = [v2_all_longs.get(price, 0.0) for price in v2_prices]
+                v2_short_intensity = [v2_all_shorts.get(price, 0.0) for price in v2_prices]
+
+                # Add to snapshot for history buffer
+                v2_snapshot['ts'] = time.time()
+                v2_snapshot['src'] = v2_src
+                v2_snapshot['step'] = v2_steps
+                v2_snapshot['price_min'] = price_min
+                v2_snapshot['price_max'] = price_max
+                v2_snapshot['prices'] = v2_prices
+                v2_snapshot['long_intensity'] = v2_long_intensity
+                v2_snapshot['short_intensity'] = v2_short_intensity
+
                 _write_api_snapshot_v2(v2_snapshot)
 
                 # Apply persisted weights from calibrator on first update (to V2)

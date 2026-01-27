@@ -317,6 +317,7 @@ class SnapshotCache:
 
 # Global cache instance
 _cache: Optional[SnapshotCache] = None
+_cache_v2: Optional[SnapshotCache] = None  # V2 cache
 _start_time: float = 0
 
 
@@ -330,18 +331,23 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        global _cache, _start_time
+        global _cache, _cache_v2, _start_time
         _start_time = time.time()
         _cache = SnapshotCache(SNAPSHOT_FILE, CACHE_REFRESH_INTERVAL, HISTORY_MINUTES)
         _cache.start()
+        _cache_v2 = SnapshotCache(SNAPSHOT_V2_FILE, CACHE_REFRESH_INTERVAL, HISTORY_MINUTES)
+        _cache_v2.start()
         print(f"API started, reading from: {SNAPSHOT_FILE}")
+        print(f"V2 snapshot file: {SNAPSHOT_V2_FILE}")
         print(f"History buffer: {HISTORY_MINUTES} minutes ({HISTORY_MINUTES / 60:.1f} hours)")
 
     @app.on_event("shutdown")
     async def shutdown():
-        global _cache
+        global _cache, _cache_v2
         if _cache:
             _cache.stop()
+        if _cache_v2:
+            _cache_v2.stop()
 
     @app.get("/v1/health")
     async def health():
@@ -602,6 +608,134 @@ def create_app() -> FastAPI:
 
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail="V2 snapshot file corrupted")
+
+    @app.get("/v2/liq_heatmap_history")
+    async def liq_heatmap_history_v2(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
+    ):
+        """
+        Get historical V2 liquidation heatmap data.
+
+        Returns time-series of intensity values for backfilling charts.
+        Intensities are u8 encoded (0-255) in flat row-major arrays.
+
+        Response format:
+        - t: array of timestamps (int milliseconds)
+        - prices: unified price grid
+        - long: flat row-major array [frames * prices] of u8 intensities
+        - short: flat row-major array [frames * prices] of u8 intensities
+        - step: price bucket size
+        - scale: 255 (max intensity value)
+        """
+        # Clamp parameters
+        minutes = max(5, min(720, minutes))
+        stride = max(1, min(30, stride))
+
+        if not _cache_v2:
+            raise HTTPException(status_code=503, detail="V2 cache not initialized")
+
+        # Get current snapshot for reference (needed for grid params)
+        current = _cache_v2.get(symbol)
+
+        # Get historical frames
+        frames = _cache_v2.history.get_frames(minutes=minutes, stride=stride)
+
+        # If no frames yet, return empty response (not 404)
+        if not frames:
+            # Use current snapshot for grid params if available
+            if current:
+                step = current.get('step', DEFAULT_STEP)
+                src = current.get('src', 100000)
+                price_min = round((src * (1 - DEFAULT_BAND_PCT)) / step) * step
+                price_max = round((src * (1 + DEFAULT_BAND_PCT)) / step) * step
+                prices = []
+                p = price_min
+                while p <= price_max:
+                    prices.append(p)
+                    p += step
+            else:
+                step = DEFAULT_STEP
+                price_min = 92000.0
+                price_max = 108000.0
+                prices = [float(p) for p in range(int(price_min), int(price_max) + int(step), int(step))]
+
+            print(f"[v2/liq_heatmap_history] EMPTY: frames=0 prices_len={len(prices)}")
+
+            return JSONResponse(content={
+                "t": [],
+                "prices": prices,
+                "long": [],
+                "short": [],
+                "step": step,
+                "scale": 255
+            })
+
+        # Build unified grid based on current src (or most recent frame)
+        if current:
+            current_src = current.get('src', 0)
+            step = current.get('step', DEFAULT_STEP)
+        else:
+            current_src = frames[-1].src
+            step = DEFAULT_STEP
+
+        prices, price_min, price_max = build_unified_grid(
+            frames, current_src, step, DEFAULT_BAND_PCT
+        )
+
+        if not prices:
+            # Fallback grid
+            price_min = 92000.0
+            price_max = 108000.0
+            step = DEFAULT_STEP
+            prices = [float(p) for p in range(int(price_min), int(price_max) + int(step), int(step))]
+
+        prices_len = len(prices)
+
+        # Build flat row-major arrays
+        t_arr = []
+        long_flat = []
+        short_flat = []
+
+        for frame in frames:
+            # Timestamp in milliseconds (int)
+            t_arr.append(int(frame.ts * 1000))
+
+            # Map frame to unified grid and append to flat arrays
+            long_row, short_row = map_frame_to_grid(frame, prices, step)
+            long_flat.extend(long_row)
+            short_flat.extend(short_row)
+
+        # Debug stats
+        num_frames = len(t_arr)
+        long_len = len(long_flat)
+        short_len = len(short_flat)
+        expected_len = num_frames * prices_len
+
+        max_long = max(long_flat) if long_flat else 0
+        max_short = max(short_flat) if short_flat else 0
+        nonzero_long = sum(1 for v in long_flat if v > 0)
+        nonzero_short = sum(1 for v in short_flat if v > 0)
+
+        first_ts_ms = t_arr[0] if t_arr else 0
+        last_ts_ms = t_arr[-1] if t_arr else 0
+
+        print(f"[v2/liq_heatmap_history] frames={num_frames} prices_len={prices_len} long_len={long_len} short_len={short_len}")
+        print(f"[v2/liq_heatmap_history] max_long={max_long} max_short={max_short} nonzero_long={nonzero_long} nonzero_short={nonzero_short}")
+        print(f"[v2/liq_heatmap_history] first_ts_ms={first_ts_ms} last_ts_ms={last_ts_ms}")
+        print(f"[v2/liq_heatmap_history] len_check: expected={expected_len} actual_long={long_len} actual_short={short_len} OK={long_len == expected_len and short_len == expected_len}")
+
+        response = {
+            "t": t_arr,
+            "prices": prices,
+            "long": long_flat,
+            "short": short_flat,
+            "step": step,
+            "scale": 255
+        }
+
+        return JSONResponse(content=response)
 
     @app.get("/v2/liq_stats")
     async def liq_stats_v2(
