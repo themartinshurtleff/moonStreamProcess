@@ -382,6 +382,122 @@ class ZoneTracker:
         })
 
 
+# =============================================================================
+# TakerAggressionAccumulator: Real-time aggTrade taker direction tracking
+# =============================================================================
+# Tracks per-minute taker buy/sell notional from aggTrade stream.
+# Uses buyer_is_maker to determine aggressor (taker) direction.
+
+@dataclass
+class MinuteAggression:
+    """Per-minute taker aggression stats."""
+    minute_key: int
+    taker_buy_notional: float = 0.0
+    taker_sell_notional: float = 0.0
+    trade_count: int = 0
+
+
+class TakerAggressionAccumulator:
+    """
+    Accumulates taker aggression from aggTrade stream.
+
+    Mapping:
+    - buyerIsMaker == false → taker buy (buyer crossed the spread)
+    - buyerIsMaker == true → taker sell (seller crossed the spread)
+
+    Notional = price * qty (USD value)
+    """
+
+    def __init__(self, history_minutes: int = 10):
+        self.history_minutes = history_minutes
+        self._current: Optional[MinuteAggression] = None
+        self._history: deque = deque(maxlen=history_minutes)
+        self._lock = threading.Lock()
+
+    def on_trade(self, price: float, qty: float, is_buyer_maker: bool) -> None:
+        """
+        Process a single aggTrade.
+
+        Args:
+            price: Trade price
+            qty: Trade quantity (base asset)
+            is_buyer_maker: True if buyer was maker (seller is taker)
+        """
+        notional = price * qty
+        minute_key = int(time.time() // 60)
+
+        with self._lock:
+            # Check if we need to roll to new minute
+            if self._current is None or self._current.minute_key != minute_key:
+                # Archive current minute if exists
+                if self._current is not None:
+                    self._history.append(self._current)
+                # Start new minute
+                self._current = MinuteAggression(minute_key=minute_key)
+
+            # Accumulate based on taker direction
+            if is_buyer_maker:
+                # Seller is taker (sell aggression)
+                self._current.taker_sell_notional += notional
+            else:
+                # Buyer is taker (buy aggression)
+                self._current.taker_buy_notional += notional
+
+            self._current.trade_count += 1
+
+    def get_minute_data(self, minute_key: int) -> Optional[MinuteAggression]:
+        """
+        Get aggression data for a specific minute.
+
+        Returns None if no data for that minute.
+        """
+        with self._lock:
+            # Check current minute
+            if self._current is not None and self._current.minute_key == minute_key:
+                return MinuteAggression(
+                    minute_key=self._current.minute_key,
+                    taker_buy_notional=self._current.taker_buy_notional,
+                    taker_sell_notional=self._current.taker_sell_notional,
+                    trade_count=self._current.trade_count
+                )
+
+            # Check history
+            for entry in reversed(self._history):
+                if entry.minute_key == minute_key:
+                    return entry
+
+            return None
+
+    def get_previous_minute_data(self) -> Optional[MinuteAggression]:
+        """
+        Get data for the most recently completed minute (not current).
+
+        This is what we want for minute rollover processing.
+        """
+        with self._lock:
+            if self._history:
+                return self._history[-1]
+            return None
+
+    def get_last_n_minutes(self, n: int = 5) -> List[dict]:
+        """
+        Get diagnostics for last N minutes.
+
+        Returns list of dicts with minute_key, trade_count, taker_buy_notional, taker_sell_notional.
+        """
+        with self._lock:
+            result = []
+            # Add history (oldest to newest)
+            for entry in list(self._history)[-n:]:
+                result.append({
+                    "minute_key": entry.minute_key,
+                    "trade_count": entry.trade_count,
+                    "taker_buy_notional": round(entry.taker_buy_notional, 2),
+                    "taker_sell_notional": round(entry.taker_sell_notional, 2)
+                })
+            return result
+
+
 @dataclass
 class FullMetricsState:
     """Complete metrics state matching btcSynth.data output."""
@@ -538,6 +654,10 @@ class FullMetricsProcessor:
             ),
             log_dir=POC_DIR
         )
+
+        # Taker aggression accumulator (real-time aggTrade tracking)
+        # Tracks per-minute taker buy/sell notional from buyer_is_maker field
+        self.taker_aggression = TakerAggressionAccumulator(history_minutes=10)
 
     def _get_price_for_symbol(self, symbol: str) -> float:
         """Get current price for a symbol (used by REST poller for OI conversion)."""
@@ -775,6 +895,10 @@ class FullMetricsProcessor:
 
         self.state.perp_VolProfile[level] = self.state.perp_VolProfile.get(level, 0) + qty
 
+        # Feed taker aggression accumulator (real-time aggTrade tracking)
+        # This tracks notional USD per taker direction for V2 inference
+        self.taker_aggression.on_trade(price, qty, is_buyer_maker)
+
     def _process_liquidations(self, exchange: str, data: dict):
         order = data.get("o", {})
         if not order or "BTC" not in order.get("s", ""):
@@ -988,15 +1112,48 @@ class FullMetricsProcessor:
                 v2_src = (self.state.perp_open + self.state.perp_high +
                           self.state.perp_low + self.state.perp_close) / 4
                 v2_minute_key = int(time.time() // 60)
+
+                # Get aggTrade-derived taker aggression (previous completed minute)
+                # Fallback to perp_buyVol/perp_sellVol if aggTrade data missing
+                prev_aggression = self.taker_aggression.get_previous_minute_data()
+                fallback_used = False
+
+                if prev_aggression is not None and prev_aggression.trade_count > 0:
+                    # Use real-time aggTrade data (notional USD)
+                    v2_buy_vol = prev_aggression.taker_buy_notional
+                    v2_sell_vol = prev_aggression.taker_sell_notional
+                    agg_trade_count = prev_aggression.trade_count
+                    agg_minute_key = prev_aggression.minute_key
+                else:
+                    # Fallback: convert BTC volume to notional USD
+                    v2_buy_vol = self.state.perp_buyVol * v2_src
+                    v2_sell_vol = self.state.perp_sellVol * v2_src
+                    fallback_used = True
+                    agg_trade_count = 0
+                    agg_minute_key = v2_minute_key - 1  # Estimate
+
                 self.heatmap_v2.on_minute(
                     minute_key=v2_minute_key,
                     src_price=v2_src,
                     high=self.state.perp_high,
                     low=self.state.perp_low,
                     oi=self.state.perp_total_oi,
-                    buy_vol=self.state.perp_buyVol,
-                    sell_vol=self.state.perp_sellVol
+                    buy_vol=v2_buy_vol,
+                    sell_vol=v2_sell_vol
                 )
+
+                # Log aggression diagnostics (last 5 minutes)
+                agg_history = self.taker_aggression.get_last_n_minutes(5)
+                _write_debug_log({
+                    "type": "aggression_minute",
+                    "minute_key": agg_minute_key,
+                    "v2_minute_key": v2_minute_key,
+                    "trade_count": agg_trade_count,
+                    "taker_buy_notional": round(v2_buy_vol, 2),
+                    "taker_sell_notional": round(v2_sell_vol, 2),
+                    "fallback_used": fallback_used,
+                    "history_last_5": agg_history
+                })
 
                 # Write V2 API snapshot
                 v2_snapshot = self.heatmap_v2.get_api_response(
