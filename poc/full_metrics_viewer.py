@@ -43,6 +43,7 @@ from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
 from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
+from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,9 @@ LIQ_DEBUG_LOG = os.path.join(POC_DIR, "liq_debug.jsonl")
 
 # Plot feed for real-time chart (OHLC + zones per minute)
 PLOT_FEED_FILE = os.path.join(POC_DIR, "plot_feed.jsonl")
+
+# Orderbook heatmap persistence file (30s frames)
+OB_HEATMAP_FILE = os.path.join(POC_DIR, "ob_heatmap_30s.bin")
 
 # API snapshot file for terminal integration
 LIQ_API_SNAPSHOT = os.path.join(POC_DIR, "liq_api_snapshot.json")
@@ -659,6 +663,21 @@ class FullMetricsProcessor:
         # Tracks per-minute taker buy/sell notional from buyer_is_maker field
         self.taker_aggression = TakerAggressionAccumulator(history_minutes=10)
 
+        # Orderbook heatmap (30s DoM screenshots)
+        # Accumulates depth updates, emits frames every 30s
+        self.ob_heatmap_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
+        self.ob_accumulator = OrderbookAccumulator(
+            step=20.0,
+            range_pct=0.10,
+            on_frame_callback=self._on_ob_frame_emitted
+        )
+        ob_stats = self.ob_heatmap_buffer.get_stats()
+        print(f"[OB_HEATMAP] Loaded {ob_stats['frames_in_memory']} frames from {OB_HEATMAP_FILE}")
+
+    def _on_ob_frame_emitted(self, frame):
+        """Callback when orderbook accumulator emits a 30s frame."""
+        self.ob_heatmap_buffer.add_frame(frame)
+
     def _get_price_for_symbol(self, symbol: str) -> float:
         """Get current price for a symbol (used by REST poller for OI conversion)."""
         # For BTCUSDT, return current BTC price
@@ -818,6 +837,16 @@ class FullMetricsProcessor:
             self.state.perp_totalReinforces = sum(reinforces.values())
 
         self.prev_books = books_heatmap.copy()
+
+        # Feed orderbook data to 30s heatmap accumulator
+        # Uses mark price (or mid) as reference, emits frame on 30s boundary
+        if mid > 0 and all_bids and all_asks:
+            self.ob_accumulator.on_depth_update(
+                bids=all_bids,
+                asks=all_asks,
+                src_price=mid,
+                timestamp=time.time()
+            )
 
     def _build_depth_band(self, src: float, steps: float) -> Dict[float, float]:
         """
