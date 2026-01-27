@@ -1179,6 +1179,23 @@ def create_app() -> FastAPI:
             p_min = frame.price_min
             p_max = frame.price_max
 
+        # Get notional arrays (USD per bucket)
+        bid_notional_usd = frame.bid_notional if frame.bid_notional else []
+        ask_notional_usd = frame.ask_notional if frame.ask_notional else []
+
+        # Calculate BTC quantities: btc = usd / price
+        bid_size_btc = []
+        ask_size_btc = []
+        for i, price in enumerate(prices):
+            if price > 0:
+                bid_btc = bid_notional_usd[i] / price if i < len(bid_notional_usd) else 0.0
+                ask_btc = ask_notional_usd[i] / price if i < len(ask_notional_usd) else 0.0
+            else:
+                bid_btc = 0.0
+                ask_btc = 0.0
+            bid_size_btc.append(round(bid_btc, 6))
+            ask_size_btc.append(round(ask_btc, 6))
+
         response = {
             "symbol": symbol,
             "ts": frame.ts,
@@ -1189,10 +1206,16 @@ def create_app() -> FastAPI:
             "prices": prices,
             "bid_u8": bid_u8,
             "ask_u8": ask_u8,
+            "bid_notional_usd": [round(v, 2) for v in bid_notional_usd],
+            "ask_notional_usd": [round(v, 2) for v in ask_notional_usd],
+            "bid_size_btc": bid_size_btc,
+            "ask_size_btc": ask_size_btc,
             "norm_p50": frame.norm_p50,
             "norm_p95": frame.norm_p95,
             "total_bid_notional": frame.total_bid_notional,
             "total_ask_notional": frame.total_ask_notional,
+            "total_bid_btc": round(frame.total_bid_notional / frame.src, 6) if frame.src > 0 else 0.0,
+            "total_ask_btc": round(frame.total_ask_notional / frame.src, 6) if frame.src > 0 else 0.0,
             "scale": 255
         }
 
@@ -1245,6 +1268,10 @@ def create_app() -> FastAPI:
                 "prices": [],
                 "bid_u8": [],
                 "ask_u8": [],
+                "bid_notional_usd": [],
+                "ask_notional_usd": [],
+                "bid_size_btc": [],
+                "ask_size_btc": [],
                 "step": step,
                 "scale": 255,
                 "norm_method": "p50_p95"
@@ -1264,12 +1291,38 @@ def create_app() -> FastAPI:
         t_arr = []
         bid_flat = []
         ask_flat = []
+        bid_notional_flat = []
+        ask_notional_flat = []
+        bid_btc_flat = []
+        ask_btc_flat = []
 
         for frame in frames:
             t_arr.append(int(frame.ts * 1000))  # ms
             bid_row, ask_row = resample_frame_to_grid(frame, prices, step)
             bid_flat.extend(bid_row)
             ask_flat.extend(ask_row)
+
+            # Get notional arrays for this frame
+            frame_bid_notional = frame.bid_notional if frame.bid_notional else []
+            frame_ask_notional = frame.ask_notional if frame.ask_notional else []
+
+            # Map notionals to unified grid (same indices as intensities)
+            for i, price in enumerate(prices):
+                # Find matching notional from frame
+                frame_prices = frame.get_prices()
+                bid_usd = 0.0
+                ask_usd = 0.0
+                if price in frame_prices:
+                    idx = frame_prices.index(price)
+                    if idx < len(frame_bid_notional):
+                        bid_usd = frame_bid_notional[idx]
+                    if idx < len(frame_ask_notional):
+                        ask_usd = frame_ask_notional[idx]
+
+                bid_notional_flat.append(round(bid_usd, 2))
+                ask_notional_flat.append(round(ask_usd, 2))
+                bid_btc_flat.append(round(bid_usd / price, 6) if price > 0 else 0.0)
+                ask_btc_flat.append(round(ask_usd / price, 6) if price > 0 else 0.0)
 
         # Debug logging
         num_frames = len(t_arr)
@@ -1281,6 +1334,10 @@ def create_app() -> FastAPI:
             "prices": prices,
             "bid_u8": bid_flat,
             "ask_u8": ask_flat,
+            "bid_notional_usd": bid_notional_flat,
+            "ask_notional_usd": ask_notional_flat,
+            "bid_size_btc": bid_btc_flat,
+            "ask_size_btc": ask_btc_flat,
             "step": step,
             "price_min": p_min,
             "price_max": p_max,

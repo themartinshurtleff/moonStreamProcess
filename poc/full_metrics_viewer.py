@@ -1334,9 +1334,13 @@ class FullMetricsProcessor:
                 v2_all_longs = v2_heatmap.get("long", {})
                 v2_all_shorts = v2_heatmap.get("short", {})
 
-                # Build intensity arrays
+                # Build intensity arrays (raw notional USD values)
                 v2_long_intensity = [v2_all_longs.get(price, 0.0) for price in v2_prices]
                 v2_short_intensity = [v2_all_shorts.get(price, 0.0) for price in v2_prices]
+
+                # Calculate BTC sizes: btc = usd / price
+                v2_long_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(v2_long_intensity, v2_prices)]
+                v2_short_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(v2_short_intensity, v2_prices)]
 
                 # Add to snapshot for history buffer
                 v2_snapshot['ts'] = time.time()
@@ -1347,6 +1351,10 @@ class FullMetricsProcessor:
                 v2_snapshot['prices'] = v2_prices
                 v2_snapshot['long_intensity'] = v2_long_intensity
                 v2_snapshot['short_intensity'] = v2_short_intensity
+                v2_snapshot['long_notional_usd'] = [round(v, 2) for v in v2_long_intensity]
+                v2_snapshot['short_notional_usd'] = [round(v, 2) for v in v2_short_intensity]
+                v2_snapshot['long_size_btc'] = v2_long_size_btc
+                v2_snapshot['short_size_btc'] = v2_short_size_btc
 
                 _write_api_snapshot_v2(v2_snapshot)
 
@@ -1593,8 +1601,12 @@ class FullMetricsProcessor:
             for p, s, a in short_zones_with_age[:5]
         ]
 
+        # Calculate BTC sizes from USD notional: btc = usd / price
+        long_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(long_intensity_raw, prices)]
+        short_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(short_intensity_raw, prices)]
+
         snapshot = {
-            "schema_version": 1,
+            "schema_version": 2,
             "symbol": "BTC",
             "ts": time.time(),
             "src": round(src, 2),
@@ -1604,6 +1616,10 @@ class FullMetricsProcessor:
             "prices": prices,
             "long_intensity": long_intensity,
             "short_intensity": short_intensity,
+            "long_notional_usd": [round(v, 2) for v in long_intensity_raw],
+            "short_notional_usd": [round(v, 2) for v in short_intensity_raw],
+            "long_size_btc": long_size_btc,
+            "short_size_btc": short_size_btc,
             "top_long_zones": top_long_zones,
             "top_short_zones": top_short_zones,
             "norm": {

@@ -510,6 +510,9 @@ class OrderbookFrame:
     norm_p95: float  # 95th percentile used for scaling
     total_bid_notional: float  # Sum of bid notional in band
     total_ask_notional: float  # Sum of ask notional in band
+    # Raw notional arrays (USD per bucket) - not persisted to disk, computed on load
+    bid_notional: List[float] = field(default_factory=list)
+    ask_notional: List[float] = field(default_factory=list)
 
     @property
     def n_prices(self) -> int:
@@ -555,11 +558,18 @@ class OrderbookFrame:
         bid_u8 = data[bid_start:bid_start + n_prices]
         ask_u8 = data[ask_start:ask_start + n_prices]
 
+        # Reconstruct approximate notionals from u8 intensities
+        # notional ≈ (intensity / 255) * (p95 - p50) + p50
+        scale = (norm_p95 - norm_p50) if norm_p95 > norm_p50 else 1.0
+        bid_notional = [(b / 255.0) * scale + norm_p50 if b > 0 else 0.0 for b in bid_u8]
+        ask_notional = [(a / 255.0) * scale + norm_p50 if a > 0 else 0.0 for a in ask_u8]
+
         return cls(
             ts=ts, src=src, step=step, price_min=price_min, price_max=price_max,
             bid_u8=bid_u8, ask_u8=ask_u8,
             norm_p50=norm_p50, norm_p95=norm_p95,
-            total_bid_notional=total_bid, total_ask_notional=total_ask
+            total_bid_notional=total_bid, total_ask_notional=total_ask,
+            bid_notional=bid_notional, ask_notional=ask_notional
         )
 
 
@@ -729,7 +739,9 @@ class OrderbookAccumulator:
             norm_p50=p50,
             norm_p95=p95,
             total_bid_notional=total_bid,
-            total_ask_notional=total_ask
+            total_ask_notional=total_ask,
+            bid_notional=bid_raw.tolist(),
+            ask_notional=ask_raw.tolist()
         )
 
         # Log diagnostics
