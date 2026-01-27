@@ -4,6 +4,7 @@ Full BTC Perpetual Metrics Viewer
 Displays ALL metrics that the moonStreamProcess library computes.
 """
 
+import argparse
 import asyncio
 import json
 import time
@@ -1865,6 +1866,22 @@ def run_websocket_thread(connector, processor, stop_event):
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Full BTC Perpetual Metrics Viewer")
+    parser.add_argument(
+        "--api", action="store_true",
+        help="Enable embedded API server (shares buffers directly, no disk sync needed)"
+    )
+    parser.add_argument(
+        "--api-host", default="127.0.0.1",
+        help="API server host (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--api-port", type=int, default=8899,
+        help="API server port (default: 8899)"
+    )
+    args = parser.parse_args()
+
     console = Console()
     console.print("\n[bold blue]Full BTC Perpetual Metrics Viewer[/]")
     console.print("Connecting to Binance futures websocket + REST pollers...\n")
@@ -1877,6 +1894,25 @@ def main():
     connector = MultiExchangeConnector(processor.process_message)
     start_time = time.time()
     stop_event = threading.Event()
+
+    # Start embedded API server if requested
+    api_thread = None
+    if args.api:
+        try:
+            from embedded_api import create_embedded_app, start_api_thread, HAS_FASTAPI
+            if not HAS_FASTAPI:
+                console.print("[yellow]WARNING: FastAPI not installed. Install with: pip install fastapi uvicorn[/]")
+            else:
+                console.print(f"[cyan]Starting embedded API server on {args.api_host}:{args.api_port}...[/]")
+                app = create_embedded_app(
+                    ob_buffer=processor.ob_heatmap_buffer,
+                    snapshot_file=LIQ_API_SNAPSHOT,
+                    snapshot_v2_file=LIQ_API_SNAPSHOT_V2
+                )
+                api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
+                console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")
+        except ImportError as e:
+            console.print(f"[yellow]WARNING: Could not start embedded API: {e}[/]")
 
     # Start REST poller for OI and trader ratios
     console.print("[cyan]Starting REST poller for OI and trader ratios...[/]")
@@ -1915,6 +1951,8 @@ def main():
         connector.stop()
         processor.rest_poller.stop()
 
+    if api_thread:
+        console.print("[dim]API server thread will terminate automatically.[/]")
     console.print("[green]Goodbye![/]")
 
 
