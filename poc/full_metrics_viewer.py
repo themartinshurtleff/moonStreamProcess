@@ -42,6 +42,7 @@ from ws_connectors import MultiExchangeConnector
 from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
 from rest_pollers import BinanceRESTPollerThread, PollerState
+from liq_heatmap import LiquidationHeatmap, HeatmapConfig
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,9 @@ PLOT_FEED_FILE = os.path.join(POC_DIR, "plot_feed.jsonl")
 
 # API snapshot file for terminal integration
 LIQ_API_SNAPSHOT = os.path.join(POC_DIR, "liq_api_snapshot.json")
+
+# V2 API snapshot file (tape + inference architecture)
+LIQ_API_SNAPSHOT_V2 = os.path.join(POC_DIR, "liq_api_snapshot_v2.json")
 
 # Log rotation thresholds
 LOG_ROTATION_MAX_MB = 200
@@ -105,6 +109,15 @@ def _write_api_snapshot(snapshot: dict):
     """Write API snapshot for terminal integration (overwrites each time)."""
     try:
         with open(LIQ_API_SNAPSHOT, "w") as f:
+            json.dump(snapshot, f)
+    except Exception:
+        pass  # Don't crash on write failures
+
+
+def _write_api_snapshot_v2(snapshot: dict):
+    """Write V2 API snapshot (tape + inference architecture)."""
+    try:
+        with open(LIQ_API_SNAPSHOT_V2, "w") as f:
             json.dump(snapshot, f)
     except Exception:
         pass  # Don't crash on write failures
@@ -510,6 +523,22 @@ class FullMetricsProcessor:
             debug_log=True           # Log displayed zones per minute
         )
 
+        # V2 Liquidation Heatmap Engine (tape + OI inference)
+        # This replaces volume-based heuristics with:
+        # 1. LiquidationTape: Ground truth from forceOrder stream
+        # 2. EntryInference: OI + aggression based forward projections
+        self.heatmap_v2 = LiquidationHeatmap(
+            config=HeatmapConfig(
+                symbol="BTC",
+                steps=20.0,
+                decay=0.995,
+                buffer=0.002,
+                tape_weight=0.35,       # 35% weight for historical tape
+                projection_weight=0.65   # 65% weight for forward projections
+            ),
+            log_dir=POC_DIR
+        )
+
     def _get_price_for_symbol(self, symbol: str) -> float:
         """Get current price for a symbol (used by REST poller for OI conversion)."""
         # For BTCUSDT, return current BTC price
@@ -857,6 +886,15 @@ class FullMetricsProcessor:
                 'mid_price': mid_price,
                 'last_price': last_price
             })
+
+            # Feed V2 heatmap tape (ground truth accumulation)
+            self.heatmap_v2.on_force_order(
+                timestamp=time.time(),
+                side=calib_side,
+                price=price,
+                qty=qty,
+                notional=notional
+            )
         except Exception as e:
             _write_debug_log({
                 "type": "liq_processing_error",
@@ -944,6 +982,29 @@ class FullMetricsProcessor:
                     'perp_sellVol': self.state.perp_sellVol,
                 }
                 self.liq_engine.update("BTC", minute_metrics)
+
+                # Update V2 heatmap engine (OI inference layer)
+                # ohlc4 = (open + high + low + close) / 4
+                v2_src = (self.state.perp_open + self.state.perp_high +
+                          self.state.perp_low + self.state.perp_close) / 4
+                v2_minute_key = int(time.time() // 60)
+                self.heatmap_v2.on_minute(
+                    minute_key=v2_minute_key,
+                    src_price=v2_src,
+                    high=self.state.perp_high,
+                    low=self.state.perp_low,
+                    oi=self.state.perp_total_oi,
+                    buy_vol=self.state.perp_buyVol,
+                    sell_vol=self.state.perp_sellVol
+                )
+
+                # Write V2 API snapshot
+                v2_snapshot = self.heatmap_v2.get_api_response(
+                    price_center=v2_src,
+                    price_range_pct=0.08
+                )
+                v2_snapshot['stats'] = self.heatmap_v2.get_stats()
+                _write_api_snapshot_v2(v2_snapshot)
 
                 # Apply persisted weights from calibrator on first update
                 if not self._applied_persisted_weights:

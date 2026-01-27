@@ -41,8 +41,11 @@ POC_DIR = os.path.dirname(os.path.abspath(__file__))
 # Snapshot file written by viewer
 SNAPSHOT_FILE = os.path.join(POC_DIR, "liq_api_snapshot.json")
 
+# V2 snapshot file (new tape+inference architecture)
+SNAPSHOT_V2_FILE = os.path.join(POC_DIR, "liq_api_snapshot_v2.json")
+
 # API version
-API_VERSION = "1.1.0"
+API_VERSION = "2.0.0"
 
 # Cache refresh interval
 CACHE_REFRESH_INTERVAL = 1.0  # seconds
@@ -517,6 +520,96 @@ def create_app() -> FastAPI:
         }
 
         return JSONResponse(content=response)
+
+    @app.get("/v2/liq_heatmap")
+    async def liq_heatmap_v2(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        range_pct: float = Query(default=0.08, description="Price range as percentage (±)")
+    ):
+        """
+        Get V2 liquidation heatmap (tape + inference architecture).
+
+        Returns combined heatmap from:
+        - Tape: Ground truth from forceOrder stream (historical)
+        - Projection: OI + aggression based inference (forward-looking)
+
+        Response format:
+        {
+            "symbol": "BTC",
+            "ts": 1234567890.123,
+            "price": 100000.0,
+            "range_pct": 0.08,
+            "long_levels": [{"price": 92000, "intensity": 0.85, "source": "combined"}, ...],
+            "short_levels": [{"price": 108000, "intensity": 0.72, "source": "combined"}, ...],
+            "meta": {
+                "tape_weight": 0.35,
+                "projection_weight": 0.65,
+                "force_orders_total": 150,
+                "inferences_total": 4200
+            },
+            "tape": {"long": {...}, "short": {...}},
+            "projection": {"long": {...}, "short": {...}}
+        }
+        """
+        v2_snapshot_path = SNAPSHOT_V2_FILE
+
+        if not os.path.exists(v2_snapshot_path):
+            # Fall back to v1 if v2 not available yet
+            raise HTTPException(
+                status_code=404,
+                detail="V2 heatmap not available. Ensure viewer is running with new engine."
+            )
+
+        try:
+            with open(v2_snapshot_path, 'r') as f:
+                data = json.load(f)
+
+            if data.get('symbol') != symbol:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"V2 snapshot is for {data.get('symbol')}, not {symbol}"
+                )
+
+            # Check staleness
+            ts = data.get('ts', 0)
+            age = time.time() - ts
+            if age > 120:
+                data["_warning"] = f"Data is {age:.0f}s old, viewer may be stopped"
+
+            return JSONResponse(content=data)
+
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="V2 snapshot file corrupted")
+
+    @app.get("/v2/liq_stats")
+    async def liq_stats_v2(
+        symbol: str = Query(default="BTC", description="Symbol to query")
+    ):
+        """
+        Get V2 heatmap statistics (tape + inference layers).
+
+        Returns detailed stats for debugging and monitoring.
+        """
+        v2_snapshot_path = SNAPSHOT_V2_FILE
+
+        if not os.path.exists(v2_snapshot_path):
+            raise HTTPException(
+                status_code=404,
+                detail="V2 heatmap not available."
+            )
+
+        try:
+            with open(v2_snapshot_path, 'r') as f:
+                data = json.load(f)
+
+            stats = data.get('stats', {})
+            stats['snapshot_ts'] = data.get('ts', 0)
+            stats['snapshot_age_s'] = round(time.time() - data.get('ts', 0), 1)
+
+            return JSONResponse(content=stats)
+
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="V2 snapshot file corrupted")
 
     return app
 
