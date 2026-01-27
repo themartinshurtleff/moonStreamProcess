@@ -359,41 +359,50 @@ class OrderbookReconstructor:
         Apply a diff in SYNCED state with continuity checks.
 
         Returns True if applied, False if gap detected (triggers resync).
+
+        For Binance Futures, pu (previous update ID) is the authoritative continuity check.
+        The U gap check is only used as a fallback when pu is not present (spot API).
         """
+        pu_check_passed = False
+
         # Check continuity using pu (previous update ID) for Futures
         # pu should equal our last_applied_u
-        if pu > 0 and pu != self._last_applied_u:
-            gap_size = abs(pu - self._last_applied_u)
-            # Track gap for debugging
-            self._stats.last_gap_pu = pu
-            self._stats.last_gap_expected = self._last_applied_u
-            self._stats.last_gap_type = "pu_mismatch"
-            self._stats.pu_gap_count += 1
+        if pu > 0:
+            if pu != self._last_applied_u:
+                gap_size = abs(pu - self._last_applied_u)
+                # Track gap for debugging
+                self._stats.last_gap_pu = pu
+                self._stats.last_gap_expected = self._last_applied_u
+                self._stats.last_gap_type = "pu_mismatch"
+                self._stats.pu_gap_count += 1
 
-            # If gap is within tolerance, log but continue (orderbook may be slightly off)
-            if self.gap_tolerance > 0 and gap_size <= self.gap_tolerance:
-                logger.info(
-                    f"[OB_RECON] Small gap tolerated: pu={pu}, expected={self._last_applied_u}, "
-                    f"gap={gap_size} <= tolerance={self.gap_tolerance}"
-                )
-                # Continue to apply the diff anyway
+                # If gap is within tolerance, log but continue (orderbook may be slightly off)
+                if self.gap_tolerance > 0 and gap_size <= self.gap_tolerance:
+                    logger.info(
+                        f"[OB_RECON] Small gap tolerated: pu={pu}, expected={self._last_applied_u}, "
+                        f"gap={gap_size} <= tolerance={self.gap_tolerance}"
+                    )
+                    pu_check_passed = True  # Tolerated gap, continue
+                else:
+                    # Track sync duration before resync
+                    if self._stats.last_synced_at > 0:
+                        sync_duration = time.time() - self._stats.last_synced_at
+                        if sync_duration > self._stats.max_sync_duration_s:
+                            self._stats.max_sync_duration_s = sync_duration
+                    logger.warning(
+                        f"[OB_RECON] Gap detected: pu={pu}, expected={self._last_applied_u}, "
+                        f"gap={gap_size}, diffs_in_sync={self._stats.diffs_in_current_sync}. "
+                        "Triggering resync."
+                    )
+                    self._trigger_resync()
+                    self._diff_buffer.append(data)
+                    return False
             else:
-                # Track sync duration before resync
-                if self._stats.last_synced_at > 0:
-                    sync_duration = time.time() - self._stats.last_synced_at
-                    if sync_duration > self._stats.max_sync_duration_s:
-                        self._stats.max_sync_duration_s = sync_duration
-                logger.warning(
-                    f"[OB_RECON] Gap detected: pu={pu}, expected={self._last_applied_u}, "
-                    f"gap={gap_size}, diffs_in_sync={self._stats.diffs_in_current_sync}. "
-                    "Triggering resync."
-                )
-                self._trigger_resync()
-                self._diff_buffer.append(data)
-                return False
+                pu_check_passed = True  # Exact match
 
-        # Also check U continuity as fallback
-        if U > self._last_applied_u + 1:
+        # U gap check is only a fallback when pu is not present (spot API)
+        # Skip this check for Binance Futures since pu is the authoritative check
+        if not pu_check_passed and pu == 0 and U > self._last_applied_u + 1:
             gap_size = U - self._last_applied_u - 1
             # Track gap for debugging
             self._stats.last_gap_pu = U
