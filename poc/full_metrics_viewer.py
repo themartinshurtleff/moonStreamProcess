@@ -669,8 +669,13 @@ class FullMetricsProcessor:
 
     def _on_calibrator_weights_updated(self, symbol: str, new_weights: list, new_buffer: float):
         """Callback when calibrator updates weights."""
-        # Push updated weights to the liq engine
-        self.liq_engine.update_leverage_weights(symbol, new_weights, new_buffer)
+        # Push updated weights to V2 inference engine
+        # Convert list format to dict format expected by V2
+        v2_ladder = sorted(self.heatmap_v2.inference.leverage_weights.keys())
+        if len(new_weights) == len(v2_ladder):
+            new_weights_dict = dict(zip(v2_ladder, new_weights))
+            self.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+            self.heatmap_v2.config.buffer = new_buffer
 
     def _on_rest_poller_update(self, poller_state: PollerState):
         """Callback when REST poller has new OI/ratio data."""
@@ -1097,15 +1102,16 @@ class FullMetricsProcessor:
         if current_minute != self.current_minute:
             # Update liquidation stress engine BEFORE resetting minute metrics
             if self.state.perp_close > 0:
-                minute_metrics = {
-                    'perp_open': self.state.perp_open,
-                    'perp_high': self.state.perp_high,
-                    'perp_low': self.state.perp_low,
-                    'perp_close': self.state.perp_close,
-                    'perp_buyVol': self.state.perp_buyVol,
-                    'perp_sellVol': self.state.perp_sellVol,
-                }
-                self.liq_engine.update("BTC", minute_metrics)
+                # V1 engine disabled - using V2 exclusively
+                # minute_metrics = {
+                #     'perp_open': self.state.perp_open,
+                #     'perp_high': self.state.perp_high,
+                #     'perp_low': self.state.perp_low,
+                #     'perp_close': self.state.perp_close,
+                #     'perp_buyVol': self.state.perp_buyVol,
+                #     'perp_sellVol': self.state.perp_sellVol,
+                # }
+                # self.liq_engine.update("BTC", minute_metrics)
 
                 # Update V2 heatmap engine (OI inference layer)
                 # ohlc4 = (open + high + low + close) / 4
@@ -1181,22 +1187,41 @@ class FullMetricsProcessor:
                 v2_snapshot['stats'] = self.heatmap_v2.get_stats()
                 _write_api_snapshot_v2(v2_snapshot)
 
-                # Apply persisted weights from calibrator on first update
+                # Apply persisted weights from calibrator on first update (to V2)
                 if not self._applied_persisted_weights:
                     persisted = self.calibrator.get_persisted_weights()
                     if persisted:
-                        self.liq_engine.update_leverage_weights(
-                            "BTC",
-                            persisted['weights'],
-                            persisted['buffer']
-                        )
-                        print(f"Loaded persisted weights (calibration #{persisted['calibration_count']})")
+                        # Convert list format to dict for V2 inference
+                        v2_ladder = sorted(self.heatmap_v2.inference.leverage_weights.keys())
+                        if len(persisted['weights']) == len(v2_ladder):
+                            new_weights_dict = dict(zip(v2_ladder, persisted['weights']))
+                            self.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+                            self.heatmap_v2.config.buffer = persisted['buffer']
+                            print(f"Loaded persisted weights to V2 (calibration #{persisted['calibration_count']})")
                     self._applied_persisted_weights = True
 
-                # Get top predicted liquidation zones from engine (raw)
-                raw_longs = self.liq_engine.top_levels("BTC", "long", 10)  # Get more for tracker
-                raw_shorts = self.liq_engine.top_levels("BTC", "short", 10)
-                self.state.liq_engine_stats = self.liq_engine.get_stats("BTC")
+                # Get top predicted liquidation zones from V2 engine (clustered pools)
+                v2_response = self.heatmap_v2.get_api_response(
+                    price_center=v2_src,
+                    price_range_pct=0.25,      # ±25% range for more visibility
+                    min_notional_usd=0         # No filtering, let UI handle it
+                )
+
+                # Convert V2 format to UI format: [(price, intensity), ...]
+                raw_longs = [
+                    (lvl['price'], lvl['intensity'])
+                    for lvl in v2_response.get('long_levels', [])
+                ]
+                raw_shorts = [
+                    (lvl['price'], lvl['intensity'])
+                    for lvl in v2_response.get('short_levels', [])
+                ]
+                # Sort by intensity descending
+                raw_longs.sort(key=lambda x: x[1], reverse=True)
+                raw_shorts.sort(key=lambda x: x[1], reverse=True)
+
+                # Use V2 stats
+                self.state.liq_engine_stats = self.heatmap_v2.get_stats()
 
                 # Pass through ZoneTracker for UI stability
                 current_minute_ts = int(time.time() // 60)
@@ -1242,25 +1267,33 @@ class FullMetricsProcessor:
                     short_zones_with_age
                 )
 
-                # Send snapshot to calibrator for learning
+                # Send snapshot to calibrator for learning (using V2 data)
                 # ohlc4 = (open + high + low + close) / 4
                 src = (self.state.perp_open + self.state.perp_high +
                        self.state.perp_low + self.state.perp_close) / 4
-                config = self.liq_engine.get_leverage_config("BTC")
 
-                # Build depth band for stress calculation
-                depth_band = self._build_depth_band(src, self.liq_engine.steps)
+                # Get V2 heatmap data for calibrator
+                v2_heatmap = self.heatmap_v2.get_heatmap()
+                v2_config = self.heatmap_v2.config
+
+                # Build depth band for stress calculation (using V2 steps)
+                depth_band = self._build_depth_band(src, v2_config.steps)
+
+                # V2 leverage weights for calibrator
+                v2_leverage_weights = self.heatmap_v2.inference.leverage_weights
+                v2_ladder = sorted(v2_leverage_weights.keys())
+                v2_weights = [v2_leverage_weights[lev] for lev in v2_ladder]
 
                 self.calibrator.on_minute_snapshot(
                     symbol="BTC",
                     timestamp=time.time(),
                     src=src,
-                    pred_longs=self.liq_engine.get_all_levels("BTC", "long"),
-                    pred_shorts=self.liq_engine.get_all_levels("BTC", "short"),
-                    ladder=config.ladder if config else [],
-                    weights=config.weights if config else [],
-                    buffer=self.liq_engine.buffer,
-                    steps=self.liq_engine.steps,
+                    pred_longs=v2_heatmap.get("long", {}),
+                    pred_shorts=v2_heatmap.get("short", {}),
+                    ladder=v2_ladder,
+                    weights=v2_weights,
+                    buffer=v2_config.buffer,
+                    steps=v2_config.steps,
                     # Market data for approach stress calculation
                     high=self.state.perp_high,
                     low=self.state.perp_low,
@@ -1306,12 +1339,12 @@ class FullMetricsProcessor:
         long_zones_with_age: list,
         short_zones_with_age: list
     ):
-        """Write comprehensive heatmap snapshot for API consumption."""
+        """Write comprehensive heatmap snapshot for API consumption (using V2)."""
         src = self.state.perp_close
         if src <= 0:
             return
 
-        steps = self.liq_engine.steps
+        steps = self.heatmap_v2.config.steps
 
         # Build price range: ±8% around src, bucketed by steps
         band_pct = 0.08
@@ -1325,9 +1358,10 @@ class FullMetricsProcessor:
             prices.append(p)
             p += steps
 
-        # Get all zone strengths from engine
-        all_longs = self.liq_engine.get_all_levels("BTC", "long")
-        all_shorts = self.liq_engine.get_all_levels("BTC", "short")
+        # Get all zone strengths from V2 engine
+        v2_heatmap = self.heatmap_v2.get_heatmap()
+        all_longs = v2_heatmap.get("long", {})
+        all_shorts = v2_heatmap.get("short", {})
 
         # Build intensity arrays (raw strengths)
         long_intensity_raw = []
