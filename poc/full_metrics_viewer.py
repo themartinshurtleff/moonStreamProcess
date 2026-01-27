@@ -43,7 +43,7 @@ from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
 from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
-from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer
+from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer, OrderbookReconstructor
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +56,9 @@ PLOT_FEED_FILE = os.path.join(POC_DIR, "plot_feed.jsonl")
 
 # Orderbook heatmap persistence file (30s frames)
 OB_HEATMAP_FILE = os.path.join(POC_DIR, "ob_heatmap_30s.bin")
+
+# Orderbook reconstructor stats file (for API diagnostics)
+OB_RECON_STATS_FILE = os.path.join(POC_DIR, "ob_recon_stats.json")
 
 # API snapshot file for terminal integration
 LIQ_API_SNAPSHOT = os.path.join(POC_DIR, "liq_api_snapshot.json")
@@ -674,9 +677,72 @@ class FullMetricsProcessor:
         ob_stats = self.ob_heatmap_buffer.get_stats()
         print(f"[OB_HEATMAP] Loaded {ob_stats['frames_in_memory']} frames from {OB_HEATMAP_FILE}")
 
+        # Orderbook Reconstructor for Binance Futures (snapshot + diff reconciliation)
+        # Maintains correct full orderbook from btcusdt@depth@100ms stream
+        self.ob_reconstructor = OrderbookReconstructor(
+            symbol="BTCUSDT",
+            on_book_update=self._on_reconstructor_update
+        )
+        print("[OB_RECON] Initialized, will sync on first depth message")
+
     def _on_ob_frame_emitted(self, frame):
         """Callback when orderbook accumulator emits a 30s frame."""
         self.ob_heatmap_buffer.add_frame(frame)
+
+    def _on_reconstructor_update(self, reconstructor: OrderbookReconstructor):
+        """
+        Callback when OrderbookReconstructor has applied a diff successfully.
+
+        Feed the full reconstructed orderbook to the 30s heatmap accumulator.
+        This ensures we have complete depth data (1000 levels) for wide-range heatmaps.
+        """
+        if not reconstructor.is_synced:
+            return
+
+        # Get full reconstructed orderbook
+        bids, asks = reconstructor.get_full_book()
+
+        # Use mark price as reference (or mid if not available)
+        mid = self.state.btc_price
+        if mid <= 0:
+            # Fallback to mid from reconstructed book
+            if bids and asks:
+                best_bid = max(b[0] for b in bids)
+                best_ask = min(a[0] for a in asks)
+                mid = (best_bid + best_ask) / 2
+            else:
+                return  # No price reference available
+
+        # Feed to accumulator (will emit frame on 30s boundary)
+        if mid > 0 and bids and asks:
+            self.ob_accumulator.on_depth_update(
+                bids=bids,
+                asks=asks,
+                src_price=mid,
+                timestamp=time.time()
+            )
+
+        # Write reconstructor stats periodically (throttled to every 5s)
+        self._maybe_write_recon_stats(reconstructor)
+
+    def _maybe_write_recon_stats(self, reconstructor: OrderbookReconstructor):
+        """Write reconstructor stats to file (throttled to every 5 seconds)."""
+        now = time.time()
+        if not hasattr(self, '_last_recon_stats_write'):
+            self._last_recon_stats_write = 0.0
+
+        if now - self._last_recon_stats_write < 5.0:
+            return
+
+        self._last_recon_stats_write = now
+        stats = reconstructor.get_stats()
+        stats['written_at'] = now
+
+        try:
+            with open(OB_RECON_STATS_FILE, 'w') as f:
+                json.dump(stats, f)
+        except Exception:
+            pass  # Don't crash on stats write failure
 
     def _get_price_for_symbol(self, symbol: str) -> float:
         """Get current price for a symbol (used by REST poller for OI conversion)."""
@@ -752,23 +818,42 @@ class FullMetricsProcessor:
             self._check_minute_rollover()
 
     def _process_depth(self, exchange: str, data: dict):
-        book = self.orderbooks[exchange]
-        bids = data.get("b") or data.get("bids") or []
-        asks = data.get("a") or data.get("asks") or []
+        # For Binance, route through the OrderbookReconstructor for proper
+        # snapshot+diff reconciliation (ensures full 1000-level orderbook)
+        if exchange == "binance":
+            # Feed raw diff to reconstructor
+            # The reconstructor callback will feed the accumulator with full book
+            self.ob_reconstructor.on_depth_diff(data)
 
-        for bid in bids:
-            price, qty = float(bid[0]), float(bid[1])
-            if qty == 0:
-                book["bids"].pop(price, None)
-            else:
-                book["bids"][price] = qty
+            # Update local orderbook from reconstructor for UI display
+            if self.ob_reconstructor.is_synced:
+                bids, asks = self.ob_reconstructor.get_full_book()
+                book = self.orderbooks[exchange]
+                book["bids"].clear()
+                book["asks"].clear()
+                for price, qty in bids:
+                    book["bids"][price] = qty
+                for price, qty in asks:
+                    book["asks"][price] = qty
+        else:
+            # For other exchanges, use the old diff-only path
+            book = self.orderbooks[exchange]
+            bids = data.get("b") or data.get("bids") or []
+            asks = data.get("a") or data.get("asks") or []
 
-        for ask in asks:
-            price, qty = float(ask[0]), float(ask[1])
-            if qty == 0:
-                book["asks"].pop(price, None)
-            else:
-                book["asks"][price] = qty
+            for bid in bids:
+                price, qty = float(bid[0]), float(bid[1])
+                if qty == 0:
+                    book["bids"].pop(price, None)
+                else:
+                    book["bids"][price] = qty
+
+            for ask in asks:
+                price, qty = float(ask[0]), float(ask[1])
+                if qty == 0:
+                    book["asks"].pop(price, None)
+                else:
+                    book["asks"][price] = qty
 
         self._compute_book_metrics()
 
@@ -838,15 +923,10 @@ class FullMetricsProcessor:
 
         self.prev_books = books_heatmap.copy()
 
-        # Feed orderbook data to 30s heatmap accumulator
-        # Uses mark price (or mid) as reference, emits frame on 30s boundary
-        if mid > 0 and all_bids and all_asks:
-            self.ob_accumulator.on_depth_update(
-                bids=all_bids,
-                asks=all_asks,
-                src_price=mid,
-                timestamp=time.time()
-            )
+        # NOTE: 30s heatmap accumulator is now fed by OrderbookReconstructor callback
+        # (_on_reconstructor_update) which provides the full 1000-level reconstructed
+        # orderbook for Binance. This ensures wide-range heatmaps have complete data.
+        # The old direct feed here was using incomplete diff-accumulated data.
 
     def _build_depth_band(self, src: float, steps: float) -> Dict[float, float]:
         """

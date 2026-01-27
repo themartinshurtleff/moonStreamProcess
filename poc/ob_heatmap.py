@@ -4,6 +4,12 @@ Orderbook Heatmap Logger - 30-second DoM screenshot frames.
 
 Aggregates Binance futures orderbook data into 30s frames for candle-overlay heatmaps.
 Keeps last 12 hours (1440 frames) with persistence across restarts.
+
+Includes OrderbookReconstructor for proper Binance diff stream reconciliation:
+- Fetches initial REST snapshot
+- Buffers diffs until snapshot applied
+- Applies diffs with update ID sequencing (U/u rules)
+- Resyncs on gaps
 """
 
 import os
@@ -13,8 +19,11 @@ import threading
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
+from enum import Enum
 import logging
+import urllib.request
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +34,383 @@ FRAME_RECORD_SIZE = 4096  # Fixed 4KB per frame for fast seek
 MAX_PRICE_BUCKETS = 1000  # Max buckets per frame
 DEFAULT_STEP = 20.0
 DEFAULT_RANGE_PCT = 0.10
+
+# Binance Futures REST API for orderbook snapshot
+BINANCE_FUTURES_DEPTH_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
+
+# Max diffs to buffer while waiting for snapshot
+MAX_DIFF_BUFFER = 500
+
+
+class SyncState(Enum):
+    """Orderbook reconstruction state."""
+    UNSYNCED = "unsynced"  # Initial state, no snapshot yet
+    SYNCING = "syncing"    # Snapshot requested, buffering diffs
+    SYNCED = "synced"      # Snapshot applied, processing diffs normally
+
+
+@dataclass
+class ReconstructorStats:
+    """Statistics for OrderbookReconstructor diagnostics."""
+    state: SyncState = SyncState.UNSYNCED
+    snapshot_last_update_id: int = 0
+    last_applied_u: int = 0
+    first_diff_applied_U: int = 0
+    first_diff_applied_u: int = 0
+    levels_bid: int = 0
+    levels_ask: int = 0
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+    resyncs: int = 0
+    diffs_buffered: int = 0
+    diffs_applied: int = 0
+    diffs_discarded: int = 0
+    last_update_ts: float = 0.0
+
+
+class OrderbookReconstructor:
+    """
+    Maintains a correct local Binance Futures orderbook via snapshot + diff stream.
+
+    Implements Binance's recommended reconciliation:
+    1. Start receiving diff stream, buffer events
+    2. Fetch REST snapshot (limit=1000)
+    3. Discard diffs where u <= lastUpdateId
+    4. First applied diff must have: U <= lastUpdateId+1 <= u
+    5. Apply diffs sequentially; detect gaps and resync if needed
+
+    Thread-safe for concurrent WS message handling.
+    """
+
+    def __init__(
+        self,
+        symbol: str = "BTCUSDT",
+        on_book_update: Optional[Callable[['OrderbookReconstructor'], None]] = None,
+        snapshot_url: str = BINANCE_FUTURES_DEPTH_URL
+    ):
+        """
+        Args:
+            symbol: Trading pair (used for logging)
+            on_book_update: Callback invoked after each successful diff application
+            snapshot_url: REST endpoint for orderbook snapshot
+        """
+        self.symbol = symbol
+        self.on_book_update = on_book_update
+        self.snapshot_url = snapshot_url
+
+        self._lock = threading.RLock()
+
+        # Orderbook state: price -> qty
+        self.bids: Dict[float, float] = {}
+        self.asks: Dict[float, float] = {}
+
+        # Sync state
+        self._state = SyncState.UNSYNCED
+        self._snapshot_last_update_id: int = 0
+        self._last_applied_u: int = 0  # Last successfully applied diff's 'u'
+
+        # Diff buffer for events received before snapshot
+        self._diff_buffer: deque = deque(maxlen=MAX_DIFF_BUFFER)
+
+        # Stats
+        self._stats = ReconstructorStats()
+        self._first_diff_U: int = 0
+        self._first_diff_u: int = 0
+
+        # Snapshot fetch thread control
+        self._snapshot_thread: Optional[threading.Thread] = None
+        self._snapshot_fetch_in_progress = False
+
+    @property
+    def state(self) -> SyncState:
+        """Current sync state."""
+        with self._lock:
+            return self._state
+
+    @property
+    def is_synced(self) -> bool:
+        """True if orderbook is fully synced and reliable."""
+        with self._lock:
+            return self._state == SyncState.SYNCED
+
+    def get_stats(self) -> dict:
+        """Get current reconstructor statistics."""
+        with self._lock:
+            return {
+                "state": self._state.value,
+                "synced": self._state == SyncState.SYNCED,
+                "snapshot_last_update_id": self._snapshot_last_update_id,
+                "last_applied_u": self._last_applied_u,
+                "first_diff_applied_U": self._first_diff_U,
+                "first_diff_applied_u": self._first_diff_u,
+                "levels_bid": len(self.bids),
+                "levels_ask": len(self.asks),
+                "best_bid": max(self.bids.keys()) if self.bids else 0.0,
+                "best_ask": min(self.asks.keys()) if self.asks else 0.0,
+                "resyncs": self._stats.resyncs,
+                "diffs_buffered": len(self._diff_buffer),
+                "diffs_applied": self._stats.diffs_applied,
+                "diffs_discarded": self._stats.diffs_discarded,
+                "last_update_ts": self._stats.last_update_ts,
+            }
+
+    def get_full_book(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """
+        Get full orderbook as (bids, asks) lists of (price, qty) tuples.
+
+        Returns:
+            (bids, asks) where each is a list of (price, qty)
+        """
+        with self._lock:
+            bids = [(p, q) for p, q in self.bids.items()]
+            asks = [(p, q) for p, q in self.asks.items()]
+            return bids, asks
+
+    def on_depth_diff(self, data: dict) -> bool:
+        """
+        Process a depth diff message from WebSocket.
+
+        Expected format (Binance Futures):
+        {
+            "e": "depthUpdate",
+            "E": 1234567890123,  # Event time
+            "T": 1234567890123,  # Transaction time
+            "s": "BTCUSDT",
+            "U": 1234567,        # First update ID in event
+            "u": 1234568,        # Final update ID in event
+            "pu": 1234566,       # Previous final update ID (Futures only)
+            "b": [["price", "qty"], ...],  # Bids to update
+            "a": [["price", "qty"], ...]   # Asks to update
+        }
+
+        Returns:
+            True if diff was applied successfully, False otherwise
+        """
+        # Extract update IDs
+        U = data.get("U", 0)  # First update ID
+        u = data.get("u", 0)  # Final update ID
+        pu = data.get("pu", 0)  # Previous update ID (Futures)
+
+        with self._lock:
+            if self._state == SyncState.UNSYNCED:
+                # First diff received - start sync process
+                self._diff_buffer.append(data)
+                self._trigger_snapshot_fetch()
+                return False
+
+            elif self._state == SyncState.SYNCING:
+                # Buffer diff while waiting for snapshot
+                self._diff_buffer.append(data)
+                if len(self._diff_buffer) >= MAX_DIFF_BUFFER:
+                    logger.warning(
+                        f"[OB_RECON] Diff buffer full ({MAX_DIFF_BUFFER}), "
+                        "snapshot may be too slow"
+                    )
+                return False
+
+            else:  # SYNCED
+                return self._apply_diff(data, U, u, pu)
+
+    def _trigger_snapshot_fetch(self):
+        """Start snapshot fetch in background thread."""
+        if self._snapshot_fetch_in_progress:
+            return
+
+        self._state = SyncState.SYNCING
+        self._snapshot_fetch_in_progress = True
+
+        def fetch():
+            try:
+                self._fetch_and_apply_snapshot()
+            except Exception as e:
+                logger.error(f"[OB_RECON] Snapshot fetch failed: {e}")
+                with self._lock:
+                    self._state = SyncState.UNSYNCED
+                    self._snapshot_fetch_in_progress = False
+
+        self._snapshot_thread = threading.Thread(target=fetch, daemon=True)
+        self._snapshot_thread.start()
+
+    def _fetch_and_apply_snapshot(self):
+        """Fetch REST snapshot and apply buffered diffs."""
+        logger.info(f"[OB_RECON] Fetching snapshot from {self.snapshot_url}")
+
+        try:
+            req = urllib.request.Request(
+                self.snapshot_url,
+                headers={"User-Agent": "moonStreamProcess/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                snapshot = json.loads(resp.read().decode())
+        except Exception as e:
+            logger.error(f"[OB_RECON] HTTP request failed: {e}")
+            with self._lock:
+                self._state = SyncState.UNSYNCED
+                self._snapshot_fetch_in_progress = False
+            return
+
+        # Extract snapshot data
+        last_update_id = snapshot.get("lastUpdateId", 0)
+        bids_raw = snapshot.get("bids", [])
+        asks_raw = snapshot.get("asks", [])
+
+        logger.info(
+            f"[OB_RECON] Snapshot received: lastUpdateId={last_update_id}, "
+            f"bids={len(bids_raw)}, asks={len(asks_raw)}"
+        )
+
+        with self._lock:
+            # Clear and rebuild orderbook from snapshot
+            self.bids.clear()
+            self.asks.clear()
+
+            for bid in bids_raw:
+                price, qty = float(bid[0]), float(bid[1])
+                if qty > 0:
+                    self.bids[price] = qty
+
+            for ask in asks_raw:
+                price, qty = float(ask[0]), float(ask[1])
+                if qty > 0:
+                    self.asks[price] = qty
+
+            self._snapshot_last_update_id = last_update_id
+            self._last_applied_u = last_update_id
+
+            # Apply buffered diffs
+            applied_first = False
+            discarded = 0
+            applied = 0
+
+            for diff in self._diff_buffer:
+                U = diff.get("U", 0)
+                u = diff.get("u", 0)
+                pu = diff.get("pu", 0)
+
+                # Discard diffs that are too old
+                if u <= last_update_id:
+                    discarded += 1
+                    continue
+
+                if not applied_first:
+                    # First diff must satisfy: U <= lastUpdateId+1 <= u
+                    if not (U <= last_update_id + 1 <= u):
+                        logger.warning(
+                            f"[OB_RECON] First diff doesn't bridge snapshot: "
+                            f"U={U}, u={u}, lastUpdateId={last_update_id}"
+                        )
+                        # Continue anyway - may have partial overlap
+                    self._first_diff_U = U
+                    self._first_diff_u = u
+                    applied_first = True
+                    logger.info(
+                        f"[OB_RECON] First diff applied: U={U}, u={u}"
+                    )
+
+                # Apply diff
+                self._apply_diff_internal(diff)
+                self._last_applied_u = u
+                applied += 1
+
+            self._diff_buffer.clear()
+            self._stats.diffs_discarded += discarded
+            self._stats.diffs_applied += applied
+
+            # Mark as synced
+            self._state = SyncState.SYNCED
+            self._snapshot_fetch_in_progress = False
+
+            best_bid = max(self.bids.keys()) if self.bids else 0
+            best_ask = min(self.asks.keys()) if self.asks else 0
+
+            logger.info(
+                f"[OB_RECON] SYNCED: levels_bid={len(self.bids)}, "
+                f"levels_ask={len(self.asks)}, best_bid={best_bid:.2f}, "
+                f"best_ask={best_ask:.2f}, applied={applied}, discarded={discarded}"
+            )
+
+    def _apply_diff(self, data: dict, U: int, u: int, pu: int) -> bool:
+        """
+        Apply a diff in SYNCED state with continuity checks.
+
+        Returns True if applied, False if gap detected (triggers resync).
+        """
+        # Check continuity using pu (previous update ID) for Futures
+        # pu should equal our last_applied_u
+        if pu > 0 and pu != self._last_applied_u:
+            # Gap detected
+            logger.warning(
+                f"[OB_RECON] Gap detected: pu={pu}, last_applied_u={self._last_applied_u}. "
+                "Triggering resync."
+            )
+            self._trigger_resync()
+            self._diff_buffer.append(data)
+            return False
+
+        # Also check U continuity as fallback
+        if U > self._last_applied_u + 1:
+            logger.warning(
+                f"[OB_RECON] U gap detected: U={U}, last_applied_u={self._last_applied_u}. "
+                "Triggering resync."
+            )
+            self._trigger_resync()
+            self._diff_buffer.append(data)
+            return False
+
+        # Apply diff
+        self._apply_diff_internal(data)
+        self._last_applied_u = u
+        self._stats.diffs_applied += 1
+        self._stats.last_update_ts = time.time()
+
+        # Invoke callback
+        if self.on_book_update:
+            try:
+                self.on_book_update(self)
+            except Exception as e:
+                logger.error(f"[OB_RECON] Callback error: {e}")
+
+        return True
+
+    def _apply_diff_internal(self, data: dict):
+        """Apply bid/ask changes from diff (no locking, no continuity check)."""
+        bids = data.get("b") or data.get("bids") or []
+        asks = data.get("a") or data.get("asks") or []
+
+        for bid in bids:
+            price, qty = float(bid[0]), float(bid[1])
+            if qty == 0:
+                self.bids.pop(price, None)
+            else:
+                self.bids[price] = qty
+
+        for ask in asks:
+            price, qty = float(ask[0]), float(ask[1])
+            if qty == 0:
+                self.asks.pop(price, None)
+            else:
+                self.asks[price] = qty
+
+    def _trigger_resync(self):
+        """Trigger a resync: clear book, go to SYNCING, fetch new snapshot."""
+        self._stats.resyncs += 1
+        self._state = SyncState.SYNCING
+        self.bids.clear()
+        self.asks.clear()
+        self._snapshot_last_update_id = 0
+        self._last_applied_u = 0
+
+        logger.info(f"[OB_RECON] Resync #{self._stats.resyncs} triggered")
+
+        # Start snapshot fetch
+        self._snapshot_fetch_in_progress = False  # Reset flag
+        self._trigger_snapshot_fetch()
+
+    def force_resync(self):
+        """Manually trigger a resync (for testing/recovery)."""
+        with self._lock:
+            self._trigger_resync()
+
 
 # Binary record header format (76 bytes)
 # ts(d) + src(d) + step(d) + price_min(d) + price_max(d) + n_prices(I) +

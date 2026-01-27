@@ -47,6 +47,9 @@ SNAPSHOT_V2_FILE = os.path.join(POC_DIR, "liq_api_snapshot_v2.json")
 # Orderbook heatmap persistence file
 OB_HEATMAP_FILE = os.path.join(POC_DIR, "ob_heatmap_30s.bin")
 
+# Orderbook reconstructor stats file
+OB_RECON_STATS_FILE = os.path.join(POC_DIR, "ob_recon_stats.json")
+
 # Import orderbook heatmap module
 try:
     from ob_heatmap import (
@@ -965,6 +968,22 @@ def create_app() -> FastAPI:
             stats["last_frame_age_s"] = round(time.time() - stats["last_ts"], 1)
         else:
             stats["last_frame_age_s"] = None
+
+        # Include reconstructor stats if available
+        if os.path.exists(OB_RECON_STATS_FILE):
+            try:
+                with open(OB_RECON_STATS_FILE, 'r') as f:
+                    recon_stats = json.load(f)
+                stats["reconstructor"] = recon_stats
+                # Calculate age of reconstructor stats
+                if "written_at" in recon_stats:
+                    stats["reconstructor"]["stats_age_s"] = round(
+                        time.time() - recon_stats["written_at"], 1
+                    )
+            except Exception:
+                stats["reconstructor"] = {"error": "failed to read stats"}
+        else:
+            stats["reconstructor"] = {"error": "stats file not found"}
 
         return JSONResponse(content=stats)
 
