@@ -44,6 +44,20 @@ SNAPSHOT_FILE = os.path.join(POC_DIR, "liq_api_snapshot.json")
 # V2 snapshot file (new tape+inference architecture)
 SNAPSHOT_V2_FILE = os.path.join(POC_DIR, "liq_api_snapshot_v2.json")
 
+# Orderbook heatmap persistence file
+OB_HEATMAP_FILE = os.path.join(POC_DIR, "ob_heatmap_30s.bin")
+
+# Import orderbook heatmap module
+try:
+    from ob_heatmap import (
+        OrderbookHeatmapBuffer, OrderbookFrame,
+        build_unified_grid, resample_frame_to_grid,
+        DEFAULT_STEP, DEFAULT_RANGE_PCT
+    )
+    HAS_OB_HEATMAP = True
+except ImportError:
+    HAS_OB_HEATMAP = False
+
 # API version
 API_VERSION = "2.0.0"
 
@@ -318,6 +332,7 @@ class SnapshotCache:
 # Global cache instance
 _cache: Optional[SnapshotCache] = None
 _cache_v2: Optional[SnapshotCache] = None  # V2 cache
+_ob_buffer: Optional['OrderbookHeatmapBuffer'] = None  # Orderbook heatmap buffer
 _start_time: float = 0
 
 
@@ -331,12 +346,17 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        global _cache, _cache_v2, _start_time
+        global _cache, _cache_v2, _ob_buffer, _start_time
         _start_time = time.time()
         _cache = SnapshotCache(SNAPSHOT_FILE, CACHE_REFRESH_INTERVAL, HISTORY_MINUTES)
         _cache.start()
         _cache_v2 = SnapshotCache(SNAPSHOT_V2_FILE, CACHE_REFRESH_INTERVAL, HISTORY_MINUTES)
         _cache_v2.start()
+        # Initialize orderbook heatmap buffer (loads from disk)
+        if HAS_OB_HEATMAP:
+            _ob_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
+            ob_stats = _ob_buffer.get_stats()
+            print(f"Orderbook heatmap: {ob_stats['frames_in_memory']} frames loaded from {OB_HEATMAP_FILE}")
         print(f"API started, reading from: {SNAPSHOT_FILE}")
         print(f"V2 snapshot file: {SNAPSHOT_V2_FILE}")
         print(f"History buffer: {HISTORY_MINUTES} minutes ({HISTORY_MINUTES / 60:.1f} hours)")
@@ -766,6 +786,187 @@ def create_app() -> FastAPI:
 
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail="V2 snapshot file corrupted")
+
+    # =========================================================================
+    # Orderbook Heatmap Endpoints (30s DoM screenshots)
+    # =========================================================================
+
+    @app.get("/v2/orderbook_heatmap_30s")
+    async def orderbook_heatmap_30s(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        range_pct: float = Query(default=0.10, description="Price range as decimal (0.10 = ±10%)"),
+        step: float = Query(default=20.0, description="Price bucket size"),
+        price_min: float = Query(default=None, description="Override minimum price"),
+        price_max: float = Query(default=None, description="Override maximum price")
+    ):
+        """
+        Get latest 30-second orderbook heatmap frame.
+
+        Returns bid/ask intensity arrays for orderbook depth visualization.
+        """
+        if not HAS_OB_HEATMAP or not _ob_buffer:
+            raise HTTPException(
+                status_code=503,
+                detail="Orderbook heatmap not available"
+            )
+
+        frame = _ob_buffer.get_latest()
+        if not frame:
+            raise HTTPException(
+                status_code=404,
+                detail="No orderbook frames available yet"
+            )
+
+        # Check staleness (warn if > 60s old)
+        age = time.time() - frame.ts
+        warning = None
+        if age > 60:
+            warning = f"Data is {age:.0f}s old, viewer may be stopped"
+
+        # Use frame's grid or resample if overrides provided
+        if price_min is not None or price_max is not None:
+            # Build custom grid
+            p_min = price_min if price_min is not None else frame.price_min
+            p_max = price_max if price_max is not None else frame.price_max
+            prices, p_min, p_max = build_unified_grid([frame], p_min, p_max, step)
+            bid_u8, ask_u8 = resample_frame_to_grid(frame, prices, step)
+        else:
+            prices = frame.get_prices()
+            bid_u8 = list(frame.bid_u8)
+            ask_u8 = list(frame.ask_u8)
+            p_min = frame.price_min
+            p_max = frame.price_max
+
+        response = {
+            "symbol": symbol,
+            "ts": frame.ts,
+            "src": frame.src,
+            "step": frame.step,
+            "price_min": p_min,
+            "price_max": p_max,
+            "prices": prices,
+            "bid_u8": bid_u8,
+            "ask_u8": ask_u8,
+            "norm_p50": frame.norm_p50,
+            "norm_p95": frame.norm_p95,
+            "total_bid_notional": frame.total_bid_notional,
+            "total_ask_notional": frame.total_ask_notional,
+            "scale": 255
+        }
+
+        if warning:
+            response["_warning"] = warning
+
+        return JSONResponse(content=response)
+
+    @app.get("/v2/orderbook_heatmap_30s_history")
+    async def orderbook_heatmap_30s_history(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        stride: int = Query(default=1, description="Downsample stride (clamped 1..60)"),
+        range_pct: float = Query(default=0.10, description="Price range as decimal"),
+        step: float = Query(default=20.0, description="Price bucket size"),
+        price_min: float = Query(default=None, description="Override minimum price"),
+        price_max: float = Query(default=None, description="Override maximum price")
+    ):
+        """
+        Get historical 30-second orderbook heatmap frames.
+
+        Returns time-series of bid/ask intensity arrays for heatmap backfill.
+        Intensities are u8 encoded (0-255) in flat row-major arrays.
+
+        Response format:
+        - t: array of timestamps (int milliseconds)
+        - prices: unified price grid
+        - bid_u8: flat row-major array [frames * prices] of u8 intensities
+        - ask_u8: flat row-major array [frames * prices] of u8 intensities
+        - step: price bucket size
+        - scale: 255 (max intensity value)
+        """
+        if not HAS_OB_HEATMAP or not _ob_buffer:
+            raise HTTPException(
+                status_code=503,
+                detail="Orderbook heatmap not available"
+            )
+
+        # Clamp parameters
+        minutes = max(5, min(720, minutes))
+        stride = max(1, min(60, stride))
+
+        # Get frames from buffer
+        frames = _ob_buffer.get_frames(minutes=minutes, stride=stride)
+
+        if not frames:
+            # Return empty response
+            return JSONResponse(content={
+                "t": [],
+                "prices": [],
+                "bid_u8": [],
+                "ask_u8": [],
+                "step": step,
+                "scale": 255,
+                "norm_method": "p50_p95"
+            })
+
+        # Build unified grid
+        prices, p_min, p_max = build_unified_grid(
+            frames,
+            price_min=price_min,
+            price_max=price_max,
+            step=step
+        )
+
+        n_prices = len(prices)
+
+        # Build flat row-major arrays
+        t_arr = []
+        bid_flat = []
+        ask_flat = []
+
+        for frame in frames:
+            t_arr.append(int(frame.ts * 1000))  # ms
+            bid_row, ask_row = resample_frame_to_grid(frame, prices, step)
+            bid_flat.extend(bid_row)
+            ask_flat.extend(ask_row)
+
+        # Debug logging
+        num_frames = len(t_arr)
+        print(f"[ob_heatmap_30s_history] frames={num_frames} prices={n_prices} "
+              f"bid_len={len(bid_flat)} ask_len={len(ask_flat)}")
+
+        return JSONResponse(content={
+            "t": t_arr,
+            "prices": prices,
+            "bid_u8": bid_flat,
+            "ask_u8": ask_flat,
+            "step": step,
+            "price_min": p_min,
+            "price_max": p_max,
+            "scale": 255,
+            "norm_method": "p50_p95"
+        })
+
+    @app.get("/v2/orderbook_heatmap_30s_stats")
+    async def orderbook_heatmap_30s_stats():
+        """
+        Get orderbook heatmap buffer statistics.
+
+        Useful for debugging and monitoring.
+        """
+        if not HAS_OB_HEATMAP or not _ob_buffer:
+            raise HTTPException(
+                status_code=503,
+                detail="Orderbook heatmap not available"
+            )
+
+        stats = _ob_buffer.get_stats()
+        stats["current_time"] = time.time()
+        if stats["last_ts"] > 0:
+            stats["last_frame_age_s"] = round(time.time() - stats["last_ts"], 1)
+        else:
+            stats["last_frame_age_s"] = None
+
+        return JSONResponse(content=stats)
 
     return app
 
