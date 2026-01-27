@@ -179,3 +179,8 @@
 {"type": "forceOrder", "ts": 1769507872.2564592, "symbol": "BTC", "side": "long", "price": 87490.1, "qty": 0.003, "notional": 262.4703, "bucket": 87500.0, "entry_est": null}
 {"type": "forceOrder", "ts": 1769507877.0478754, "symbol": "BTC", "side": "long", "price": 87482.0, "qty": 0.112, "notional": 9797.984, "bucket": 87480.0, "entry_est": null}
 {"type": "forceOrder", "ts": 1769507880.762812, "symbol": "BTC", "side": "long", "price": 87480.7, "qty": 0.007, "notional": 612.3649, "bucket": 87480.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769509495.3898568, "symbol": "BTC", "side": "long", "price": 87619.8, "qty": 0.011, "notional": 963.8177999999999, "bucket": 87620.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769509588.3455672, "symbol": "BTC", "side": "short", "price": 88325.44, "qty": 0.023, "notional": 2031.48512, "bucket": 88320.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769509835.1303093, "symbol": "BTC", "side": "long", "price": 0.0236, "qty": 502.0, "notional": 11.847199999999999, "bucket": 0.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769509879.921174, "symbol": "BTC", "side": "long", "price": 87551.7, "qty": 0.002, "notional": 175.1034, "bucket": 87560.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769509954.3072352, "symbol": "BTC", "side": "long", "price": 87490.9, "qty": 0.005, "notional": 437.4545, "bucket": 87500.0, "entry_est": null}
