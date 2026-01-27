@@ -67,6 +67,10 @@ LIQ_API_SNAPSHOT = os.path.join(POC_DIR, "liq_api_snapshot.json")
 # V2 API snapshot file (tape + inference architecture)
 LIQ_API_SNAPSHOT_V2 = os.path.join(POC_DIR, "liq_api_snapshot_v2.json")
 
+# Liquidation heatmap persistence files (binary history)
+LIQ_HEATMAP_V1_FILE = os.path.join(POC_DIR, "liq_heatmap_v1.bin")
+LIQ_HEATMAP_V2_FILE = os.path.join(POC_DIR, "liq_heatmap_v2.bin")
+
 # Log rotation thresholds
 LOG_ROTATION_MAX_MB = 200
 LOG_ROTATION_MAX_AGE_HOURS = 24
@@ -1907,7 +1911,9 @@ def main():
                 app = create_embedded_app(
                     ob_buffer=processor.ob_heatmap_buffer,
                     snapshot_file=LIQ_API_SNAPSHOT,
-                    snapshot_v2_file=LIQ_API_SNAPSHOT_V2
+                    snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
+                    liq_heatmap_v1_file=LIQ_HEATMAP_V1_FILE,
+                    liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE
                 )
                 api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
                 console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")

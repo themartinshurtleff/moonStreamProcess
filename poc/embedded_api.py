@@ -20,8 +20,11 @@ Usage:
 
 import json
 import os
+import struct
 import time
 import threading
+from collections import deque
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 import logging
 
@@ -57,13 +60,238 @@ API_VERSION = "2.1.0"  # Bumped for embedded mode
 DEFAULT_STEP = 20.0
 DEFAULT_BAND_PCT = 0.08
 
+# History buffer size (12 hours at 1-minute resolution)
+HISTORY_MINUTES = 720
+
+# Liquidation heatmap persistence constants
+LIQ_FRAME_RECORD_SIZE = 4096  # Fixed 4KB per frame for fast seek
+LIQ_MAX_BUCKETS = 1000  # Max price buckets per frame
+LIQ_HEADER_FORMAT = '<dddddI'
+LIQ_HEADER_SIZE = struct.calcsize(LIQ_HEADER_FORMAT)  # 48 bytes
+
+
+@dataclass
+class HistoryFrame:
+    """A single frame of heatmap history (1 minute)."""
+    ts: float
+    src: float
+    price_min: float
+    price_max: float
+    long_intensity: bytes  # u8 encoded
+    short_intensity: bytes  # u8 encoded
+    prices: List[float]
+
+
+class LiquidationHeatmapBuffer:
+    """
+    Persistent ring buffer for liquidation heatmap history.
+    Stores frames to disk for persistence across restarts.
+    """
+
+    def __init__(self, persistence_path: str, max_frames: int = HISTORY_MINUTES):
+        self.persistence_path = persistence_path
+        self.max_frames = max_frames
+        self._lock = threading.RLock()
+        self._frames: deque = deque(maxlen=max_frames)
+        self._last_ts: float = 0
+
+        # Load existing frames on init
+        self._load_from_disk()
+
+    def _load_from_disk(self):
+        """Load frames from persistence file on startup."""
+        if not os.path.exists(self.persistence_path):
+            return
+
+        file_size = os.path.getsize(self.persistence_path)
+        total_frames = file_size // LIQ_FRAME_RECORD_SIZE
+
+        if total_frames == 0:
+            return
+
+        frames_to_load = min(total_frames, self.max_frames)
+        start_offset = (total_frames - frames_to_load) * LIQ_FRAME_RECORD_SIZE
+
+        try:
+            with open(self.persistence_path, 'rb') as f:
+                f.seek(start_offset)
+                for _ in range(frames_to_load):
+                    record = f.read(LIQ_FRAME_RECORD_SIZE)
+                    if len(record) < LIQ_FRAME_RECORD_SIZE:
+                        break
+                    try:
+                        frame = self._frame_from_bytes(record)
+                        if frame is not None:
+                            self._frames.append(frame)
+                            self._last_ts = frame.ts
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _frame_from_bytes(self, data: bytes) -> Optional[HistoryFrame]:
+        """Deserialize frame from binary record."""
+        if len(data) < LIQ_HEADER_SIZE:
+            return None
+
+        header = struct.unpack(LIQ_HEADER_FORMAT, data[:LIQ_HEADER_SIZE])
+        ts, src, price_min, price_max, step, n_buckets = header
+
+        if ts <= 0 or n_buckets == 0:
+            return None
+
+        long_start = LIQ_HEADER_SIZE
+        short_start = LIQ_HEADER_SIZE + LIQ_MAX_BUCKETS
+        long_intensity = data[long_start:long_start + n_buckets]
+        short_intensity = data[short_start:short_start + n_buckets]
+
+        prices = []
+        p = price_min
+        while p <= price_max + 0.01 and len(prices) < n_buckets:
+            prices.append(p)
+            p += step
+
+        return HistoryFrame(
+            ts=ts,
+            src=src,
+            price_min=price_min,
+            price_max=price_max,
+            long_intensity=long_intensity,
+            short_intensity=short_intensity,
+            prices=prices
+        )
+
+    def add_frame(self, snapshot: Dict) -> bool:
+        """Add a frame from a snapshot dict."""
+        ts = snapshot.get('ts', 0)
+        if ts <= 0:
+            return False
+
+        ts_minute = int(ts // 60)
+
+        with self._lock:
+            last_minute = int(self._last_ts // 60) if self._last_ts > 0 else -1
+            if ts_minute <= last_minute:
+                return False
+
+            long_raw = snapshot.get('long_intensity', [])
+            short_raw = snapshot.get('short_intensity', [])
+
+            long_u8 = bytes([min(255, max(0, int(v * 255))) for v in long_raw])
+            short_u8 = bytes([min(255, max(0, int(v * 255))) for v in short_raw])
+
+            frame = HistoryFrame(
+                ts=ts,
+                src=snapshot.get('src', 0),
+                price_min=snapshot.get('price_min', 0),
+                price_max=snapshot.get('price_max', 0),
+                long_intensity=long_u8,
+                short_intensity=short_u8,
+                prices=snapshot.get('prices', [])
+            )
+
+            self._frames.append(frame)
+            self._last_ts = ts
+            return True
+
+    def get_frames(self, minutes: int = 60, stride: int = 1) -> List[HistoryFrame]:
+        """Get recent frames with optional downsampling."""
+        with self._lock:
+            n_frames = min(minutes, len(self._frames))
+            if n_frames == 0:
+                return []
+            frames = list(self._frames)[-n_frames:]
+            if stride > 1:
+                frames = frames[::stride]
+            return frames
+
+    def frame_count(self) -> int:
+        with self._lock:
+            return len(self._frames)
+
+    def get_time_range(self) -> Tuple[float, float]:
+        with self._lock:
+            if not self._frames:
+                return (0, 0)
+            return (self._frames[0].ts, self._frames[-1].ts)
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            frames_in_memory = len(self._frames)
+            last_ts = self._frames[-1].ts if self._frames else 0
+            oldest_ts = self._frames[0].ts if self._frames else 0
+
+        file_size = 0
+        frames_on_disk = 0
+        if os.path.exists(self.persistence_path):
+            file_size = os.path.getsize(self.persistence_path)
+            frames_on_disk = file_size // LIQ_FRAME_RECORD_SIZE
+
+        return {
+            "frames_in_memory": frames_in_memory,
+            "frames_on_disk": frames_on_disk,
+            "max_frames": self.max_frames,
+            "last_ts": last_ts,
+            "oldest_ts": oldest_ts,
+            "file_size_bytes": file_size
+        }
+
+
+def build_unified_grid(
+    frames: List[HistoryFrame],
+    current_src: float,
+    step: float = DEFAULT_STEP,
+    band_pct: float = DEFAULT_BAND_PCT
+) -> Tuple[List[float], float, float]:
+    """Build a unified price grid that covers all frames."""
+    if current_src <= 0:
+        if frames:
+            current_src = frames[-1].src
+        else:
+            return ([], 0, 0)
+
+    price_min = round((current_src * (1 - band_pct)) / step) * step
+    price_max = round((current_src * (1 + band_pct)) / step) * step
+
+    prices = []
+    p = price_min
+    while p <= price_max:
+        prices.append(p)
+        p += step
+
+    return (prices, price_min, price_max)
+
+
+def map_frame_to_grid(
+    frame: HistoryFrame,
+    target_prices: List[float],
+    step: float
+) -> Tuple[List[int], List[int]]:
+    """Map a frame's intensities to a target grid."""
+    frame_lookup_long = {}
+    frame_lookup_short = {}
+
+    for i, price in enumerate(frame.prices):
+        if i < len(frame.long_intensity):
+            frame_lookup_long[price] = frame.long_intensity[i]
+        if i < len(frame.short_intensity):
+            frame_lookup_short[price] = frame.short_intensity[i]
+
+    long_out = []
+    short_out = []
+
+    for target_price in target_prices:
+        best_long = frame_lookup_long.get(target_price, 0)
+        best_short = frame_lookup_short.get(target_price, 0)
+        long_out.append(best_long)
+        short_out.append(best_short)
+
+    return (long_out, short_out)
+
 
 class EmbeddedAPIState:
     """
     Holds shared references to buffers and files.
-
-    This allows the API to read directly from in-memory buffers
-    instead of loading from disk.
     """
 
     def __init__(
@@ -74,53 +302,75 @@ class EmbeddedAPIState:
         liq_heatmap_v1_file: Optional[str] = None,
         liq_heatmap_v2_file: Optional[str] = None
     ):
-        self.ob_buffer = ob_buffer  # Shared OrderbookHeatmapBuffer
-        self.snapshot_file = snapshot_file  # V1 JSON snapshot path
-        self.snapshot_v2_file = snapshot_v2_file  # V2 JSON snapshot path
+        self.ob_buffer = ob_buffer
+        self.snapshot_file = snapshot_file
+        self.snapshot_v2_file = snapshot_v2_file
         self.liq_heatmap_v1_file = liq_heatmap_v1_file
         self.liq_heatmap_v2_file = liq_heatmap_v2_file
         self.start_time = time.time()
 
-        # Cached snapshot data (refreshed from files periodically)
+        # Cached snapshot data
         self._v1_cache: Optional[Dict] = None
         self._v1_cache_time: float = 0
         self._v2_cache: Optional[Dict] = None
         self._v2_cache_time: float = 0
-        self._cache_ttl: float = 1.0  # Refresh from file every 1s
+        self._cache_ttl: float = 1.0
+
+        # History buffers for liquidation heatmap
+        self.v1_history: Optional[LiquidationHeatmapBuffer] = None
+        self.v2_history: Optional[LiquidationHeatmapBuffer] = None
+
+        if liq_heatmap_v1_file:
+            self.v1_history = LiquidationHeatmapBuffer(liq_heatmap_v1_file)
+        if liq_heatmap_v2_file:
+            self.v2_history = LiquidationHeatmapBuffer(liq_heatmap_v2_file)
+
+        # Start background refresh thread
+        self._running = True
+        self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+        self._refresh_thread.start()
+
+    def _refresh_loop(self):
+        """Background loop to refresh caches and add to history."""
+        while self._running:
+            self._refresh_v1_cache()
+            self._refresh_v2_cache()
+            time.sleep(self._cache_ttl)
+
+    def stop(self):
+        self._running = False
 
     def get_v1_snapshot(self) -> Optional[Dict]:
-        """Get V1 snapshot, refreshing from file if stale."""
-        now = time.time()
-        if now - self._v1_cache_time > self._cache_ttl:
-            self._refresh_v1_cache()
         return self._v1_cache
 
     def get_v2_snapshot(self) -> Optional[Dict]:
-        """Get V2 snapshot, refreshing from file if stale."""
-        now = time.time()
-        if now - self._v2_cache_time > self._cache_ttl:
-            self._refresh_v2_cache()
         return self._v2_cache
 
     def _refresh_v1_cache(self):
-        """Refresh V1 cache from file."""
         if not self.snapshot_file or not os.path.exists(self.snapshot_file):
             return
         try:
             with open(self.snapshot_file, 'r') as f:
-                self._v1_cache = json.load(f)
+                data = json.load(f)
+            self._v1_cache = data
             self._v1_cache_time = time.time()
+            # Add to history buffer
+            if self.v1_history:
+                self.v1_history.add_frame(data)
         except Exception:
             pass
 
     def _refresh_v2_cache(self):
-        """Refresh V2 cache from file."""
         if not self.snapshot_v2_file or not os.path.exists(self.snapshot_v2_file):
             return
         try:
             with open(self.snapshot_v2_file, 'r') as f:
-                self._v2_cache = json.load(f)
+                data = json.load(f)
+            self._v2_cache = data
             self._v2_cache_time = time.time()
+            # Add to history buffer
+            if self.v2_history:
+                self.v2_history.add_frame(data)
         except Exception:
             pass
 
@@ -134,16 +384,6 @@ def create_embedded_app(
 ) -> 'FastAPI':
     """
     Create FastAPI application with shared buffer references.
-
-    Args:
-        ob_buffer: Shared OrderbookHeatmapBuffer from collector
-        snapshot_file: Path to V1 liquidation snapshot JSON
-        snapshot_v2_file: Path to V2 liquidation snapshot JSON
-        liq_heatmap_v1_file: Path to V1 liquidation heatmap binary
-        liq_heatmap_v2_file: Path to V2 liquidation heatmap binary
-
-    Returns:
-        FastAPI application instance
     """
     if not HAS_FASTAPI:
         raise ImportError("FastAPI not installed. Install with: pip install fastapi uvicorn")
@@ -170,9 +410,17 @@ def create_embedded_app(
             ob_stats = state.ob_buffer.get_stats()
             ob_frames = ob_stats.get('frames_in_memory', 0)
 
+        v1_frames = state.v1_history.frame_count() if state.v1_history else 0
+        v2_frames = state.v2_history.frame_count() if state.v2_history else 0
+
         print(f"[EMBEDDED_API] Started with shared buffer: {ob_frames} OB frames")
+        print(f"[EMBEDDED_API] V1 history: {v1_frames} frames, V2 history: {v2_frames} frames")
         print(f"[EMBEDDED_API] V1 snapshot: {state.snapshot_file}")
         print(f"[EMBEDDED_API] V2 snapshot: {state.snapshot_v2_file}")
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        state.stop()
 
     @app.get("/v1/health")
     async def health():
@@ -183,6 +431,8 @@ def create_embedded_app(
 
         v1_snapshot = state.get_v1_snapshot()
         v2_snapshot = state.get_v2_snapshot()
+        v1_history_frames = state.v1_history.frame_count() if state.v1_history else 0
+        v2_history_frames = state.v2_history.frame_count() if state.v2_history else 0
 
         return {
             "ok": True,
@@ -201,6 +451,10 @@ def create_embedded_app(
             "v2_snapshot": {
                 "available": v2_snapshot is not None,
                 "ts": v2_snapshot.get('ts', 0) if v2_snapshot else 0
+            },
+            "history": {
+                "v1_frames": v1_history_frames,
+                "v2_frames": v2_history_frames
             }
         }
 
@@ -222,13 +476,78 @@ def create_embedded_app(
                 detail=f"Snapshot is for {snapshot.get('symbol')}, not {symbol}"
             )
 
-        # Check staleness
         ts = snapshot.get('ts', 0)
         age = time.time() - ts
         if age > 120:
+            snapshot = snapshot.copy()
             snapshot["_warning"] = f"Data is {age:.0f}s old, viewer may be stopped"
 
         return JSONResponse(content=snapshot)
+
+    @app.get("/v1/liq_heatmap_history")
+    async def liq_heatmap_history(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
+    ):
+        """Get historical V1 liquidation heatmap data."""
+        minutes = max(5, min(720, minutes))
+        stride = max(1, min(30, stride))
+
+        if not state.v1_history:
+            raise HTTPException(status_code=503, detail="V1 history not available")
+
+        current = state.get_v1_snapshot()
+        frames = state.v1_history.get_frames(minutes=minutes, stride=stride)
+
+        if not frames:
+            if current:
+                step = current.get('step', DEFAULT_STEP)
+                src = current.get('src', 100000)
+                price_min = round((src * (1 - DEFAULT_BAND_PCT)) / step) * step
+                price_max = round((src * (1 + DEFAULT_BAND_PCT)) / step) * step
+                prices = []
+                p = price_min
+                while p <= price_max:
+                    prices.append(p)
+                    p += step
+            else:
+                step = DEFAULT_STEP
+                prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+
+            return JSONResponse(content={
+                "t": [], "prices": prices, "long": [], "short": [],
+                "step": step, "scale": 255, "_mode": "embedded"
+            })
+
+        if current:
+            current_src = current.get('src', 0)
+            step = current.get('step', DEFAULT_STEP)
+        else:
+            current_src = frames[-1].src
+            step = DEFAULT_STEP
+
+        prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
+
+        if not prices:
+            prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+
+        t_arr = []
+        long_flat = []
+        short_flat = []
+
+        for frame in frames:
+            t_arr.append(int(frame.ts * 1000))
+            long_row, short_row = map_frame_to_grid(frame, prices, step)
+            long_flat.extend(long_row)
+            short_flat.extend(short_row)
+
+        print(f"[EMBEDDED_API] v1/liq_heatmap_history: frames={len(t_arr)} prices={len(prices)}")
+
+        return JSONResponse(content={
+            "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
+            "step": step, "scale": 255, "_mode": "embedded"
+        })
 
     @app.get("/v2/liq_heatmap")
     async def liq_heatmap_v2(
@@ -249,9 +568,8 @@ def create_embedded_app(
                 detail=f"V2 snapshot is for {snapshot.get('symbol')}, not {symbol}"
             )
 
-        # Apply min_notional filter if specified
         if min_notional > 0:
-            snapshot = snapshot.copy()  # Don't modify cached version
+            snapshot = snapshot.copy()
             snapshot['long_levels'] = [
                 lvl for lvl in snapshot.get('long_levels', [])
                 if lvl.get('notional_usd', 0) >= min_notional
@@ -261,13 +579,96 @@ def create_embedded_app(
                 if lvl.get('notional_usd', 0) >= min_notional
             ]
 
-        # Check staleness
         ts = snapshot.get('ts', 0)
         age = time.time() - ts
         if age > 120:
+            snapshot = snapshot.copy() if min_notional == 0 else snapshot
             snapshot["_warning"] = f"Data is {age:.0f}s old, viewer may be stopped"
 
         return JSONResponse(content=snapshot)
+
+    @app.get("/v2/liq_heatmap_history")
+    async def liq_heatmap_history_v2(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
+    ):
+        """Get historical V2 liquidation heatmap data."""
+        minutes = max(5, min(720, minutes))
+        stride = max(1, min(30, stride))
+
+        if not state.v2_history:
+            raise HTTPException(status_code=503, detail="V2 history not available")
+
+        current = state.get_v2_snapshot()
+        frames = state.v2_history.get_frames(minutes=minutes, stride=stride)
+
+        if not frames:
+            if current:
+                step = current.get('step', DEFAULT_STEP)
+                src = current.get('src', 100000)
+                price_min = round((src * (1 - DEFAULT_BAND_PCT)) / step) * step
+                price_max = round((src * (1 + DEFAULT_BAND_PCT)) / step) * step
+                prices = []
+                p = price_min
+                while p <= price_max:
+                    prices.append(p)
+                    p += step
+            else:
+                step = DEFAULT_STEP
+                prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+
+            return JSONResponse(content={
+                "t": [], "prices": prices, "long": [], "short": [],
+                "step": step, "scale": 255, "_mode": "embedded"
+            })
+
+        if current:
+            current_src = current.get('src', 0)
+            step = current.get('step', DEFAULT_STEP)
+        else:
+            current_src = frames[-1].src
+            step = DEFAULT_STEP
+
+        prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
+
+        if not prices:
+            prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+
+        t_arr = []
+        long_flat = []
+        short_flat = []
+
+        for frame in frames:
+            t_arr.append(int(frame.ts * 1000))
+            long_row, short_row = map_frame_to_grid(frame, prices, step)
+            long_flat.extend(long_row)
+            short_flat.extend(short_row)
+
+        print(f"[EMBEDDED_API] v2/liq_heatmap_history: frames={len(t_arr)} prices={len(prices)}")
+
+        return JSONResponse(content={
+            "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
+            "step": step, "scale": 255, "_mode": "embedded"
+        })
+
+    @app.get("/v2/liq_stats")
+    async def liq_stats_v2(
+        symbol: str = Query(default="BTC", description="Symbol to query")
+    ):
+        """Get V2 heatmap statistics."""
+        snapshot = state.get_v2_snapshot()
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="V2 heatmap not available")
+
+        stats = snapshot.get('stats', {})
+        stats['snapshot_ts'] = snapshot.get('ts', 0)
+        stats['snapshot_age_s'] = round(time.time() - snapshot.get('ts', 0), 1)
+
+        if state.v2_history:
+            stats['history_frames'] = state.v2_history.frame_count()
+
+        return JSONResponse(content=stats)
 
     # =========================================================================
     # Orderbook Heatmap Endpoints (30s DoM - uses shared buffer directly)
@@ -281,11 +682,7 @@ def create_embedded_app(
         price_min: float = Query(default=None, description="Override minimum price"),
         price_max: float = Query(default=None, description="Override maximum price")
     ):
-        """
-        Get latest 30-second orderbook heatmap frame.
-
-        Uses shared buffer directly - no disk sync needed!
-        """
+        """Get latest 30-second orderbook heatmap frame."""
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -299,13 +696,11 @@ def create_embedded_app(
                 detail="No orderbook frames available yet"
             )
 
-        # Check staleness
         age = time.time() - frame.ts
         warning = None
         if age > 60:
             warning = f"Data is {age:.0f}s old"
 
-        # Use frame's grid or resample if overrides provided
         if price_min is not None or price_max is not None:
             p_min = price_min if price_min is not None else frame.price_min
             p_max = price_max if price_max is not None else frame.price_max
@@ -333,7 +728,7 @@ def create_embedded_app(
             "total_bid_notional": frame.total_bid_notional,
             "total_ask_notional": frame.total_ask_notional,
             "scale": 255,
-            "_mode": "shared_buffer"  # Indicates we're using shared memory
+            "_mode": "shared_buffer"
         }
 
         if warning:
@@ -350,71 +745,44 @@ def create_embedded_app(
         price_min: float = Query(default=None, description="Override minimum price"),
         price_max: float = Query(default=None, description="Override maximum price")
     ):
-        """
-        Get historical 30-second orderbook heatmap frames.
-
-        Uses shared buffer directly - always up to date!
-        """
+        """Get historical 30-second orderbook heatmap frames."""
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
                 detail="Orderbook heatmap not available (no shared buffer)"
             )
 
-        # Clamp parameters
         minutes = max(5, min(720, minutes))
         stride = max(1, min(60, stride))
 
-        # Get frames from shared buffer
         frames = state.ob_buffer.get_frames(minutes=minutes, stride=stride)
 
         if not frames:
             return JSONResponse(content={
-                "t": [],
-                "prices": [],
-                "bid_u8": [],
-                "ask_u8": [],
-                "step": step,
-                "scale": 255,
-                "norm_method": "p50_p95",
-                "_mode": "shared_buffer"
+                "t": [], "prices": [], "bid_u8": [], "ask_u8": [],
+                "step": step, "scale": 255, "norm_method": "p50_p95", "_mode": "shared_buffer"
             })
 
-        # Build unified grid
         prices, p_min, p_max = ob_build_unified_grid(
-            frames,
-            price_min=price_min,
-            price_max=price_max,
-            step=step
+            frames, price_min=price_min, price_max=price_max, step=step
         )
 
-        n_prices = len(prices)
-
-        # Build flat row-major arrays
         t_arr = []
         bid_flat = []
         ask_flat = []
 
         for frame in frames:
-            t_arr.append(int(frame.ts * 1000))  # ms
+            t_arr.append(int(frame.ts * 1000))
             bid_row, ask_row = resample_frame_to_grid(frame, prices, step)
             bid_flat.extend(bid_row)
             ask_flat.extend(ask_row)
 
-        num_frames = len(t_arr)
-        print(f"[EMBEDDED_API] ob_heatmap_30s_history: frames={num_frames} prices={n_prices}")
+        print(f"[EMBEDDED_API] ob_heatmap_30s_history: frames={len(t_arr)} prices={len(prices)}")
 
         return JSONResponse(content={
-            "t": t_arr,
-            "prices": prices,
-            "bid_u8": bid_flat,
-            "ask_u8": ask_flat,
-            "step": step,
-            "price_min": p_min,
-            "price_max": p_max,
-            "scale": 255,
-            "norm_method": "p50_p95",
-            "_mode": "shared_buffer"
+            "t": t_arr, "prices": prices, "bid_u8": bid_flat, "ask_u8": ask_flat,
+            "step": step, "price_min": p_min, "price_max": p_max,
+            "scale": 255, "norm_method": "p50_p95", "_mode": "shared_buffer"
         })
 
     @app.get("/v2/orderbook_heatmap_30s_stats")
@@ -463,28 +831,13 @@ def start_api_thread(
     port: int = 8899,
     log_level: str = "warning"
 ) -> threading.Thread:
-    """
-    Start the API server in a background daemon thread.
-
-    Args:
-        app: FastAPI application instance
-        host: Host to bind to
-        port: Port to bind to
-        log_level: Uvicorn log level
-
-    Returns:
-        Thread running the API server
-    """
+    """Start the API server in a background daemon thread."""
     if not HAS_FASTAPI:
         raise ImportError("FastAPI not installed")
 
     def run_server():
         config = uvicorn.Config(
-            app,
-            host=host,
-            port=port,
-            log_level=log_level,
-            access_log=False  # Reduce noise
+            app, host=host, port=port, log_level=log_level, access_log=False
         )
         server = uvicorn.Server(config)
         server.run()
@@ -496,9 +849,10 @@ def start_api_thread(
     print(f"[EMBEDDED_API] Endpoints:")
     print(f"  GET http://{host}:{port}/v1/health")
     print(f"  GET http://{host}:{port}/v1/liq_heatmap")
+    print(f"  GET http://{host}:{port}/v1/liq_heatmap_history")
     print(f"  GET http://{host}:{port}/v2/liq_heatmap")
+    print(f"  GET http://{host}:{port}/v2/liq_heatmap_history")
     print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s")
     print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s_history")
-    print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s_stats")
 
     return thread
