@@ -407,7 +407,7 @@ class OrderbookReconstructor:
                     f"[OB_RECON] Small U gap tolerated: U={U}, expected<={self._last_applied_u + 1}, "
                     f"gap={gap_size} <= tolerance={self.gap_tolerance}"
                 )
-                # Continue to apply the diff anyway
+                # Continue to apply the diff anyway (fall through to apply section)
             else:
                 # Track sync duration before resync
                 if self._stats.last_synced_at > 0:
@@ -418,10 +418,10 @@ class OrderbookReconstructor:
                     f"[OB_RECON] U gap detected: U={U}, expected<={self._last_applied_u + 1}, "
                     f"gap={gap_size}, diffs_in_sync={self._stats.diffs_in_current_sync}. "
                     "Triggering resync."
-            )
-            self._trigger_resync()
-            self._diff_buffer.append(data)
-            return False
+                )
+                self._trigger_resync()
+                self._diff_buffer.append(data)
+                return False
 
         # Apply diff
         self._apply_diff_internal(data)
