@@ -75,7 +75,7 @@ class EntryInference:
 
     DEFAULT_BUFFER = 0.002    # 0.2% maintenance margin buffer
     DEFAULT_STEPS = 20.0      # Price bucket size
-    DEFAULT_DECAY = 0.98      # Per-minute decay for projected zones
+    DEFAULT_DECAY = 0.998     # Per-minute decay for projected zones (slower for persistence)
 
     # Minimum OI change to trigger inference (as fraction of position size)
     MIN_OI_CHANGE_PCT = 0.001  # 0.1% of OI

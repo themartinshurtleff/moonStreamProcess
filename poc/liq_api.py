@@ -524,12 +524,12 @@ def create_app() -> FastAPI:
     @app.get("/v2/liq_heatmap")
     async def liq_heatmap_v2(
         symbol: str = Query(default="BTC", description="Symbol to query"),
-        range_pct: float = Query(default=0.08, description="Price range as percentage (±)")
+        min_notional: float = Query(default=0, description="Minimum USD notional to include (0=all)")
     ):
         """
         Get V2 liquidation heatmap (tape + inference architecture).
 
-        Returns combined heatmap from:
+        Returns clustered liquidity pools from:
         - Tape: Ground truth from forceOrder stream (historical)
         - Projection: OI + aggression based inference (forward-looking)
 
@@ -538,23 +538,29 @@ def create_app() -> FastAPI:
             "symbol": "BTC",
             "ts": 1234567890.123,
             "price": 100000.0,
-            "range_pct": 0.08,
-            "long_levels": [{"price": 92000, "intensity": 0.85, "source": "combined"}, ...],
-            "short_levels": [{"price": 108000, "intensity": 0.72, "source": "combined"}, ...],
+            "long_levels": [
+                {
+                    "price": 92000.0,        // Weighted centroid
+                    "price_low": 91800.0,    // Cluster lower bound
+                    "price_high": 92200.0,   // Cluster upper bound
+                    "notional_usd": 250000.0,// Total USD in cluster
+                    "intensity": 0.85,       // Normalized 0-1 strength
+                    "bucket_count": 5        // Buckets merged
+                }, ...
+            ],
+            "short_levels": [...],
             "meta": {
                 "tape_weight": 0.35,
                 "projection_weight": 0.65,
-                "force_orders_total": 150,
-                "inferences_total": 4200
-            },
-            "tape": {"long": {...}, "short": {...}},
-            "projection": {"long": {...}, "short": {...}}
+                "cluster_radius_pct": 0.005,
+                "min_notional_usd": 10000.0,
+                ...
+            }
         }
         """
         v2_snapshot_path = SNAPSHOT_V2_FILE
 
         if not os.path.exists(v2_snapshot_path):
-            # Fall back to v1 if v2 not available yet
             raise HTTPException(
                 status_code=404,
                 detail="V2 heatmap not available. Ensure viewer is running with new engine."
@@ -569,6 +575,22 @@ def create_app() -> FastAPI:
                     status_code=404,
                     detail=f"V2 snapshot is for {data.get('symbol')}, not {symbol}"
                 )
+
+            # Apply min_notional filter if specified
+            if min_notional > 0:
+                data['long_levels'] = [
+                    lvl for lvl in data.get('long_levels', [])
+                    if lvl.get('notional_usd', 0) >= min_notional
+                ]
+                data['short_levels'] = [
+                    lvl for lvl in data.get('short_levels', [])
+                    if lvl.get('notional_usd', 0) >= min_notional
+                ]
+                # Update meta
+                if 'meta' in data:
+                    data['meta']['filtered_min_notional'] = min_notional
+                    data['meta']['long_pools_count'] = len(data['long_levels'])
+                    data['meta']['short_pools_count'] = len(data['short_levels'])
 
             # Check staleness
             ts = data.get('ts', 0)

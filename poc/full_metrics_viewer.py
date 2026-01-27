@@ -1171,10 +1171,12 @@ class FullMetricsProcessor:
                     debug_entry["perp_sellVol_btc"] = round(perp_sellVol_btc, 6)
                 _write_debug_log(debug_entry)
 
-                # Write V2 API snapshot
+                # Write V2 API snapshot (clustered pools with notional values)
+                # Use lower min_notional for snapshot so UI can filter
                 v2_snapshot = self.heatmap_v2.get_api_response(
                     price_center=v2_src,
-                    price_range_pct=0.08
+                    price_range_pct=0.10,      # ±10% range for more visibility
+                    min_notional_usd=1000.0    # Low threshold, UI can filter
                 )
                 v2_snapshot['stats'] = self.heatmap_v2.get_stats()
                 _write_api_snapshot_v2(v2_snapshot)

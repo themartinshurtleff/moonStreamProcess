@@ -16,9 +16,10 @@ Both layers feed back into each other:
 
 import json
 import logging
+import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from liq_tape import LiquidationTape
@@ -28,14 +29,30 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class LiquidityPool:
+    """A clustered liquidity pool (merged from nearby buckets)."""
+    center_price: float      # Weighted centroid price
+    price_low: float         # Lower bound of cluster
+    price_high: float        # Upper bound of cluster
+    notional_usd: float      # Total USD notional in cluster
+    bucket_count: int        # Number of buckets merged
+    intensity: float = 0.0   # Normalized 0-1 intensity
+    side: str = ""           # "long" or "short"
+
+
+@dataclass
 class HeatmapConfig:
     """Configuration for the unified heatmap engine."""
     symbol: str = "BTC"
     steps: float = 20.0          # Price bucket size
-    decay: float = 0.995         # Per-minute decay
+    decay: float = 0.998         # Per-minute decay (slower for persistence)
     buffer: float = 0.002        # Liquidation buffer
     tape_weight: float = 0.35    # Weight for historical tape
     projection_weight: float = 0.65  # Weight for forward projections
+    # Clustering parameters
+    cluster_radius_pct: float = 0.005  # Cluster within ±0.5% of price (~$500 at $100k)
+    min_notional_usd: float = 10000.0  # Minimum $10k to display a pool
+    max_pools_per_side: int = 20       # Max pools to return per side
 
 
 class LiquidationHeatmap:
@@ -288,44 +305,180 @@ class LiquidationHeatmap:
             }
         }
 
-    def get_api_response(self, price_center: float = None, price_range_pct: float = 0.10) -> Dict:
+    def _cluster_zones(
+        self,
+        zones: Dict[float, float],
+        center: float,
+        side: str,
+        min_notional: float = None
+    ) -> List[LiquidityPool]:
+        """
+        Cluster nearby price buckets into liquidity pools.
+
+        Uses greedy clustering: sort by notional, cluster each bucket with
+        nearby buckets within cluster_radius_pct.
+
+        Args:
+            zones: {price: notional_usd} dict
+            center: Current price for radius calculation
+            side: "long" or "short"
+            min_notional: Minimum notional to include (default: config value)
+
+        Returns:
+            List of LiquidityPool objects, sorted by notional descending
+        """
+        if not zones:
+            return []
+
+        min_notional = min_notional if min_notional is not None else self.config.min_notional_usd
+        cluster_radius = center * self.config.cluster_radius_pct
+
+        # Filter by minimum notional and convert to list of (price, notional)
+        buckets = [(p, n) for p, n in zones.items() if n >= 100]  # At least $100 per bucket
+        if not buckets:
+            return []
+
+        # Sort by price for clustering
+        buckets.sort(key=lambda x: x[0])
+
+        # Greedy clustering: merge adjacent buckets within radius
+        clusters = []
+        i = 0
+        while i < len(buckets):
+            cluster_prices = [buckets[i][0]]
+            cluster_notionals = [buckets[i][1]]
+
+            # Extend cluster to include nearby buckets
+            j = i + 1
+            while j < len(buckets):
+                if buckets[j][0] - cluster_prices[-1] <= cluster_radius:
+                    cluster_prices.append(buckets[j][0])
+                    cluster_notionals.append(buckets[j][1])
+                    j += 1
+                else:
+                    break
+
+            # Create cluster if meets minimum
+            total_notional = sum(cluster_notionals)
+            if total_notional >= min_notional:
+                # Weighted centroid price
+                weighted_price = sum(p * n for p, n in zip(cluster_prices, cluster_notionals)) / total_notional
+
+                clusters.append(LiquidityPool(
+                    center_price=round(weighted_price, 2),
+                    price_low=min(cluster_prices),
+                    price_high=max(cluster_prices),
+                    notional_usd=round(total_notional, 2),
+                    bucket_count=len(cluster_prices),
+                    side=side
+                ))
+
+            i = j
+
+        # Sort by notional descending and limit
+        clusters.sort(key=lambda x: x.notional_usd, reverse=True)
+        return clusters[:self.config.max_pools_per_side]
+
+    def _normalize_pools(self, pools: List[LiquidityPool]) -> None:
+        """Normalize pool intensities to 0-1 range in place."""
+        if not pools:
+            return
+
+        max_notional = max(p.notional_usd for p in pools)
+        if max_notional <= 0:
+            return
+
+        for pool in pools:
+            # Use sqrt scaling for better visual distribution
+            pool.intensity = round(math.sqrt(pool.notional_usd / max_notional), 4)
+
+    def get_api_response(
+        self,
+        price_center: float = None,
+        price_range_pct: float = 0.10,
+        min_notional_usd: float = None
+    ) -> Dict:
         """
         Get heatmap formatted for API response (Rust terminal compatible).
+
+        Returns clustered liquidity pools with notional values for UI filtering.
 
         Args:
             price_center: Center price for filtering (default: current price)
             price_range_pct: Range as percentage (default: ±10%)
+            min_notional_usd: Minimum USD notional to include (default: config value)
 
         Returns:
-            API-compatible response with arrays for efficient rendering
+            API-compatible response with clustered pools
         """
-        heatmap = self.get_heatmap()
-        center = price_center or self.current_price or 0
+        tape_heatmap = self.tape.get_heatmap()
+        projections = self.inference.get_projections()
 
+        # Combine tape and projections into notional values
+        combined_long = {}
+        combined_short = {}
+
+        # Merge long zones
+        all_long_prices = set(tape_heatmap.get("long", {}).keys()) | set(projections.get("long", {}).keys())
+        for price in all_long_prices:
+            tape_val = tape_heatmap.get("long", {}).get(price, 0)
+            proj_val = projections.get("long", {}).get(price, 0)
+            combined = tape_val * self.config.tape_weight + proj_val * self.config.projection_weight
+            if combined > 0:
+                combined_long[price] = combined
+
+        # Merge short zones
+        all_short_prices = set(tape_heatmap.get("short", {}).keys()) | set(projections.get("short", {}).keys())
+        for price in all_short_prices:
+            tape_val = tape_heatmap.get("short", {}).get(price, 0)
+            proj_val = projections.get("short", {}).get(price, 0)
+            combined = tape_val * self.config.tape_weight + proj_val * self.config.projection_weight
+            if combined > 0:
+                combined_short[price] = combined
+
+        center = price_center or self.current_price or 0
         if center <= 0:
             return {"error": "no_price_data"}
 
         low_bound = center * (1 - price_range_pct)
         high_bound = center * (1 + price_range_pct)
 
-        # Filter and format as arrays for efficient rendering
-        long_levels = []
-        for price, intensity in sorted(heatmap["long"].items()):
-            if low_bound <= price <= center:  # Longs below current price
-                long_levels.append({
-                    "price": price,
-                    "intensity": round(intensity, 4),
-                    "source": "combined"
-                })
+        # Filter to price range
+        long_in_range = {p: n for p, n in combined_long.items() if low_bound <= p <= center}
+        short_in_range = {p: n for p, n in combined_short.items() if center <= p <= high_bound}
 
-        short_levels = []
-        for price, intensity in sorted(heatmap["short"].items()):
-            if center <= price <= high_bound:  # Shorts above current price
-                short_levels.append({
-                    "price": price,
-                    "intensity": round(intensity, 4),
-                    "source": "combined"
-                })
+        # Cluster into pools
+        long_pools = self._cluster_zones(long_in_range, center, "long", min_notional_usd)
+        short_pools = self._cluster_zones(short_in_range, center, "short", min_notional_usd)
+
+        # Normalize intensities (combined across both sides for consistent scaling)
+        all_pools = long_pools + short_pools
+        self._normalize_pools(all_pools)
+
+        # Format for API response
+        long_levels = [
+            {
+                "price": pool.center_price,
+                "price_low": pool.price_low,
+                "price_high": pool.price_high,
+                "notional_usd": pool.notional_usd,
+                "intensity": pool.intensity,
+                "bucket_count": pool.bucket_count
+            }
+            for pool in long_pools
+        ]
+
+        short_levels = [
+            {
+                "price": pool.center_price,
+                "price_low": pool.price_low,
+                "price_high": pool.price_high,
+                "notional_usd": pool.notional_usd,
+                "intensity": pool.intensity,
+                "bucket_count": pool.bucket_count
+            }
+            for pool in short_pools
+        ]
 
         return {
             "symbol": self.config.symbol,
@@ -338,7 +491,13 @@ class LiquidationHeatmap:
                 "tape_weight": self.config.tape_weight,
                 "projection_weight": self.config.projection_weight,
                 "force_orders_total": self.total_force_orders,
-                "inferences_total": self.total_inferences
+                "inferences_total": self.total_inferences,
+                "cluster_radius_pct": self.config.cluster_radius_pct,
+                "min_notional_usd": min_notional_usd or self.config.min_notional_usd,
+                "long_pools_count": len(long_pools),
+                "short_pools_count": len(short_pools),
+                "raw_long_buckets": len(long_in_range),
+                "raw_short_buckets": len(short_in_range)
             }
         }
 
