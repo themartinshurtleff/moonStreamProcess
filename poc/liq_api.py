@@ -59,6 +59,8 @@ LIQ_HEATMAP_V1_FILE = os.path.join(POC_DIR, "liq_heatmap_v1.bin")
 LIQ_HEATMAP_V2_FILE = os.path.join(POC_DIR, "liq_heatmap_v2.bin")
 
 # Import orderbook heatmap module
+HAS_OB_HEATMAP = False
+OB_HEATMAP_IMPORT_ERROR = None
 try:
     from ob_heatmap import (
         OrderbookHeatmapBuffer, OrderbookFrame,
@@ -66,8 +68,10 @@ try:
         DEFAULT_STEP, DEFAULT_RANGE_PCT
     )
     HAS_OB_HEATMAP = True
-except ImportError:
-    HAS_OB_HEATMAP = False
+except ImportError as e:
+    OB_HEATMAP_IMPORT_ERROR = f"ImportError: {e}"
+except Exception as e:
+    OB_HEATMAP_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 # API version
 API_VERSION = "2.0.0"
@@ -681,9 +685,15 @@ def create_app() -> FastAPI:
 
         # Initialize orderbook heatmap buffer (loads from disk)
         if HAS_OB_HEATMAP:
-            _ob_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
-            ob_stats = _ob_buffer.get_stats()
-            print(f"Orderbook heatmap: {ob_stats['frames_in_memory']} frames loaded from {OB_HEATMAP_FILE}")
+            try:
+                _ob_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
+                ob_stats = _ob_buffer.get_stats()
+                print(f"Orderbook heatmap: {ob_stats['frames_in_memory']} frames loaded from {OB_HEATMAP_FILE}")
+            except Exception as e:
+                print(f"ERROR: Failed to initialize OrderbookHeatmapBuffer: {e}")
+                _ob_buffer = None
+        else:
+            print(f"WARNING: Orderbook heatmap module not available: {OB_HEATMAP_IMPORT_ERROR}")
 
         print(f"API started, reading from: {SNAPSHOT_FILE}")
         print(f"V2 snapshot file: {SNAPSHOT_V2_FILE}")
@@ -1313,6 +1323,44 @@ def create_app() -> FastAPI:
             stats["reconstructor"] = {"error": "stats file not found"}
 
         return JSONResponse(content=stats)
+
+    @app.get("/v2/orderbook_heatmap_30s_debug")
+    async def orderbook_heatmap_30s_debug():
+        """
+        Debug endpoint for orderbook heatmap system.
+
+        Shows internal state without requiring working heatmap.
+        """
+        debug_info = {
+            "has_ob_heatmap_module": HAS_OB_HEATMAP,
+            "ob_heatmap_import_error": OB_HEATMAP_IMPORT_ERROR,
+            "ob_buffer_initialized": _ob_buffer is not None,
+            "ob_heatmap_file": OB_HEATMAP_FILE,
+            "ob_heatmap_file_exists": os.path.exists(OB_HEATMAP_FILE),
+            "ob_recon_stats_file": OB_RECON_STATS_FILE,
+            "ob_recon_stats_exists": os.path.exists(OB_RECON_STATS_FILE),
+        }
+
+        # File sizes
+        if os.path.exists(OB_HEATMAP_FILE):
+            debug_info["ob_heatmap_file_size_bytes"] = os.path.getsize(OB_HEATMAP_FILE)
+
+        # Buffer stats if available
+        if _ob_buffer is not None:
+            try:
+                debug_info["ob_buffer_stats"] = _ob_buffer.get_stats()
+            except Exception as e:
+                debug_info["ob_buffer_stats_error"] = str(e)
+
+        # Recon stats if available
+        if os.path.exists(OB_RECON_STATS_FILE):
+            try:
+                with open(OB_RECON_STATS_FILE, 'r') as f:
+                    debug_info["recon_stats"] = json.load(f)
+            except Exception as e:
+                debug_info["recon_stats_error"] = str(e)
+
+        return JSONResponse(content=debug_info)
 
     return app
 

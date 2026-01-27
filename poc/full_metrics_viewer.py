@@ -679,11 +679,14 @@ class FullMetricsProcessor:
 
         # Orderbook Reconstructor for Binance Futures (snapshot + diff reconciliation)
         # Maintains correct full orderbook from btcusdt@depth@100ms stream
+        # gap_tolerance=100 allows small gaps to be tolerated for heatmap visualization
+        # (orderbook may be slightly off during gaps, but better than constant resyncs)
         self.ob_reconstructor = OrderbookReconstructor(
             symbol="BTCUSDT",
-            on_book_update=self._on_reconstructor_update
+            on_book_update=self._on_reconstructor_update,
+            gap_tolerance=100  # Tolerate gaps up to 100 update IDs
         )
-        print("[OB_RECON] Initialized, will sync on first depth message")
+        print("[OB_RECON] Initialized with gap_tolerance=100, will sync on first depth message")
 
     def _on_ob_frame_emitted(self, frame):
         """Callback when orderbook accumulator emits a 30s frame."""

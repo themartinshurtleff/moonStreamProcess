@@ -66,6 +66,15 @@ class ReconstructorStats:
     diffs_applied: int = 0
     diffs_discarded: int = 0
     last_update_ts: float = 0.0
+    # Gap tracking for debugging
+    last_gap_pu: int = 0  # pu that caused last gap
+    last_gap_expected: int = 0  # what we expected pu to be
+    last_gap_type: str = ""  # "pu_mismatch" or "u_gap"
+    pu_gap_count: int = 0  # count of pu mismatch resyncs
+    u_gap_count: int = 0  # count of U gap resyncs
+    last_synced_at: float = 0.0  # when we last entered SYNCED state
+    max_sync_duration_s: float = 0.0  # longest sync period
+    diffs_in_current_sync: int = 0  # diffs applied in current sync period
 
 
 class OrderbookReconstructor:
@@ -86,17 +95,22 @@ class OrderbookReconstructor:
         self,
         symbol: str = "BTCUSDT",
         on_book_update: Optional[Callable[['OrderbookReconstructor'], None]] = None,
-        snapshot_url: str = BINANCE_FUTURES_DEPTH_URL
+        snapshot_url: str = BINANCE_FUTURES_DEPTH_URL,
+        gap_tolerance: int = 0
     ):
         """
         Args:
             symbol: Trading pair (used for logging)
             on_book_update: Callback invoked after each successful diff application
             snapshot_url: REST endpoint for orderbook snapshot
+            gap_tolerance: Number of update IDs to tolerate as a gap before resyncing.
+                           Set to 0 for strict mode (resync on any gap).
+                           For heatmap visualization, a small tolerance (e.g., 100) is acceptable.
         """
         self.symbol = symbol
         self.on_book_update = on_book_update
         self.snapshot_url = snapshot_url
+        self.gap_tolerance = gap_tolerance
 
         self._lock = threading.RLock()
 
@@ -152,6 +166,15 @@ class OrderbookReconstructor:
                 "diffs_applied": self._stats.diffs_applied,
                 "diffs_discarded": self._stats.diffs_discarded,
                 "last_update_ts": self._stats.last_update_ts,
+                # Gap tracking and tolerance
+                "gap_tolerance": self.gap_tolerance,
+                "last_gap_type": self._stats.last_gap_type,
+                "last_gap_pu": self._stats.last_gap_pu,
+                "last_gap_expected": self._stats.last_gap_expected,
+                "pu_gap_count": self._stats.pu_gap_count,
+                "u_gap_count": self._stats.u_gap_count,
+                "max_sync_duration_s": round(self._stats.max_sync_duration_s, 3),
+                "diffs_in_current_sync": self._stats.diffs_in_current_sync,
             }
 
     def get_full_book(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
@@ -316,9 +339,11 @@ class OrderbookReconstructor:
             self._stats.diffs_discarded += discarded
             self._stats.diffs_applied += applied
 
-            # Mark as synced
+            # Mark as synced and reset sync tracking
             self._state = SyncState.SYNCED
             self._snapshot_fetch_in_progress = False
+            self._stats.last_synced_at = time.time()
+            self._stats.diffs_in_current_sync = applied  # Buffered diffs count towards current sync
 
             best_bid = max(self.bids.keys()) if self.bids else 0
             best_ask = min(self.asks.keys()) if self.asks else 0
@@ -338,20 +363,61 @@ class OrderbookReconstructor:
         # Check continuity using pu (previous update ID) for Futures
         # pu should equal our last_applied_u
         if pu > 0 and pu != self._last_applied_u:
-            # Gap detected
-            logger.warning(
-                f"[OB_RECON] Gap detected: pu={pu}, last_applied_u={self._last_applied_u}. "
-                "Triggering resync."
-            )
-            self._trigger_resync()
-            self._diff_buffer.append(data)
-            return False
+            gap_size = abs(pu - self._last_applied_u)
+            # Track gap for debugging
+            self._stats.last_gap_pu = pu
+            self._stats.last_gap_expected = self._last_applied_u
+            self._stats.last_gap_type = "pu_mismatch"
+            self._stats.pu_gap_count += 1
+
+            # If gap is within tolerance, log but continue (orderbook may be slightly off)
+            if self.gap_tolerance > 0 and gap_size <= self.gap_tolerance:
+                logger.info(
+                    f"[OB_RECON] Small gap tolerated: pu={pu}, expected={self._last_applied_u}, "
+                    f"gap={gap_size} <= tolerance={self.gap_tolerance}"
+                )
+                # Continue to apply the diff anyway
+            else:
+                # Track sync duration before resync
+                if self._stats.last_synced_at > 0:
+                    sync_duration = time.time() - self._stats.last_synced_at
+                    if sync_duration > self._stats.max_sync_duration_s:
+                        self._stats.max_sync_duration_s = sync_duration
+                logger.warning(
+                    f"[OB_RECON] Gap detected: pu={pu}, expected={self._last_applied_u}, "
+                    f"gap={gap_size}, diffs_in_sync={self._stats.diffs_in_current_sync}. "
+                    "Triggering resync."
+                )
+                self._trigger_resync()
+                self._diff_buffer.append(data)
+                return False
 
         # Also check U continuity as fallback
         if U > self._last_applied_u + 1:
-            logger.warning(
-                f"[OB_RECON] U gap detected: U={U}, last_applied_u={self._last_applied_u}. "
-                "Triggering resync."
+            gap_size = U - self._last_applied_u - 1
+            # Track gap for debugging
+            self._stats.last_gap_pu = U
+            self._stats.last_gap_expected = self._last_applied_u + 1
+            self._stats.last_gap_type = "u_gap"
+            self._stats.u_gap_count += 1
+
+            # If gap is within tolerance, log but continue
+            if self.gap_tolerance > 0 and gap_size <= self.gap_tolerance:
+                logger.info(
+                    f"[OB_RECON] Small U gap tolerated: U={U}, expected<={self._last_applied_u + 1}, "
+                    f"gap={gap_size} <= tolerance={self.gap_tolerance}"
+                )
+                # Continue to apply the diff anyway
+            else:
+                # Track sync duration before resync
+                if self._stats.last_synced_at > 0:
+                    sync_duration = time.time() - self._stats.last_synced_at
+                    if sync_duration > self._stats.max_sync_duration_s:
+                        self._stats.max_sync_duration_s = sync_duration
+                logger.warning(
+                    f"[OB_RECON] U gap detected: U={U}, expected<={self._last_applied_u + 1}, "
+                    f"gap={gap_size}, diffs_in_sync={self._stats.diffs_in_current_sync}. "
+                    "Triggering resync."
             )
             self._trigger_resync()
             self._diff_buffer.append(data)
@@ -361,6 +427,7 @@ class OrderbookReconstructor:
         self._apply_diff_internal(data)
         self._last_applied_u = u
         self._stats.diffs_applied += 1
+        self._stats.diffs_in_current_sync += 1
         self._stats.last_update_ts = time.time()
 
         # Invoke callback
