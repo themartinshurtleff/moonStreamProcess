@@ -219,3 +219,12 @@
 {"type": "forceOrder", "ts": 1769512302.5348306, "symbol": "BTC", "side": "long", "price": 87451.34, "qty": 0.004, "notional": 349.80536, "bucket": 87460.0, "entry_est": null}
 {"type": "forceOrder", "ts": 1769513057.2086706, "symbol": "BTC", "side": "short", "price": 88077.5, "qty": 0.002, "notional": 176.155, "bucket": 88080.0, "entry_est": null}
 {"type": "forceOrder", "ts": 1769513457.1517553, "symbol": "BTC", "side": "short", "price": 88199.5, "qty": 0.033, "notional": 2910.5835, "bucket": 88200.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769513640.382779, "symbol": "BTC", "side": "short", "price": 88289.9, "qty": 0.005, "notional": 441.4495, "bucket": 88280.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769513721.4562755, "symbol": "BTC", "side": "short", "price": 88320.8, "qty": 0.03, "notional": 2649.624, "bucket": 88320.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769513724.0724204, "symbol": "BTC", "side": "short", "price": 88327.6, "qty": 2.687, "notional": 237336.2612, "bucket": 88320.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769513726.5957873, "symbol": "BTC", "side": "short", "price": 88330.1, "qty": 0.004, "notional": 353.3204, "bucket": 88340.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769514132.7575479, "symbol": "BTC", "side": "short", "price": 88338.6, "qty": 0.002, "notional": 176.67720000000003, "bucket": 88340.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769514140.2814577, "symbol": "BTC", "side": "short", "price": 88346.3, "qty": 0.008, "notional": 706.7704, "bucket": 88340.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769514173.0947793, "symbol": "BTC", "side": "short", "price": 88354.8, "qty": 0.02, "notional": 1767.096, "bucket": 88360.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769514246.3446267, "symbol": "BTC", "side": "short", "price": 88371.7, "qty": 0.094, "notional": 8306.9398, "bucket": 88380.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1769514247.4426734, "symbol": "BTC", "side": "short", "price": 88372.8, "qty": 0.026, "notional": 2297.6928, "bucket": 88380.0, "entry_est": null}
