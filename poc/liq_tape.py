@@ -67,7 +67,8 @@ class LiquidationTape:
         steps: float = DEFAULT_STEPS,
         decay: float = DEFAULT_DECAY,
         retention_minutes: int = RETENTION_MINUTES,
-        log_file: str = None
+        log_file: str = None,
+        sweep_log_file: str = None
     ):
         self.symbol = symbol
         self.steps = steps
@@ -99,6 +100,15 @@ class LiquidationTape:
                 self._log_fh = open(log_file, 'a')
             except Exception as e:
                 logger.warning(f"Could not open tape log file: {e}")
+
+        # Sweep log file
+        self.sweep_log_file = sweep_log_file
+        self._sweep_log_fh = None
+        if sweep_log_file:
+            try:
+                self._sweep_log_fh = open(sweep_log_file, 'a')
+            except Exception as e:
+                logger.warning(f"Could not open sweep log file: {e}")
 
     def _bucket_price(self, price: float) -> float:
         """Round price to nearest bucket."""
@@ -238,7 +248,7 @@ class LiquidationTape:
         for price in to_remove:
             del buckets[price]
 
-    def sweep(self, high: float, low: float) -> Tuple[int, float]:
+    def sweep(self, high: float, low: float, minute_key: int = 0) -> Tuple[int, float]:
         """
         Remove liquidation buckets that price has crossed.
 
@@ -246,20 +256,57 @@ class LiquidationTape:
         """
         swept_count = 0
         swept_notional = 0.0
+        ts_now = time.time()
 
         # Short liqs above price get swept when high >= bucket
         to_remove = [p for p in self.short_liqs if high >= p]
         for price in to_remove:
-            swept_notional += self.short_liqs[price].notional
-            del self.short_liqs[price]
+            bucket = self.short_liqs[price]
+            swept_notional += bucket.notional
             swept_count += 1
+
+            # Log sweep event
+            if self._sweep_log_fh:
+                sweep_entry = {
+                    "type": "sweep",
+                    "ts": ts_now,
+                    "minute_key": minute_key,
+                    "side": "short",
+                    "bucket": price,
+                    "notional_usd": round(bucket.notional, 2),
+                    "layer": "tape",
+                    "reason": f"high>={price:.0f}",
+                    "trigger_high": high
+                }
+                self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
+                self._sweep_log_fh.flush()
+
+            del self.short_liqs[price]
 
         # Long liqs below price get swept when low <= bucket
         to_remove = [p for p in self.long_liqs if low <= p]
         for price in to_remove:
-            swept_notional += self.long_liqs[price].notional
-            del self.long_liqs[price]
+            bucket = self.long_liqs[price]
+            swept_notional += bucket.notional
             swept_count += 1
+
+            # Log sweep event
+            if self._sweep_log_fh:
+                sweep_entry = {
+                    "type": "sweep",
+                    "ts": ts_now,
+                    "minute_key": minute_key,
+                    "side": "long",
+                    "bucket": price,
+                    "notional_usd": round(bucket.notional, 2),
+                    "layer": "tape",
+                    "reason": f"low<={price:.0f}",
+                    "trigger_low": low
+                }
+                self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
+                self._sweep_log_fh.flush()
+
+            del self.long_liqs[price]
 
         return swept_count, swept_notional
 
@@ -322,7 +369,10 @@ class LiquidationTape:
         }
 
     def close(self):
-        """Close log file handle."""
+        """Close log file handles."""
         if self._log_fh:
             self._log_fh.close()
             self._log_fh = None
+        if self._sweep_log_fh:
+            self._sweep_log_fh.close()
+            self._sweep_log_fh = None

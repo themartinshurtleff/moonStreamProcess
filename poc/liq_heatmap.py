@@ -70,15 +70,18 @@ class LiquidationHeatmap:
     ):
         self.config = config or HeatmapConfig()
 
-        # Initialize sub-engines
+        # Initialize sub-engines with full logging
         tape_log = os.path.join(log_dir, "liq_tape.jsonl") if log_dir else None
         inference_log = os.path.join(log_dir, "liq_inference.jsonl") if log_dir else None
+        sweep_log = os.path.join(log_dir, "liq_sweeps.jsonl") if log_dir else None
+        debug_log = os.path.join(log_dir, "liq_debug.jsonl") if log_dir else None
 
         self.tape = LiquidationTape(
             symbol=self.config.symbol,
             steps=self.config.steps,
             decay=self.config.decay,
-            log_file=tape_log
+            log_file=tape_log,
+            sweep_log_file=sweep_log
         )
 
         self.inference = EntryInference(
@@ -86,7 +89,9 @@ class LiquidationHeatmap:
             steps=self.config.steps,
             buffer=self.config.buffer,
             decay=self.config.decay,
-            log_file=inference_log
+            log_file=inference_log,
+            debug_log_file=debug_log,
+            sweep_log_file=sweep_log
         )
 
         # State tracking
@@ -186,7 +191,7 @@ class LiquidationHeatmap:
 
         # Update tape (decay + sweep)
         self.tape.on_minute(minute_key)
-        self.tape.sweep(high, low)
+        self.tape.sweep(high, low, minute_key)
 
         # Update inference (generates projections)
         inferences = self.inference.on_minute(

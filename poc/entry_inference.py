@@ -23,7 +23,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +82,9 @@ class EntryInference:
     # Lowered to 0.00005 = $500K/min for BTC - more realistic
     MIN_OI_CHANGE_PCT = 0.00005  # 0.005% of OI
 
-    # Aggression imbalance threshold
-    AGGRESSION_THRESHOLD = 0.55  # 55% skew needed to classify direction
+    # Weight clamping for buy/sell distribution
+    MIN_WEIGHT = 0.10  # Never fully zero a side
+    MAX_WEIGHT = 0.90  # Never fully one side
 
     def __init__(
         self,
@@ -92,7 +93,9 @@ class EntryInference:
         buffer: float = DEFAULT_BUFFER,
         decay: float = DEFAULT_DECAY,
         leverage_weights: Dict[int, float] = None,
-        log_file: str = None
+        log_file: str = None,
+        debug_log_file: str = None,
+        sweep_log_file: str = None
     ):
         self.symbol = symbol
         self.steps = steps
@@ -127,6 +130,24 @@ class EntryInference:
             except Exception as e:
                 logger.warning(f"Could not open inference log file: {e}")
 
+        # Debug logging (per-minute detailed diagnostics)
+        self.debug_log_file = debug_log_file
+        self._debug_log_fh = None
+        if debug_log_file:
+            try:
+                self._debug_log_fh = open(debug_log_file, 'a')
+            except Exception as e:
+                logger.warning(f"Could not open debug log file: {e}")
+
+        # Sweep logging
+        self.sweep_log_file = sweep_log_file
+        self._sweep_log_fh = None
+        if sweep_log_file:
+            try:
+                self._sweep_log_fh = open(sweep_log_file, 'a')
+            except Exception as e:
+                logger.warning(f"Could not open sweep log file: {e}")
+
     def _bucket_price(self, price: float) -> float:
         """Round price to nearest bucket."""
         return round(price / self.steps) * self.steps
@@ -153,10 +174,15 @@ class EntryInference:
         taker_buy_notional_usd: float,
         taker_sell_notional_usd: float,
         high: float = None,
-        low: float = None
+        low: float = None,
+        oi_stale: bool = False,
+        fallback_aggression: bool = False
     ) -> List[InferredEntry]:
         """
         Process minute data to infer new position entries.
+
+        BOTH SIDES ARE ALWAYS PREDICTED based on weighted OI distribution.
+        Uses buy_weight = clamp(buy_pct, 0.10, 0.90) to distribute OI to both sides.
 
         Args:
             minute_key: Minute timestamp
@@ -166,6 +192,8 @@ class EntryInference:
             taker_sell_notional_usd: Taker sell volume in USD (from aggTrade)
             high: Minute high (for sweep detection)
             low: Minute low (for sweep detection)
+            oi_stale: Whether OI data is stale
+            fallback_aggression: Whether fallback aggression values were used
 
         Returns:
             List of inferred entries this minute
@@ -185,139 +213,115 @@ class EntryInference:
         self._apply_decay()
 
         # Sweep: remove projected zones that price crossed
+        swept_long = 0
+        swept_short = 0
+        swept_long_notional = 0.0
+        swept_short_notional = 0.0
         if high and low:
-            self._sweep(high, low)
+            swept_long, swept_short, swept_long_notional, swept_short_notional = self._sweep(high, low, minute_key)
 
         # Compute aggression from USD notional
         total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
 
-        # Debug: log OI delta and thresholds
-        oi_threshold = self.last_oi * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
-        logger.debug(
-            f"[{self.symbol}] OI check: oi={oi:,.0f} last_oi={self.last_oi:,.0f} "
-            f"delta={oi_delta:+,.0f} threshold={oi_threshold:,.0f} "
-            f"volume_usd={total_notional_usd:,.0f}"
-        )
-
-        # Skip inference if volume too small (< $1000 USD)
-        if total_notional_usd < 1000:
-            logger.debug(f"[{self.symbol}] Skip: volume too small ({total_notional_usd:.0f} < 1000)")
-            return inferences
-
-        if abs(oi_delta) < oi_threshold:
-            logger.debug(f"[{self.symbol}] Skip: OI delta too small ({abs(oi_delta):,.0f} < {oi_threshold:,.0f})")
-            return inferences
-
-        # Determine aggression direction from USD notional ratio
+        # Calculate buy_pct and weighted distribution
         buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
 
-        # Debug log: units verification
-        logger.debug(
-            f"[{self.symbol}] minute={minute_key} src={src_price:.2f} "
-            f"buy_usd={taker_buy_notional_usd:.0f} sell_usd={taker_sell_notional_usd:.0f} "
-            f"total_usd={total_notional_usd:.0f} buy_pct={buy_pct:.3f}"
-        )
+        # Clamp buy_weight to never fully zero a side
+        buy_weight = max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, buy_pct))
+        sell_weight = 1.0 - buy_weight
 
-        # Infer direction from OI change + aggression
-        # OI↑ + buy aggression → longs opening
-        # OI↑ + sell aggression → shorts opening
-        # OI↓ → positions closing (we reduce projections proportionally)
+        # Debug log for diagnostics
+        oi_threshold = self.last_oi * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
+
+        # Track projected additions for debug logging
+        projected_added_long_usd = 0.0
+        projected_added_short_usd = 0.0
 
         if oi_delta > 0:
-            # New positions opening
-            if buy_pct >= self.AGGRESSION_THRESHOLD:
-                # Longs opening
-                side = "long"
-                confidence = min(1.0, buy_pct / self.AGGRESSION_THRESHOLD)
-            elif buy_pct <= (1 - self.AGGRESSION_THRESHOLD):
-                # Shorts opening
-                side = "short"
-                confidence = min(1.0, (1 - buy_pct) / self.AGGRESSION_THRESHOLD)
+            # New positions opening - compute BOTH sides
+            # Assuming OI is in USD (Binance reports it that way for perpetuals)
+            oi_delta_usd = abs(oi_delta)
+
+            # Distribute OI to both sides based on aggression weight
+            long_open_usd = oi_delta_usd * buy_weight
+            short_open_usd = oi_delta_usd * sell_weight
+
+            # Skip if OI delta too small
+            if oi_delta_usd < oi_threshold:
+                long_open_usd = 0.0
+                short_open_usd = 0.0
             else:
-                # Mixed/unclear - split proportionally
-                # Don't infer when signal is ambiguous
-                logger.debug(
-                    f"[{self.symbol}] Skip: ambiguous aggression (buy_pct={buy_pct:.3f}, "
-                    f"need <{1-self.AGGRESSION_THRESHOLD:.2f} or >{self.AGGRESSION_THRESHOLD:.2f})"
-                )
-                return inferences
-
-            # Log successful inference trigger
-            logger.info(
-                f"[{self.symbol}] INFERENCE: side={side} oi_delta={oi_delta:+,.0f} "
-                f"buy_pct={buy_pct:.3f} confidence={confidence:.3f}"
-            )
-
-            # Estimate notional size from OI delta
-            # Assuming OI is in contracts and we need to convert
-            estimated_size_usd = abs(oi_delta) * src_price if oi_delta < 1000 else abs(oi_delta)
-
-            # Create projected liquidation zones for each leverage tier
-            for leverage, weight in self.leverage_weights.items():
-                if weight < 0.01:
-                    continue
-
-                liq_price = self._calculate_liq_price(src_price, leverage, side)
-                bucket = self._bucket_price(liq_price)
-                size_contribution = estimated_size_usd * weight * confidence
-
-                if size_contribution < 100:  # Less than $100 - skip
-                    continue
-
-                inference = InferredEntry(
-                    timestamp=time.time(),
+                # Create projected liquidation zones for LONG positions
+                inferences.extend(self._project_side(
                     minute_key=minute_key,
-                    price=src_price,
-                    side=side,
-                    size_usd=size_contribution,
-                    confidence=confidence,
-                    projected_liq=bucket
+                    src_price=src_price,
+                    side="long",
+                    size_usd=long_open_usd,
+                    confidence=buy_weight  # Use weight as confidence
+                ))
+                projected_added_long_usd = long_open_usd
+
+                # Create projected liquidation zones for SHORT positions
+                inferences.extend(self._project_side(
+                    minute_key=minute_key,
+                    src_price=src_price,
+                    side="short",
+                    size_usd=short_open_usd,
+                    confidence=sell_weight  # Use weight as confidence
+                ))
+                projected_added_short_usd = short_open_usd
+
+                logger.info(
+                    f"[{self.symbol}] INFERENCE: oi_delta={oi_delta:+,.0f} "
+                    f"buy_pct={buy_pct:.3f} buy_weight={buy_weight:.3f} "
+                    f"long_usd={long_open_usd:,.0f} short_usd={short_open_usd:,.0f}"
                 )
-                inferences.append(inference)
-                self.inferences.append(inference)
-
-                # Accumulate into projection buckets
-                buckets = self.projected_long_liqs if side == "long" else self.projected_short_liqs
-
-                if bucket not in buckets:
-                    buckets[bucket] = PositionBucket(
-                        price=bucket,
-                        size_usd=0.0,
-                        side=side,
-                        entry_price=src_price,
-                        last_ts=time.time(),
-                        leverage_est=leverage
-                    )
-
-                buckets[bucket].size_usd += size_contribution
-                buckets[bucket].last_ts = time.time()
-
-                # Track totals
-                if side == "long":
-                    self.total_inferred_long_usd += size_contribution
-                else:
-                    self.total_inferred_short_usd += size_contribution
 
         elif oi_delta < 0:
-            # Positions closing - reduce projections proportionally
-            close_pct = abs(oi_delta) / self.last_oi if self.last_oi > 0 else 0
-            close_pct = min(0.5, close_pct)  # Cap at 50% reduction per minute
+            # Positions closing - proportionally decay BOTH sides
+            # Calculate close factor relative to current projected total
+            total_projected = sum(b.size_usd for b in self.projected_long_liqs.values()) + \
+                              sum(b.size_usd for b in self.projected_short_liqs.values())
 
-            # Determine which side is closing based on aggression
-            # Sell aggression with OI↓ → longs closing
-            # Buy aggression with OI↓ → shorts closing
-            if buy_pct < (1 - self.AGGRESSION_THRESHOLD):
-                # Longs closing (selling to close)
-                self._reduce_projections(self.projected_long_liqs, close_pct)
-            elif buy_pct > self.AGGRESSION_THRESHOLD:
-                # Shorts closing (buying to close)
-                self._reduce_projections(self.projected_short_liqs, close_pct)
-            else:
-                # Mixed - reduce both sides slightly
-                self._reduce_projections(self.projected_long_liqs, close_pct * 0.5)
-                self._reduce_projections(self.projected_short_liqs, close_pct * 0.5)
+            if total_projected > 0:
+                close_factor = min(0.5, abs(oi_delta) / total_projected)  # Cap at 50% per minute
 
-        # Log inference summary
+                # Reduce both sides proportionally
+                self._reduce_projections(self.projected_long_liqs, close_factor)
+                self._reduce_projections(self.projected_short_liqs, close_factor)
+
+                logger.debug(
+                    f"[{self.symbol}] CLOSING: oi_delta={oi_delta:,.0f} "
+                    f"close_factor={close_factor:.3f} total_projected={total_projected:,.0f}"
+                )
+
+        # Write enhanced debug log
+        if self._debug_log_fh:
+            debug_entry = {
+                "type": "minute_inference",
+                "ts": time.time(),
+                "minute_key": minute_key,
+                "src_price": src_price,
+                "oi_delta_usd": oi_delta,
+                "buy_pct": round(buy_pct, 4),
+                "buy_weight": round(buy_weight, 4),
+                "long_open_usd": round(projected_added_long_usd, 2),
+                "short_open_usd": round(projected_added_short_usd, 2),
+                "projected_added_long_usd": round(projected_added_long_usd, 2),
+                "projected_added_short_usd": round(projected_added_short_usd, 2),
+                "oi_stale": oi_stale,
+                "fallback_aggression": fallback_aggression,
+                "swept_long": swept_long,
+                "swept_short": swept_short,
+                "swept_long_notional": round(swept_long_notional, 2),
+                "swept_short_notional": round(swept_short_notional, 2),
+                "total_long_buckets": len(self.projected_long_liqs),
+                "total_short_buckets": len(self.projected_short_liqs)
+            }
+            self._debug_log_fh.write(json.dumps(debug_entry) + '\n')
+            self._debug_log_fh.flush()
+
+        # Log inference summary (original format)
         if self._log_fh and inferences:
             log_entry = {
                 "type": "inference",
@@ -338,6 +342,79 @@ class EntryInference:
             }
             self._log_fh.write(json.dumps(log_entry) + '\n')
             self._log_fh.flush()
+
+        return inferences
+
+    def _project_side(
+        self,
+        minute_key: int,
+        src_price: float,
+        side: str,
+        size_usd: float,
+        confidence: float
+    ) -> List[InferredEntry]:
+        """
+        Project liquidation zones for a single side.
+
+        Args:
+            minute_key: Minute timestamp
+            src_price: Reference price
+            side: "long" or "short"
+            size_usd: Total USD to distribute across leverage tiers
+            confidence: Confidence weight (0-1)
+
+        Returns:
+            List of InferredEntry objects created
+        """
+        inferences = []
+
+        if size_usd < 100:  # Less than $100 total - skip
+            return inferences
+
+        for leverage, weight in self.leverage_weights.items():
+            if weight < 0.01:
+                continue
+
+            liq_price = self._calculate_liq_price(src_price, leverage, side)
+            bucket = self._bucket_price(liq_price)
+            size_contribution = size_usd * weight
+
+            if size_contribution < 100:  # Less than $100 - skip
+                continue
+
+            inference = InferredEntry(
+                timestamp=time.time(),
+                minute_key=minute_key,
+                price=src_price,
+                side=side,
+                size_usd=size_contribution,
+                confidence=confidence,
+                projected_liq=bucket
+            )
+            inferences.append(inference)
+            self.inferences.append(inference)
+
+            # Accumulate into projection buckets
+            buckets = self.projected_long_liqs if side == "long" else self.projected_short_liqs
+
+            if bucket not in buckets:
+                buckets[bucket] = PositionBucket(
+                    price=bucket,
+                    size_usd=0.0,
+                    side=side,
+                    entry_price=src_price,
+                    last_ts=time.time(),
+                    leverage_est=leverage
+                )
+
+            buckets[bucket].size_usd += size_contribution
+            buckets[bucket].last_ts = time.time()
+
+            # Track totals
+            if side == "long":
+                self.total_inferred_long_usd += size_contribution
+            else:
+                self.total_inferred_short_usd += size_contribution
 
         return inferences
 
@@ -364,27 +441,69 @@ class EntryInference:
         for price in to_remove:
             del buckets[price]
 
-    def _sweep(self, high: float, low: float) -> int:
+    def _sweep(self, high: float, low: float, minute_key: int = 0) -> Tuple[int, int, float, float]:
         """
         Remove projected zones that price has crossed.
 
-        Returns count of swept zones.
+        Returns (swept_long_count, swept_short_count, swept_long_notional, swept_short_notional).
         """
-        swept = 0
+        swept_long = 0
+        swept_short = 0
+        swept_long_notional = 0.0
+        swept_short_notional = 0.0
+        ts_now = time.time()
 
         # Short projections above price get swept when high >= bucket
         to_remove = [p for p in self.projected_short_liqs if high >= p]
         for price in to_remove:
+            bucket = self.projected_short_liqs[price]
+            swept_short_notional += bucket.size_usd
+            swept_short += 1
+
+            # Log sweep event
+            if self._sweep_log_fh:
+                sweep_entry = {
+                    "type": "sweep",
+                    "ts": ts_now,
+                    "minute_key": minute_key,
+                    "side": "short",
+                    "bucket": price,
+                    "notional_usd": round(bucket.size_usd, 2),
+                    "layer": "projection",
+                    "reason": f"high>={price:.0f}",
+                    "trigger_high": high
+                }
+                self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
+                self._sweep_log_fh.flush()
+
             del self.projected_short_liqs[price]
-            swept += 1
 
         # Long projections below price get swept when low <= bucket
         to_remove = [p for p in self.projected_long_liqs if low <= p]
         for price in to_remove:
-            del self.projected_long_liqs[price]
-            swept += 1
+            bucket = self.projected_long_liqs[price]
+            swept_long_notional += bucket.size_usd
+            swept_long += 1
 
-        return swept
+            # Log sweep event
+            if self._sweep_log_fh:
+                sweep_entry = {
+                    "type": "sweep",
+                    "ts": ts_now,
+                    "minute_key": minute_key,
+                    "side": "long",
+                    "bucket": price,
+                    "notional_usd": round(bucket.size_usd, 2),
+                    "layer": "projection",
+                    "reason": f"low<={price:.0f}",
+                    "trigger_low": low
+                }
+                self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
+                self._sweep_log_fh.flush()
+
+            del self.projected_long_liqs[price]
+
+        return swept_long, swept_short, swept_long_notional, swept_short_notional
 
     def update_leverage_weights(self, new_weights: Dict[int, float]) -> None:
         """
@@ -469,7 +588,13 @@ class EntryInference:
         }
 
     def close(self):
-        """Close log file handle."""
+        """Close all log file handles."""
         if self._log_fh:
             self._log_fh.close()
             self._log_fh = None
+        if self._debug_log_fh:
+            self._debug_log_fh.close()
+            self._debug_log_fh = None
+        if self._sweep_log_fh:
+            self._sweep_log_fh.close()
+            self._sweep_log_fh = None
