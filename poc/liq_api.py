@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # Add poc/ for o
 
 try:
     from fastapi import FastAPI, Query, HTTPException
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     import uvicorn
     HAS_FASTAPI = True
 except ImportError:
@@ -67,7 +67,9 @@ try:
         OrderbookHeatmapBuffer, OrderbookFrame,
         build_unified_grid as ob_build_unified_grid,
         resample_frame_to_grid,
-        DEFAULT_STEP, DEFAULT_RANGE_PCT
+        frame_to_binary, frames_to_binary,
+        DEFAULT_STEP, DEFAULT_RANGE_PCT,
+        FRAME_INTERVAL_MS, FRAME_INTERVAL_SEC
     )
     HAS_OB_HEATMAP = True
 except ImportError as e:
@@ -1139,13 +1141,24 @@ def create_app() -> FastAPI:
         range_pct: float = Query(default=0.10, description="Price range as decimal (0.10 = ±10%)"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),
-        price_max: float = Query(default=None, description="Override maximum price")
+        price_max: float = Query(default=None, description="Override maximum price"),
+        format: str = Query(default="json", description="Response format: json or bin")
     ):
         """
         Get latest 30-second orderbook heatmap frame.
 
-        Returns bid/ask intensity arrays for orderbook depth visualization.
+        Time metadata fields:
+        - frame_ts_ms: Start of 30s window (milliseconds)
+        - frame_interval_ms: 30000 (fixed 30s interval)
+        - valid_from_ts_ms: Same as frame_ts_ms
+        - valid_to_ts_ms: frame_ts_ms + 30000
+        - server_send_ts_ms: Server timestamp when response was sent
+        - data_is_stale: True if frame is older than 2x interval (60s)
+
+        Returns the most recently WRITTEN frame (never synthesized/rewritten).
         """
+        server_recv_ts_ms = int(time.time() * 1000)
+
         if not HAS_OB_HEATMAP or not _ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -1159,15 +1172,32 @@ def create_app() -> FastAPI:
                 detail="No orderbook frames available yet"
             )
 
-        # Check staleness (warn if > 60s old)
-        age = time.time() - frame.ts
-        warning = None
-        if age > 60:
-            warning = f"Data is {age:.0f}s old, viewer may be stopped"
+        # Compute time metadata
+        frame_ts_ms = int(frame.ts * 1000)
+        frame_interval_ms = FRAME_INTERVAL_MS  # 30000
+        valid_from_ts_ms = frame_ts_ms
+        valid_to_ts_ms = frame_ts_ms + frame_interval_ms
 
-        # Use frame's grid or resample if overrides provided
+        # Data is stale if frame is older than 2x interval (60s)
+        now_ms = int(time.time() * 1000)
+        data_is_stale = (now_ms - frame_ts_ms) > (2 * frame_interval_ms)
+
+        # Binary format response
+        if format == "bin":
+            binary_data = frame_to_binary(frame, frame_ts_ms)
+            return Response(
+                content=binary_data,
+                media_type="application/octet-stream",
+                headers={
+                    "X-Frame-Ts-Ms": str(frame_ts_ms),
+                    "X-Frame-Interval-Ms": str(frame_interval_ms),
+                    "X-Data-Is-Stale": "true" if data_is_stale else "false",
+                    "X-Server-Send-Ts-Ms": str(int(time.time() * 1000))
+                }
+            )
+
+        # JSON format response
         if price_min is not None or price_max is not None:
-            # Build custom grid (using ob_heatmap version for OrderbookFrame)
             p_min = price_min if price_min is not None else frame.price_min
             p_max = price_max if price_max is not None else frame.price_max
             prices, p_min, p_max = ob_build_unified_grid([frame], p_min, p_max, step)
@@ -1196,8 +1226,19 @@ def create_app() -> FastAPI:
             bid_size_btc.append(round(bid_btc, 6))
             ask_size_btc.append(round(ask_btc, 6))
 
+        server_send_ts_ms = int(time.time() * 1000)
+
         response = {
             "symbol": symbol,
+            # Time metadata for client synchronization
+            "frame_ts_ms": frame_ts_ms,
+            "frame_interval_ms": frame_interval_ms,
+            "valid_from_ts_ms": valid_from_ts_ms,
+            "valid_to_ts_ms": valid_to_ts_ms,
+            "server_recv_ts_ms": server_recv_ts_ms,
+            "server_send_ts_ms": server_send_ts_ms,
+            "data_is_stale": data_is_stale,
+            # Legacy ts field (epoch seconds) for backward compatibility
             "ts": frame.ts,
             "src": frame.src,
             "step": frame.step,
@@ -1210,17 +1251,26 @@ def create_app() -> FastAPI:
             "ask_notional_usd": [round(v, 2) for v in ask_notional_usd],
             "bid_size_btc": bid_size_btc,
             "ask_size_btc": ask_size_btc,
+            # Combined scaling stats
             "norm_p50": frame.norm_p50,
+            "norm_p90": frame.norm_p90,
             "norm_p95": frame.norm_p95,
+            "norm_p99": frame.norm_p99,
+            "norm_max": frame.norm_max,
+            # Per-side scaling stats for asymmetric colormaps
+            "bid_p50": frame.bid_p50,
+            "bid_p95": frame.bid_p95,
+            "bid_max": frame.bid_max,
+            "ask_p50": frame.ask_p50,
+            "ask_p95": frame.ask_p95,
+            "ask_max": frame.ask_max,
+            # Totals
             "total_bid_notional": frame.total_bid_notional,
             "total_ask_notional": frame.total_ask_notional,
             "total_bid_btc": round(frame.total_bid_notional / frame.src, 6) if frame.src > 0 else 0.0,
             "total_ask_btc": round(frame.total_ask_notional / frame.src, 6) if frame.src > 0 else 0.0,
             "scale": 255
         }
-
-        if warning:
-            response["_warning"] = warning
 
         return JSONResponse(content=response)
 
@@ -1232,22 +1282,23 @@ def create_app() -> FastAPI:
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),
-        price_max: float = Query(default=None, description="Override maximum price")
+        price_max: float = Query(default=None, description="Override maximum price"),
+        format: str = Query(default="json", description="Response format: json or bin")
     ):
         """
         Get historical 30-second orderbook heatmap frames.
 
-        Returns time-series of bid/ask intensity arrays for heatmap backfill.
-        Intensities are u8 encoded (0-255) in flat row-major arrays.
+        Time metadata fields:
+        - frame_interval_ms: 30000 (fixed 30s interval)
+        - first_frame_ts_ms: Timestamp of oldest frame in response
+        - last_frame_ts_ms: Timestamp of newest frame in response
+        - server_send_ts_ms: Server timestamp when response was sent
+        - data_is_stale: True if last frame is older than 2x interval
 
-        Response format:
-        - t: array of timestamps (int milliseconds)
-        - prices: unified price grid
-        - bid_u8: flat row-major array [frames * prices] of u8 intensities
-        - ask_u8: flat row-major array [frames * prices] of u8 intensities
-        - step: price bucket size
-        - scale: 255 (max intensity value)
+        Binary format (format=bin) returns compact blob for low-latency backfill.
         """
+        server_recv_ts_ms = int(time.time() * 1000)
+
         if not HAS_OB_HEATMAP or not _ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -1272,6 +1323,7 @@ def create_app() -> FastAPI:
                 "ask_notional_usd": [],
                 "bid_size_btc": [],
                 "ask_size_btc": [],
+                "frame_interval_ms": FRAME_INTERVAL_MS,
                 "step": step,
                 "scale": 255,
                 "norm_method": "p50_p95"
@@ -1287,7 +1339,30 @@ def create_app() -> FastAPI:
 
         n_prices = len(prices)
 
-        # Build flat row-major arrays
+        # Time metadata
+        first_frame_ts_ms = int(frames[0].ts * 1000)
+        last_frame_ts_ms = int(frames[-1].ts * 1000)
+        now_ms = int(time.time() * 1000)
+        data_is_stale = (now_ms - last_frame_ts_ms) > (2 * FRAME_INTERVAL_MS)
+
+        # Binary format response
+        if format == "bin":
+            binary_data = frames_to_binary(frames, prices, step)
+            return Response(
+                content=binary_data,
+                media_type="application/octet-stream",
+                headers={
+                    "X-First-Frame-Ts-Ms": str(first_frame_ts_ms),
+                    "X-Last-Frame-Ts-Ms": str(last_frame_ts_ms),
+                    "X-Frame-Count": str(len(frames)),
+                    "X-Price-Count": str(n_prices),
+                    "X-Frame-Interval-Ms": str(FRAME_INTERVAL_MS),
+                    "X-Data-Is-Stale": "true" if data_is_stale else "false",
+                    "X-Server-Send-Ts-Ms": str(int(time.time() * 1000))
+                }
+            )
+
+        # Build flat row-major arrays (JSON format)
         t_arr = []
         bid_flat = []
         ask_flat = []
@@ -1324,12 +1399,22 @@ def create_app() -> FastAPI:
                 bid_btc_flat.append(round(bid_usd / price, 6) if price > 0 else 0.0)
                 ask_btc_flat.append(round(ask_usd / price, 6) if price > 0 else 0.0)
 
+        server_send_ts_ms = int(time.time() * 1000)
+
         # Debug logging
         num_frames = len(t_arr)
         print(f"[ob_heatmap_30s_history] frames={num_frames} prices={n_prices} "
               f"bid_len={len(bid_flat)} ask_len={len(ask_flat)}")
 
         return JSONResponse(content={
+            # Time metadata
+            "frame_interval_ms": FRAME_INTERVAL_MS,
+            "first_frame_ts_ms": first_frame_ts_ms,
+            "last_frame_ts_ms": last_frame_ts_ms,
+            "server_recv_ts_ms": server_recv_ts_ms,
+            "server_send_ts_ms": server_send_ts_ms,
+            "data_is_stale": data_is_stale,
+            # Frame data
             "t": t_arr,
             "prices": prices,
             "bid_u8": bid_flat,
@@ -1348,9 +1433,12 @@ def create_app() -> FastAPI:
     @app.get("/v2/orderbook_heatmap_30s_stats")
     async def orderbook_heatmap_30s_stats():
         """
-        Get orderbook heatmap buffer statistics.
+        Get orderbook heatmap buffer and reconstructor statistics.
 
-        Useful for debugging and monitoring.
+        Includes:
+        - Buffer stats: frames in memory/disk, write timing
+        - Reconstructor stats: state, resyncs, gaps, update IDs
+        - Timing: last frame age, staleness indicator
         """
         if not HAS_OB_HEATMAP or not _ob_buffer:
             raise HTTPException(
@@ -1359,11 +1447,25 @@ def create_app() -> FastAPI:
             )
 
         stats = _ob_buffer.get_stats()
-        stats["current_time"] = time.time()
+        now = time.time()
+        now_ms = int(now * 1000)
+
+        # Time metadata
+        stats["current_time"] = now
+        stats["current_time_ms"] = now_ms
+        stats["frame_interval_ms"] = FRAME_INTERVAL_MS
+        stats["mode"] = "standalone"
+
         if stats["last_ts"] > 0:
-            stats["last_frame_age_s"] = round(time.time() - stats["last_ts"], 1)
+            last_frame_age_s = now - stats["last_ts"]
+            stats["last_frame_age_s"] = round(last_frame_age_s, 1)
+            stats["last_frame_ts_ms"] = int(stats["last_ts"] * 1000)
+            # Stale if > 2x frame interval
+            stats["data_is_stale"] = last_frame_age_s > (2 * FRAME_INTERVAL_SEC)
         else:
             stats["last_frame_age_s"] = None
+            stats["last_frame_ts_ms"] = 0
+            stats["data_is_stale"] = True
 
         # Include reconstructor stats if available
         if os.path.exists(OB_RECON_STATS_FILE):
@@ -1374,10 +1476,10 @@ def create_app() -> FastAPI:
                 # Calculate age of reconstructor stats
                 if "written_at" in recon_stats:
                     stats["reconstructor"]["stats_age_s"] = round(
-                        time.time() - recon_stats["written_at"], 1
+                        now - recon_stats["written_at"], 1
                     )
-            except Exception:
-                stats["reconstructor"] = {"error": "failed to read stats"}
+            except Exception as e:
+                stats["reconstructor"] = {"error": f"failed to read: {e}"}
         else:
             stats["reconstructor"] = {"error": "stats file not found"}
 

@@ -513,6 +513,17 @@ class OrderbookFrame:
     # Raw notional arrays (USD per bucket) - not persisted to disk, computed on load
     bid_notional: List[float] = field(default_factory=list)
     ask_notional: List[float] = field(default_factory=list)
+    # Extended scaling stats for colormap (Bookmap-style palette mapping)
+    norm_p90: float = 0.0  # 90th percentile
+    norm_p99: float = 0.0  # 99th percentile
+    norm_max: float = 0.0  # Maximum value
+    # Separate bid/ask stats for asymmetric scaling
+    bid_p50: float = 0.0
+    bid_p95: float = 0.0
+    bid_max: float = 0.0
+    ask_p50: float = 0.0
+    ask_p95: float = 0.0
+    ask_max: float = 0.0
 
     @property
     def n_prices(self) -> int:
@@ -712,10 +723,37 @@ class OrderbookAccumulator:
         all_nonzero = np.concatenate([bid_raw[bid_raw > 0], ask_raw[ask_raw > 0]])
         if len(all_nonzero) > 0:
             p50 = float(np.percentile(all_nonzero, 50))
+            p90 = float(np.percentile(all_nonzero, 90))
             p95 = float(np.percentile(all_nonzero, 95))
+            p99 = float(np.percentile(all_nonzero, 99))
+            pmax = float(np.max(all_nonzero))
         else:
             p50 = 0.0
+            p90 = 0.0
             p95 = 1.0  # Avoid division by zero
+            p99 = 1.0
+            pmax = 1.0
+
+        # Compute per-side stats for asymmetric scaling
+        bid_nonzero_arr = bid_raw[bid_raw > 0]
+        if len(bid_nonzero_arr) > 0:
+            bid_p50 = float(np.percentile(bid_nonzero_arr, 50))
+            bid_p95 = float(np.percentile(bid_nonzero_arr, 95))
+            bid_max = float(np.max(bid_nonzero_arr))
+        else:
+            bid_p50 = 0.0
+            bid_p95 = 1.0
+            bid_max = 1.0
+
+        ask_nonzero_arr = ask_raw[ask_raw > 0]
+        if len(ask_nonzero_arr) > 0:
+            ask_p50 = float(np.percentile(ask_nonzero_arr, 50))
+            ask_p95 = float(np.percentile(ask_nonzero_arr, 95))
+            ask_max = float(np.max(ask_nonzero_arr))
+        else:
+            ask_p50 = 0.0
+            ask_p95 = 1.0
+            ask_max = 1.0
 
         # Normalize to u8
         def normalize_to_u8(arr: np.ndarray, p50: float, p95: float) -> bytes:
@@ -741,7 +779,17 @@ class OrderbookAccumulator:
             total_bid_notional=total_bid,
             total_ask_notional=total_ask,
             bid_notional=bid_raw.tolist(),
-            ask_notional=ask_raw.tolist()
+            ask_notional=ask_raw.tolist(),
+            # Extended scaling stats
+            norm_p90=p90,
+            norm_p99=p99,
+            norm_max=pmax,
+            bid_p50=bid_p50,
+            bid_p95=bid_p95,
+            bid_max=bid_max,
+            ask_p50=ask_p50,
+            ask_p95=ask_p95,
+            ask_max=ask_max
         )
 
         # Log diagnostics
@@ -777,6 +825,12 @@ class OrderbookHeatmapBuffer:
         self._frames: deque = deque(maxlen=HISTORY_FRAMES)
         self._frames_written_since_compact = 0
         self._compact_threshold = 100  # Compact every 100 frames (~50 min)
+
+        # Frame write tracking for instrumentation
+        self._frames_written_total = 0  # Total frames written since startup
+        self._last_frame_write_ts = 0.0  # Wall clock time of last frame write
+        self._last_frame_write_duration_ms = 0.0  # Time to write last frame
+        self._avg_frame_write_duration_ms = 0.0  # Rolling average write time
 
         # Load existing frames on init
         self._load_from_disk()
@@ -829,16 +883,35 @@ class OrderbookHeatmapBuffer:
 
     def add_frame(self, frame: OrderbookFrame):
         """Add a new frame to buffer and persist."""
+        write_start = time.time()
         print(f"[OB_BUFFER_DEBUG] add_frame called: ts={frame.ts} src={frame.src:.2f}")
         with self._lock:
             self._frames.append(frame)
             print(f"[OB_BUFFER_DEBUG] Frame appended to memory, now {len(self._frames)} frames")
             self._persist_frame(frame)
 
+            # Update frame write tracking
+            write_duration_ms = (time.time() - write_start) * 1000
+            self._frames_written_total += 1
+            self._last_frame_write_ts = time.time()
+            self._last_frame_write_duration_ms = write_duration_ms
+            # Rolling average (exponential moving average with alpha=0.1)
+            if self._avg_frame_write_duration_ms == 0:
+                self._avg_frame_write_duration_ms = write_duration_ms
+            else:
+                self._avg_frame_write_duration_ms = 0.9 * self._avg_frame_write_duration_ms + 0.1 * write_duration_ms
+
             self._frames_written_since_compact += 1
             if self._frames_written_since_compact >= self._compact_threshold:
                 self._maybe_compact()
                 self._frames_written_since_compact = 0
+
+            # Log frame write for instrumentation
+            logger.info(
+                f"[OB_FRAME_WRITE] ts={frame.ts:.0f} src={frame.src:.2f} "
+                f"write_ms={write_duration_ms:.2f} avg_ms={self._avg_frame_write_duration_ms:.2f} "
+                f"total_frames={self._frames_written_total}"
+            )
 
     def _persist_frame(self, frame: OrderbookFrame):
         """Append frame to persistence file."""
@@ -927,6 +1000,10 @@ class OrderbookHeatmapBuffer:
             frames_in_memory = len(self._frames)
             last_ts = self._frames[-1].ts if self._frames else 0
             oldest_ts = self._frames[0].ts if self._frames else 0
+            frames_written_total = self._frames_written_total
+            last_frame_write_ts = self._last_frame_write_ts
+            last_frame_write_duration_ms = self._last_frame_write_duration_ms
+            avg_frame_write_duration_ms = self._avg_frame_write_duration_ms
 
         file_size = 0
         frames_on_disk = 0
@@ -939,7 +1016,12 @@ class OrderbookHeatmapBuffer:
             "frames_on_disk": frames_on_disk,
             "last_ts": last_ts,
             "oldest_ts": oldest_ts,
-            "file_size_bytes": file_size
+            "file_size_bytes": file_size,
+            # Frame write instrumentation
+            "frames_written_total": frames_written_total,
+            "last_frame_write_ts_ms": int(last_frame_write_ts * 1000) if last_frame_write_ts > 0 else 0,
+            "last_frame_write_duration_ms": round(last_frame_write_duration_ms, 2),
+            "avg_frame_write_duration_ms": round(avg_frame_write_duration_ms, 2),
         }
 
 
@@ -1018,3 +1100,178 @@ def resample_frame_to_grid(
             ask_resampled.append(0)
 
     return bid_resampled, ask_resampled
+
+
+# =============================================================================
+# Binary Response Format for Low-Latency OB Heatmap Delivery
+# =============================================================================
+
+# Binary header format (fixed 64 bytes):
+# version(u8) + encoding(u8) + reserved(u16) +
+# frame_ts_ms(u64) + interval_ms(u32) + rows(u16) + cols(u16) +
+# price_min(f64) + price_max(f64) + step(f64) + src(f64) +
+# p50(u16) + p90(u16) + p95(u16) + p99(u16) + max(u16) + reserved(u16)
+# Total: 1 + 1 + 2 + 8 + 4 + 2 + 2 + 8 + 8 + 8 + 8 + 2*6 = 64 bytes
+
+BINARY_HEADER_FORMAT = '<BBHQIHHddddHHHHHH'
+BINARY_HEADER_SIZE = struct.calcsize(BINARY_HEADER_FORMAT)  # 64 bytes
+BINARY_VERSION = 1
+BINARY_ENCODING_RAW = 0  # Raw u8 intensities
+BINARY_ENCODING_RLE = 1  # Run-length encoded (future)
+
+
+def frame_to_binary(
+    frame: OrderbookFrame,
+    frame_ts_ms: int = None
+) -> bytes:
+    """
+    Serialize a single frame to compact binary format.
+
+    Format:
+        Header (64 bytes): metadata
+        Bid intensities (n_prices bytes): u8 array row-major
+        Ask intensities (n_prices bytes): u8 array row-major
+
+    Args:
+        frame: OrderbookFrame to serialize
+        frame_ts_ms: Override frame timestamp (defaults to frame.ts * 1000)
+
+    Returns:
+        Binary blob
+    """
+    if frame_ts_ms is None:
+        frame_ts_ms = int(frame.ts * 1000)
+
+    n_prices = frame.n_prices
+
+    # Scale percentiles to u16 (divide by 1000 to fit in u16 range)
+    # Client should multiply by 1000 to get actual USD values
+    scale_factor = 1000.0
+    p50_scaled = min(65535, int(frame.norm_p50 / scale_factor))
+    p90_scaled = min(65535, int(frame.norm_p90 / scale_factor))
+    p95_scaled = min(65535, int(frame.norm_p95 / scale_factor))
+    p99_scaled = min(65535, int(frame.norm_p99 / scale_factor))
+    max_scaled = min(65535, int(frame.norm_max / scale_factor))
+
+    header = struct.pack(
+        BINARY_HEADER_FORMAT,
+        BINARY_VERSION,       # version u8
+        BINARY_ENCODING_RAW,  # encoding u8
+        0,                    # reserved u16
+        frame_ts_ms,          # frame_ts_ms u64
+        FRAME_INTERVAL_SEC * 1000,  # interval_ms u32
+        1,                    # rows u16 (single frame)
+        n_prices,             # cols u16
+        frame.price_min,      # price_min f64
+        frame.price_max,      # price_max f64
+        frame.step,           # step f64
+        frame.src,            # src f64
+        p50_scaled,           # p50 u16 (scaled)
+        p90_scaled,           # p90 u16
+        p95_scaled,           # p95 u16
+        p99_scaled,           # p99 u16
+        max_scaled,           # max u16
+        0                     # reserved u16
+    )
+
+    # Append bid and ask intensities
+    return header + bytes(frame.bid_u8) + bytes(frame.ask_u8)
+
+
+def frames_to_binary(
+    frames: List[OrderbookFrame],
+    prices: List[float],
+    step: float
+) -> bytes:
+    """
+    Serialize multiple frames to compact binary format for history endpoint.
+
+    Format:
+        Header (64 bytes): metadata (rows = number of frames)
+        Bid intensities (rows * cols bytes): u8 array row-major
+        Ask intensities (rows * cols bytes): u8 array row-major
+        Timestamps (rows * 8 bytes): u64 array of frame_ts_ms values
+
+    Args:
+        frames: List of OrderbookFrame to serialize
+        prices: Unified price grid
+        step: Price bucket size
+
+    Returns:
+        Binary blob
+    """
+    if not frames:
+        return b''
+
+    n_frames = len(frames)
+    n_prices = len(prices)
+
+    # Use first frame for price bounds
+    price_min = prices[0] if prices else 0.0
+    price_max = prices[-1] if prices else 0.0
+    src = frames[-1].src if frames else 0.0
+
+    # Aggregate stats from all frames
+    all_p50 = [f.norm_p50 for f in frames]
+    all_p90 = [f.norm_p90 for f in frames]
+    all_p95 = [f.norm_p95 for f in frames]
+    all_p99 = [f.norm_p99 for f in frames]
+    all_max = [f.norm_max for f in frames]
+
+    # Use median of each percentile for stable scaling
+    p50 = float(np.median(all_p50)) if all_p50 else 0.0
+    p90 = float(np.median(all_p90)) if all_p90 else 0.0
+    p95 = float(np.median(all_p95)) if all_p95 else 0.0
+    p99 = float(np.median(all_p99)) if all_p99 else 0.0
+    pmax = float(np.max(all_max)) if all_max else 0.0
+
+    scale_factor = 1000.0
+    p50_scaled = min(65535, int(p50 / scale_factor))
+    p90_scaled = min(65535, int(p90 / scale_factor))
+    p95_scaled = min(65535, int(p95 / scale_factor))
+    p99_scaled = min(65535, int(p99 / scale_factor))
+    max_scaled = min(65535, int(pmax / scale_factor))
+
+    # First frame timestamp
+    first_ts_ms = int(frames[0].ts * 1000) if frames else 0
+
+    header = struct.pack(
+        BINARY_HEADER_FORMAT,
+        BINARY_VERSION,
+        BINARY_ENCODING_RAW,
+        0,
+        first_ts_ms,
+        FRAME_INTERVAL_SEC * 1000,
+        n_frames,
+        n_prices,
+        price_min,
+        price_max,
+        step,
+        src,
+        p50_scaled,
+        p90_scaled,
+        p95_scaled,
+        p99_scaled,
+        max_scaled,
+        0
+    )
+
+    # Build flat intensity arrays
+    bid_flat = bytearray()
+    ask_flat = bytearray()
+    timestamps = []
+
+    for frame in frames:
+        bid_row, ask_row = resample_frame_to_grid(frame, prices, step)
+        bid_flat.extend(bid_row)
+        ask_flat.extend(ask_row)
+        timestamps.append(int(frame.ts * 1000))
+
+    # Pack timestamps as u64 array
+    ts_bytes = struct.pack(f'<{n_frames}Q', *timestamps)
+
+    return header + bytes(bid_flat) + bytes(ask_flat) + ts_bytes
+
+
+# Frame interval constant for API responses
+FRAME_INTERVAL_MS = FRAME_INTERVAL_SEC * 1000  # 30000ms

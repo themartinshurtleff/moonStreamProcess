@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 HAS_FASTAPI = False
 try:
     from fastapi import FastAPI, Query, HTTPException
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     import uvicorn
     HAS_FASTAPI = True
 except ImportError:
@@ -47,7 +47,9 @@ try:
         OrderbookHeatmapBuffer, OrderbookFrame,
         build_unified_grid as ob_build_unified_grid,
         resample_frame_to_grid,
-        DEFAULT_STEP, DEFAULT_RANGE_PCT
+        frame_to_binary, frames_to_binary,
+        DEFAULT_STEP, DEFAULT_RANGE_PCT,
+        FRAME_INTERVAL_MS, FRAME_INTERVAL_SEC
     )
     HAS_OB_HEATMAP = True
 except ImportError:
@@ -680,9 +682,24 @@ def create_embedded_app(
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),
-        price_max: float = Query(default=None, description="Override maximum price")
+        price_max: float = Query(default=None, description="Override maximum price"),
+        format: str = Query(default="json", description="Response format: json or bin")
     ):
-        """Get latest 30-second orderbook heatmap frame."""
+        """
+        Get latest 30-second orderbook heatmap frame.
+
+        Time metadata fields:
+        - frame_ts_ms: Start of 30s window (milliseconds)
+        - frame_interval_ms: 30000 (fixed 30s interval)
+        - valid_from_ts_ms: Same as frame_ts_ms
+        - valid_to_ts_ms: frame_ts_ms + 30000
+        - server_send_ts_ms: Server timestamp when response was sent
+        - data_is_stale: True if frame is older than 2x interval (60s)
+
+        Returns the most recently WRITTEN frame (never synthesized/rewritten).
+        """
+        server_recv_ts_ms = int(time.time() * 1000)
+
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -696,11 +713,31 @@ def create_embedded_app(
                 detail="No orderbook frames available yet"
             )
 
-        age = time.time() - frame.ts
-        warning = None
-        if age > 60:
-            warning = f"Data is {age:.0f}s old"
+        # Compute time metadata
+        frame_ts_ms = int(frame.ts * 1000)
+        frame_interval_ms = FRAME_INTERVAL_MS  # 30000
+        valid_from_ts_ms = frame_ts_ms
+        valid_to_ts_ms = frame_ts_ms + frame_interval_ms
 
+        # Data is stale if frame is older than 2x interval (60s)
+        now_ms = int(time.time() * 1000)
+        data_is_stale = (now_ms - frame_ts_ms) > (2 * frame_interval_ms)
+
+        # Binary format response
+        if format == "bin":
+            binary_data = frame_to_binary(frame, frame_ts_ms)
+            return Response(
+                content=binary_data,
+                media_type="application/octet-stream",
+                headers={
+                    "X-Frame-Ts-Ms": str(frame_ts_ms),
+                    "X-Frame-Interval-Ms": str(frame_interval_ms),
+                    "X-Data-Is-Stale": "true" if data_is_stale else "false",
+                    "X-Server-Send-Ts-Ms": str(int(time.time() * 1000))
+                }
+            )
+
+        # JSON format response
         if price_min is not None or price_max is not None:
             p_min = price_min if price_min is not None else frame.price_min
             p_max = price_max if price_max is not None else frame.price_max
@@ -713,8 +750,19 @@ def create_embedded_app(
             p_min = frame.price_min
             p_max = frame.price_max
 
+        server_send_ts_ms = int(time.time() * 1000)
+
         response = {
             "symbol": symbol,
+            # Time metadata for client synchronization
+            "frame_ts_ms": frame_ts_ms,
+            "frame_interval_ms": frame_interval_ms,
+            "valid_from_ts_ms": valid_from_ts_ms,
+            "valid_to_ts_ms": valid_to_ts_ms,
+            "server_recv_ts_ms": server_recv_ts_ms,
+            "server_send_ts_ms": server_send_ts_ms,
+            "data_is_stale": data_is_stale,
+            # Legacy ts field (epoch seconds) for backward compatibility
             "ts": frame.ts,
             "src": frame.src,
             "step": frame.step,
@@ -723,16 +771,25 @@ def create_embedded_app(
             "prices": prices,
             "bid_u8": bid_u8,
             "ask_u8": ask_u8,
+            # Combined scaling stats
             "norm_p50": frame.norm_p50,
+            "norm_p90": frame.norm_p90,
             "norm_p95": frame.norm_p95,
+            "norm_p99": frame.norm_p99,
+            "norm_max": frame.norm_max,
+            # Per-side scaling stats for asymmetric colormaps
+            "bid_p50": frame.bid_p50,
+            "bid_p95": frame.bid_p95,
+            "bid_max": frame.bid_max,
+            "ask_p50": frame.ask_p50,
+            "ask_p95": frame.ask_p95,
+            "ask_max": frame.ask_max,
+            # Totals
             "total_bid_notional": frame.total_bid_notional,
             "total_ask_notional": frame.total_ask_notional,
             "scale": 255,
             "_mode": "shared_buffer"
         }
-
-        if warning:
-            response["_warning"] = warning
 
         return JSONResponse(content=response)
 
@@ -743,9 +800,23 @@ def create_embedded_app(
         stride: int = Query(default=1, description="Downsample stride (clamped 1..60)"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),
-        price_max: float = Query(default=None, description="Override maximum price")
+        price_max: float = Query(default=None, description="Override maximum price"),
+        format: str = Query(default="json", description="Response format: json or bin")
     ):
-        """Get historical 30-second orderbook heatmap frames."""
+        """
+        Get historical 30-second orderbook heatmap frames.
+
+        Time metadata fields:
+        - frame_interval_ms: 30000 (fixed 30s interval)
+        - first_frame_ts_ms: Timestamp of oldest frame in response
+        - last_frame_ts_ms: Timestamp of newest frame in response
+        - server_send_ts_ms: Server timestamp when response was sent
+        - data_is_stale: True if last frame is older than 2x interval
+
+        Binary format (format=bin) returns compact blob for low-latency backfill.
+        """
+        server_recv_ts_ms = int(time.time() * 1000)
+
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -760,6 +831,7 @@ def create_embedded_app(
         if not frames:
             return JSONResponse(content={
                 "t": [], "prices": [], "bid_u8": [], "ask_u8": [],
+                "frame_interval_ms": FRAME_INTERVAL_MS,
                 "step": step, "scale": 255, "norm_method": "p50_p95", "_mode": "shared_buffer"
             })
 
@@ -767,6 +839,30 @@ def create_embedded_app(
             frames, price_min=price_min, price_max=price_max, step=step
         )
 
+        # Time metadata
+        first_frame_ts_ms = int(frames[0].ts * 1000)
+        last_frame_ts_ms = int(frames[-1].ts * 1000)
+        now_ms = int(time.time() * 1000)
+        data_is_stale = (now_ms - last_frame_ts_ms) > (2 * FRAME_INTERVAL_MS)
+
+        # Binary format response
+        if format == "bin":
+            binary_data = frames_to_binary(frames, prices, step)
+            return Response(
+                content=binary_data,
+                media_type="application/octet-stream",
+                headers={
+                    "X-First-Frame-Ts-Ms": str(first_frame_ts_ms),
+                    "X-Last-Frame-Ts-Ms": str(last_frame_ts_ms),
+                    "X-Frame-Count": str(len(frames)),
+                    "X-Price-Count": str(len(prices)),
+                    "X-Frame-Interval-Ms": str(FRAME_INTERVAL_MS),
+                    "X-Data-Is-Stale": "true" if data_is_stale else "false",
+                    "X-Server-Send-Ts-Ms": str(int(time.time() * 1000))
+                }
+            )
+
+        # JSON format response
         t_arr = []
         bid_flat = []
         ask_flat = []
@@ -777,17 +873,41 @@ def create_embedded_app(
             bid_flat.extend(bid_row)
             ask_flat.extend(ask_row)
 
+        server_send_ts_ms = int(time.time() * 1000)
+
         print(f"[EMBEDDED_API] ob_heatmap_30s_history: frames={len(t_arr)} prices={len(prices)}")
 
         return JSONResponse(content={
-            "t": t_arr, "prices": prices, "bid_u8": bid_flat, "ask_u8": ask_flat,
-            "step": step, "price_min": p_min, "price_max": p_max,
-            "scale": 255, "norm_method": "p50_p95", "_mode": "shared_buffer"
+            # Time metadata
+            "frame_interval_ms": FRAME_INTERVAL_MS,
+            "first_frame_ts_ms": first_frame_ts_ms,
+            "last_frame_ts_ms": last_frame_ts_ms,
+            "server_recv_ts_ms": server_recv_ts_ms,
+            "server_send_ts_ms": server_send_ts_ms,
+            "data_is_stale": data_is_stale,
+            # Frame data
+            "t": t_arr,
+            "prices": prices,
+            "bid_u8": bid_flat,
+            "ask_u8": ask_flat,
+            "step": step,
+            "price_min": p_min,
+            "price_max": p_max,
+            "scale": 255,
+            "norm_method": "p50_p95",
+            "_mode": "shared_buffer"
         })
 
     @app.get("/v2/orderbook_heatmap_30s_stats")
     async def orderbook_heatmap_30s_stats():
-        """Get orderbook heatmap buffer statistics."""
+        """
+        Get orderbook heatmap buffer and reconstructor statistics.
+
+        Includes:
+        - Buffer stats: frames in memory/disk, write timing
+        - Reconstructor stats: state, resyncs, gaps, update IDs
+        - Timing: last frame age, staleness indicator
+        """
         if not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -795,13 +915,42 @@ def create_embedded_app(
             )
 
         stats = state.ob_buffer.get_stats()
-        stats["current_time"] = time.time()
+        now = time.time()
+        now_ms = int(now * 1000)
+
+        # Time metadata
+        stats["current_time"] = now
+        stats["current_time_ms"] = now_ms
+        stats["frame_interval_ms"] = FRAME_INTERVAL_MS
         stats["mode"] = "shared_buffer"
 
         if stats["last_ts"] > 0:
-            stats["last_frame_age_s"] = round(time.time() - stats["last_ts"], 1)
+            last_frame_age_s = now - stats["last_ts"]
+            stats["last_frame_age_s"] = round(last_frame_age_s, 1)
+            stats["last_frame_ts_ms"] = int(stats["last_ts"] * 1000)
+            # Stale if > 2x frame interval
+            stats["data_is_stale"] = last_frame_age_s > (2 * FRAME_INTERVAL_SEC)
         else:
             stats["last_frame_age_s"] = None
+            stats["last_frame_ts_ms"] = 0
+            stats["data_is_stale"] = True
+
+        # Try to load reconstructor stats from file (written by full_metrics_viewer)
+        recon_stats_file = os.path.join(os.path.dirname(__file__), "ob_recon_stats.json")
+        if os.path.exists(recon_stats_file):
+            try:
+                with open(recon_stats_file, 'r') as f:
+                    recon_stats = json.load(f)
+                stats["reconstructor"] = recon_stats
+                # Add stats file age
+                if "written_at" in recon_stats:
+                    stats["reconstructor"]["stats_age_s"] = round(
+                        now - recon_stats["written_at"], 1
+                    )
+            except Exception as e:
+                stats["reconstructor"] = {"error": f"failed to read: {e}"}
+        else:
+            stats["reconstructor"] = {"error": "stats file not found"}
 
         return JSONResponse(content=stats)
 
