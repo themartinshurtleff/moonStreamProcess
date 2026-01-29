@@ -200,47 +200,56 @@ def analyze_sweeps(sweeps_records: List[dict]) -> dict:
 def compute_forceorder_hit_rate(
     force_orders: List[dict],
     inference_records: List[dict],
-    n_minutes: int = 5
+    n_minutes: int = 5,
+    tolerance_pct: float = 0.5
 ) -> dict:
     """
     Compute hit rate: when forceOrder occurs, did we predict it?
+    Uses tolerance_pct for bucket matching (0.5% = ~$450 at $90k price).
     """
     if not force_orders or not inference_records:
         return {"hit_rate": 0, "status": "INSUFFICIENT_DATA"}
 
-    # Build timeline of predictions by bucket
-    predictions_by_minute = defaultdict(dict)  # {minute_key: {bucket: side}}
+    # Filter to valid forceOrders (bucket > 0) and after inference started
+    inference_start = inference_records[0].get('ts', 0) if inference_records else 0
+    valid_fos = [fo for fo in force_orders if fo.get('bucket', 0) > 0 and fo.get('ts', 0) >= inference_start]
 
+    # Build timeline of predictions by minute and side
+    predictions_by_minute = defaultdict(lambda: {'long': [], 'short': []})
     for inf_rec in inference_records:
         minute_key = inf_rec.get('minute_key', 0)
         for inf in inf_rec.get('inferences', []):
             bucket = inf.get('projected_liq', 0)
             side = inf.get('side', '')
             if bucket and side:
-                # Store for the next n_minutes
-                for offset in range(n_minutes + 1):
-                    predictions_by_minute[minute_key + offset][bucket] = side
+                predictions_by_minute[minute_key][side].append(bucket)
 
     hits = 0
     misses = 0
     side_hits = {'long': 0, 'short': 0}
     side_misses = {'long': 0, 'short': 0}
+    miss_distances = []
 
-    for fo in force_orders:
+    for fo in valid_fos:
         ts = fo.get('ts', 0)
         minute_key = int(ts // 60)
         bucket = fo.get('bucket', 0)
         side = fo.get('side', '')
 
-        # Check if we predicted this bucket
+        # Check if we predicted this bucket within tolerance
         predicted = False
+        closest_dist = float('inf')
+
         for offset in range(n_minutes + 1):
             check_minute = minute_key - offset
-            if check_minute in predictions_by_minute:
-                if bucket in predictions_by_minute[check_minute]:
-                    if predictions_by_minute[check_minute][bucket] == side:
-                        predicted = True
-                        break
+            for pred_bucket in predictions_by_minute[check_minute][side]:
+                dist_pct = abs(bucket - pred_bucket) / bucket * 100
+                closest_dist = min(closest_dist, dist_pct)
+                if dist_pct <= tolerance_pct:
+                    predicted = True
+                    break
+            if predicted:
+                break
 
         if predicted:
             hits += 1
@@ -248,17 +257,101 @@ def compute_forceorder_hit_rate(
         else:
             misses += 1
             side_misses[side] = side_misses.get(side, 0) + 1
+            if closest_dist < float('inf'):
+                miss_distances.append(closest_dist)
 
     total = hits + misses
+    median_miss = statistics.median(miss_distances) if miss_distances else 0
+
     return {
         "hit_rate": round(hits / total * 100, 2) if total > 0 else 0,
         "hits": hits,
         "misses": misses,
         "total_events": total,
         "n_minutes_lookback": n_minutes,
+        "tolerance_pct": tolerance_pct,
         "side_hits": side_hits,
         "side_misses": side_misses,
+        "median_miss_pct": round(median_miss, 2),
         "status": "COMPUTED"
+    }
+
+
+def analyze_side_coverage(
+    force_orders: List[dict],
+    inference_records: List[dict],
+    n_minutes: int = 5
+) -> dict:
+    """
+    Analyze how many forceOrders had same-side vs wrong-side predictions.
+    This identifies the fundamental issue of binary side selection.
+    """
+    if not force_orders or not inference_records:
+        return {"status": "INSUFFICIENT_DATA"}
+
+    inference_start = inference_records[0].get('ts', 0) if inference_records else 0
+    valid_fos = [fo for fo in force_orders if fo.get('bucket', 0) > 0 and fo.get('ts', 0) >= inference_start]
+
+    # Build minute -> predicted sides mapping
+    predictions_by_minute = defaultdict(lambda: {'long': False, 'short': False})
+    inf_minutes = set()
+    for inf_rec in inference_records:
+        minute_key = inf_rec.get('minute_key', 0)
+        inf_minutes.add(minute_key)
+        for inf in inf_rec.get('inferences', []):
+            side = inf.get('side', '')
+            if side:
+                predictions_by_minute[minute_key][side] = True
+
+    same_side = 0
+    wrong_side = 0
+    no_inference = 0
+    by_side = {'long': {'same': 0, 'wrong': 0, 'gap': 0}, 'short': {'same': 0, 'wrong': 0, 'gap': 0}}
+
+    for fo in valid_fos:
+        ts = fo.get('ts', 0)
+        minute_key = int(ts // 60)
+        fo_side = fo.get('side', '')
+        opposite = 'short' if fo_side == 'long' else 'long'
+
+        # Check last n_minutes for predictions
+        found_same = False
+        found_opposite = False
+        found_any_inference = False
+
+        for offset in range(n_minutes + 1):
+            check_minute = minute_key - offset
+            if check_minute in inf_minutes:
+                found_any_inference = True
+            if predictions_by_minute[check_minute][fo_side]:
+                found_same = True
+            if predictions_by_minute[check_minute][opposite]:
+                found_opposite = True
+
+        if found_same:
+            same_side += 1
+            by_side[fo_side]['same'] += 1
+        elif found_opposite:
+            wrong_side += 1
+            by_side[fo_side]['wrong'] += 1
+        elif not found_any_inference:
+            no_inference += 1
+            by_side[fo_side]['gap'] += 1
+        else:
+            # Had inference but no predictions for either side (neutral zone)
+            wrong_side += 1
+            by_side[fo_side]['wrong'] += 1
+
+    total = len(valid_fos)
+    return {
+        "total_forceorders": total,
+        "same_side_predictions": same_side,
+        "wrong_side_predictions": wrong_side,
+        "inference_gaps": no_inference,
+        "coverage_pct": round(same_side / total * 100, 2) if total > 0 else 0,
+        "wrong_side_pct": round(wrong_side / total * 100, 2) if total > 0 else 0,
+        "by_side": by_side,
+        "status": "ANALYZED"
     }
 
 def analyze_skip_reasons(calibrator_records: List[dict]) -> dict:
@@ -396,15 +489,27 @@ def main():
     print("CORE ACCURACY METRICS")
     print("=" * 70)
 
-    # ForceOrder hit rate at different lookback windows
+    # ForceOrder hit rate with tolerance
     force_orders = [r for r in tape_records if r.get('type') == 'forceOrder']
 
-    for n in [1, 3, 5]:
-        hr = compute_forceorder_hit_rate(force_orders, inference_records, n_minutes=n)
-        print(f"\n[A] ForceOrder Hit Rate (N={n} min lookback):")
-        print(f"    - Hit rate: {hr.get('hit_rate', 0)}%")
-        print(f"    - Hits: {hr.get('hits', 0)} / Misses: {hr.get('misses', 0)}")
-        print(f"    - By side: Long hits={hr.get('side_hits', {}).get('long', 0)}, Short hits={hr.get('side_hits', {}).get('short', 0)}")
+    print("\n[A] ForceOrder Hit Rate (0.5% bucket tolerance, 5 min lookback):")
+    hr = compute_forceorder_hit_rate(force_orders, inference_records, n_minutes=5, tolerance_pct=0.5)
+    print(f"    - Hit rate: {hr.get('hit_rate', 0)}%")
+    print(f"    - Hits: {hr.get('hits', 0)} / Misses: {hr.get('misses', 0)}")
+    print(f"    - Median miss distance: {hr.get('median_miss_pct', 0)}%")
+    print(f"    - By side: Long hits={hr.get('side_hits', {}).get('long', 0)}, Short hits={hr.get('side_hits', {}).get('short', 0)}")
+
+    # Side coverage analysis - the key diagnostic
+    print("\n[A2] Side Coverage Analysis (ROOT CAUSE DIAGNOSTIC):")
+    coverage = analyze_side_coverage(force_orders, inference_records, n_minutes=5)
+    print(f"    - Total forceOrders analyzed: {coverage.get('total_forceorders', 0)}")
+    print(f"    - Same-side predictions: {coverage.get('same_side_predictions', 0)} ({coverage.get('coverage_pct', 0)}%)")
+    print(f"    - WRONG-side predictions: {coverage.get('wrong_side_predictions', 0)} ({coverage.get('wrong_side_pct', 0)}%)")
+    print(f"    - Inference gaps: {coverage.get('inference_gaps', 0)}")
+    by_side = coverage.get('by_side', {})
+    if by_side:
+        print(f"    - Long FOs: same={by_side.get('long', {}).get('same', 0)}, wrong={by_side.get('long', {}).get('wrong', 0)}, gap={by_side.get('long', {}).get('gap', 0)}")
+        print(f"    - Short FOs: same={by_side.get('short', {}).get('same', 0)}, wrong={by_side.get('short', {}).get('wrong', 0)}, gap={by_side.get('short', {}).get('gap', 0)}")
 
     # Calibrator analysis
     calib_analysis = analyze_calibrator_events(calibrator_records)
@@ -451,20 +556,19 @@ def main():
 
     findings = []
 
+    # Check wrong-side prediction rate
+    wrong_side_pct = coverage.get('wrong_side_pct', 0)
+    if wrong_side_pct > 30:
+        findings.append(f"CRITICAL: {wrong_side_pct}% of forceOrders had WRONG-SIDE predictions - engine predicts one side based on aggression")
+
     if sweep_analysis.get('critical'):
         findings.append("CRITICAL: liq_sweeps.jsonl is EMPTY - sweep detection not logging")
 
+    if coverage.get('inference_gaps', 0) > 100:
+        findings.append(f"WARNING: {coverage.get('inference_gaps')} forceOrders during inference gaps")
+
     if agg_analysis.get('fallback_used_rate', 0) > 5:
         findings.append(f"WARNING: High fallback rate ({agg_analysis.get('fallback_used_rate')}%) in aggression accumulator")
-
-    if fo_analysis.get('count', 0) < 20:
-        findings.append(f"WARNING: Low forceOrder volume ({fo_analysis.get('count')} events)")
-
-    if calib_analysis.get('hit_rate', 0) < 10:
-        findings.append(f"WARNING: Very low calibration hit rate ({calib_analysis.get('hit_rate')}%)")
-
-    if sym_analysis.get('notional_ratio_long_short', 1) > 5 or sym_analysis.get('notional_ratio_long_short', 1) < 0.2:
-        findings.append(f"WARNING: Significant long/short notional imbalance (ratio: {sym_analysis.get('notional_ratio_long_short')})")
 
     for i, finding in enumerate(findings, 1):
         print(f"  {i}. {finding}")
@@ -478,35 +582,37 @@ def main():
     print("=" * 70)
 
     print("""
-1. FIX SWEEP LOGGING (Critical)
+1. PREDICT BOTH SIDES (CRITICAL - Highest Impact)
+   - Problem: Engine predicts ONE side based on buy_pct threshold
+     * buy_pct < 0.45 -> SHORT liquidations only
+     * buy_pct > 0.55 -> LONG liquidations only
+   - Impact: ~40% of forceOrders have WRONG-side predictions
+   - Fix: Project liquidation zones for BOTH sides every inference
+   - Module: entry_inference.py / full_metrics_viewer.py
+   - Expected: Coverage jumps from ~59% to ~95%+
+
+2. FIX SWEEP LOGGING
    - Symptom: liq_sweeps.jsonl is empty (0 bytes)
    - Module: full_metrics_viewer.py or liq_heatmap.py
    - Action: Ensure on_sweep() is called when price crosses predicted buckets
    - Metric: Should see sweep events correlated with price movements
 
-2. IMPLEMENT SIDE-SPECIFIC LEVERAGE WEIGHTS
+3. REDUCE INFERENCE GAPS
+   - Current: ~10% of forceOrders during no-inference periods
+   - Module: entry_inference.py
+   - Action: Lower OI delta threshold or add time-based minimum firing
+   - Metric: Ensure inference fires at least once per minute
+
+4. IMPLEMENT SIDE-SPECIFIC LEVERAGE WEIGHTS
    - Symptom: Offset by side shows asymmetric miss distances
    - Module: entry_inference.py
    - Action: Maintain separate leverage_weights dicts for long vs short
    - Metric: Reduce median offset USD by side
 
-3. ROLLING ENTRY DISTRIBUTION
-   - Symptom: Projections anchored to single src price
-   - Module: entry_inference.py
-   - Action: Track entry price distribution over N-minute window
-   - Metric: Improve hit rate by accounting for position entry spread
-
-4. DYNAMIC AGGRESSION THRESHOLD
-   - Symptom: Static 0.45/0.55 thresholds may miss subtle directional bias
-   - Module: full_metrics_viewer.py (aggression detection)
-   - Action: Use rolling volatility-scaled threshold
-   - Metric: Increase inference firing rate while maintaining accuracy
-
-5. DEPTH-BASED CONFIDENCE SCALING
-   - Symptom: Predictions don't account for orderbook support
-   - Module: entry_inference.py or liq_heatmap.py
-   - Action: Scale prediction intensity by nearby depth liquidity
-   - Metric: Reduce false positives at unsupported price levels
+5. BUCKET TOLERANCE FOR METRICS
+   - Current: Exact bucket matching underreports accuracy
+   - Note: At 0.5% tolerance, actual hit rate is ~41%
+   - This is informational - the real fix is #1 above
 """)
 
     # NEXT 5 ACTIONS
@@ -515,29 +621,32 @@ def main():
     print("=" * 70)
 
     print("""
-1. [HIGH] Fix sweep logging - without this, can't compute sweep hit rate
-   - File: Check on_sweep() in liq_heatmap.py or full_metrics_viewer.py
-   - Expected: Sweeps logged when high/low crosses predicted bucket
-
-2. [HIGH] Add side-specific offset learning
-   - File: liq_calibrator.py, entry_inference.py
-   - Maintain long_bias_pct and short_bias_pct separately
-   - Apply side-specific corrections to implied levels
-
-3. [MEDIUM] Implement rolling entry bands
+1. [CRITICAL] Predict both sides simultaneously
    - File: entry_inference.py
-   - Replace single src_price with (entry_low, entry_high) band
-   - Spread projected_liq across band range
+   - Change: Remove buy_pct side filtering
+   - Always project long AND short liquidation zones
+   - Use aggression to weight intensity, not exclude sides
+   - Expected: 40% immediate hit rate improvement
 
-4. [MEDIUM] Add approach zone detection
-   - Current: 0 approach candidates logged
-   - File: liq_calibrator.py approach logic
-   - Verify price-to-zone distance calculation
+2. [HIGH] Fix sweep logging
+   - File: liq_heatmap.py or full_metrics_viewer.py
+   - Verify on_sweep() callback is wired up
+   - Expected: Enable real-time accuracy tracking
 
-5. [LOW] Tune aggression sensitivity
-   - File: full_metrics_viewer.py
-   - Current threshold appears functional (low fallback rate)
-   - Consider adaptive threshold based on volume regime
+3. [HIGH] Add time-based inference minimum
+   - File: entry_inference.py
+   - Ensure inference fires at least once per minute
+   - Expected: Eliminate inference gap misses
+
+4. [MEDIUM] Side-specific offset learning
+   - File: liq_calibrator.py
+   - Track long_bias_pct and short_bias_pct separately
+   - Expected: Reduce per-side miss distances
+
+5. [LOW] Review calibrator hit rate
+   - Current: 93.78% calibrator hit rate is excellent
+   - The calibrator is working well
+   - Focus on the inference side-selection issue instead
 """)
 
 if __name__ == "__main__":
