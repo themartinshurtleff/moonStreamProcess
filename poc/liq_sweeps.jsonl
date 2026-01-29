@@ -30,3 +30,8 @@
 {"type": "sweep", "ts": 1769655060.2460477, "minute_key": 29494251, "side": "long", "bucket": 87720.0, "notional_usd": 4146.62, "layer": "tape", "reason": "low<=87720", "trigger_low": 87678.05}
 {"type": "sweep", "ts": 1769655060.2460477, "minute_key": 29494251, "side": "long", "bucket": 87680.0, "notional_usd": 15635.28, "layer": "tape", "reason": "low<=87680", "trigger_low": 87678.05}
 {"type": "sweep", "ts": 1769655360.2025287, "minute_key": 29494256, "side": "long", "bucket": 87660.0, "notional_usd": 17874.29, "layer": "tape", "reason": "low<=87660", "trigger_low": 87650.15}
+{"type": "sweep", "ts": 1769662680.2333899, "minute_key": 29494378, "side": "short", "bucket": 88300.0, "notional_usd": 1724.22, "layer": "tape", "reason": "high>=88300", "trigger_high": 88308.75}
+{"type": "sweep", "ts": 1769662680.2333899, "minute_key": 29494378, "side": "short", "bucket": 88260.0, "notional_usd": 114.71, "layer": "tape", "reason": "high>=88260", "trigger_high": 88308.75}
+{"type": "sweep", "ts": 1769662980.0063863, "minute_key": 29494383, "side": "short", "bucket": 88320.0, "notional_usd": 29964.48, "layer": "tape", "reason": "high>=88320", "trigger_high": 88332.95}
+{"type": "sweep", "ts": 1769663040.0087192, "minute_key": 29494384, "side": "short", "bucket": 88340.0, "notional_usd": 345.48, "layer": "tape", "reason": "high>=88340", "trigger_high": 88343.65}
+{"type": "sweep", "ts": 1769675400.313545, "minute_key": 29494590, "side": "short", "bucket": 88420.0, "notional_usd": 172.45, "layer": "tape", "reason": "high>=88420", "trigger_high": 88439.25}
