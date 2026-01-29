@@ -1,0 +1,6 @@
+{"type": "sweep", "ts": 1769650080.23331, "minute_key": 29494168, "side": "long", "bucket": 88620.0, "notional_usd": 337.18, "layer": "tape", "reason": "low<=88620", "trigger_low": 88565.05}
+{"type": "sweep", "ts": 1769650080.23331, "minute_key": 29494168, "side": "long", "bucket": 88680.0, "notional_usd": 430.24, "layer": "tape", "reason": "low<=88680", "trigger_low": 88565.05}
+{"type": "sweep", "ts": 1769651580.1972752, "minute_key": 29494193, "side": "long", "bucket": 88540.0, "notional_usd": 384.75, "layer": "tape", "reason": "low<=88540", "trigger_low": 88521.15}
+{"type": "sweep", "ts": 1769652120.0008774, "minute_key": 29494202, "side": "long", "bucket": 88500.0, "notional_usd": 20584.96, "layer": "tape", "reason": "low<=88500", "trigger_low": 88399.05}
+{"type": "sweep", "ts": 1769652120.0008774, "minute_key": 29494202, "side": "long", "bucket": 88460.0, "notional_usd": 146.98, "layer": "tape", "reason": "low<=88460", "trigger_low": 88399.05}
+{"type": "sweep", "ts": 1769652120.0008774, "minute_key": 29494202, "side": "long", "bucket": 88400.0, "notional_usd": 146.88, "layer": "tape", "reason": "low<=88400", "trigger_low": 88399.05}

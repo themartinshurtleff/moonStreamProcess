@@ -18,7 +18,7 @@ TAPE_LOG = "liq_tape.jsonl"
 INFERENCE_LOG = "liq_inference.jsonl"
 SWEEPS_LOG = "liq_sweeps.jsonl"
 SNAPSHOT_V2 = "liq_api_snapshot_v2.json"
-WEIGHTS_FILE = "liq_calibrator_weights.json"
+WEIGHTS_FILE = "old_log/liq_calibrator_weights.json"
 
 def load_jsonl(path: str) -> List[dict]:
     """Load JSONL file into list of dicts."""
