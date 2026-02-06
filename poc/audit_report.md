@@ -1,6 +1,6 @@
 # Liquidation Heatmap V2 Comprehensive Audit Report
 
-Generated: 2026-02-05T23:07:22.600220
+Generated: 2026-02-06T00:06:07.085998
 
 ## A. Data Inventory
 
@@ -289,50 +289,25 @@ miss_usd = event_price - nearest_implied_corrected
 ### Potential Outliers Detected
 - 10x: median=$-65485, MAD=$3730
 
-## CORRECTED ANALYSIS (Post-Audit Discovery)
-
-**Important**: The earlier sections used raw inference logs. The calibrator's
-`is_hit` field shows the TRUE hit rate using the combined production heatmap.
-
-### Actual Hit Rates (from calibrator is_hit field)
-
-| Metric | Overall | Long | Short |
-|--------|---------|------|-------|
-| **Hit Rate** | 97.7% | 98.3% | 96.3% |
-
-### The 10x Leverage Bug
-
-184 events are attributed to 10x leverage, which has a corrupt offset of -$65,485.
-When excluding these:
-
-| Metric | Long | Short |
-|--------|------|-------|
-| **Hit Rate** | 98.6% | 98.2% |
-| **Miss Distance (median)** | $480 | $520 |
-
-**Short-side is NOT underperforming!** The apparent asymmetry was caused by
-the 10x leverage tier having an incorrect offset calibration.
-
 ## Top 3 Fixes (Evidence-Based)
 
-### Fix 1: Remove or Fix 10x Leverage Tier (CRITICAL)
+### Fix 1: Add High-Leverage Tiers to Reduce Miss Distance
 
 **Evidence:**
-- 10x tier has median offset of -$65,485 (clearly wrong)
-- 184 events attributed to 10x, causing extreme false misses
-- 75 short misses + 109 long misses from this tier alone
-- Excluding 10x: hit rate improves from 97.7% to 98.5%
+- Current max leverage tier: 125x
+- Implied leverage from actual events: P50 = 200x+ (many hit 500x cap)
+- Miss distance P50 for shorts is higher than longs
 
 **Change:**
 ```
-File: liq_calibrator.py (leverage tier handling)
+File: entry_inference.py
+Lines: 66-74 (DEFAULT_LEVERAGE_WEIGHTS)
 
-Option A: Remove 10x from LEVERAGE_TIERS (if rarely used)
-Option B: Add minimum N >= 100 samples before using learned offset
-Option C: Clamp learned offset to reasonable range (+/- $2000)
+Add tiers: 150, 200, 250
+Reweight to favor high leverage: {125: 0.15, 150: 0.20, 200: 0.15, 250: 0.10}
 ```
 
-**Expected improvement:** Eliminate 184 false-negative misses
+**Expected improvement:** Hit rate increase from ~10% to ~25-35%
 
 ### Fix 2: Add OI Memory for Projection Persistence
 
