@@ -881,6 +881,64 @@ class OrderbookHeatmapBuffer:
             f"oldest={oldest_ts}, newest={newest_ts}"
         )
 
+    def tail_from_disk(self) -> int:
+        """
+        Read any new frames appended to disk since last load.
+
+        This enables standalone API processes to stay updated when the collector
+        writes new frames to the shared binary file.
+
+        Returns:
+            Number of new frames loaded
+        """
+        if not os.path.exists(self.persistence_path):
+            return 0
+
+        file_size = os.path.getsize(self.persistence_path)
+        total_frames_on_disk = file_size // FRAME_RECORD_SIZE
+
+        with self._lock:
+            # Get current newest timestamp to detect duplicates
+            current_newest_ts = self._frames[-1].ts if self._frames else 0
+
+            # Calculate where to start reading
+            # We need to find frames newer than our current newest
+            # Start from end and work backwards to be efficient
+            new_frames = []
+
+            try:
+                with open(self.persistence_path, 'rb') as f:
+                    # Read from end, looking for frames we don't have
+                    for i in range(total_frames_on_disk - 1, -1, -1):
+                        f.seek(i * FRAME_RECORD_SIZE)
+                        record = f.read(FRAME_RECORD_SIZE)
+                        if len(record) < FRAME_RECORD_SIZE:
+                            continue
+                        try:
+                            frame = OrderbookFrame.from_bytes(record)
+                            if frame.ts <= current_newest_ts:
+                                # We've reached frames we already have
+                                break
+                            new_frames.append(frame)
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.error(f"[OB_HEATMAP] Failed to tail from disk: {e}")
+                return 0
+
+            # Reverse to get chronological order and append
+            new_frames.reverse()
+            for frame in new_frames:
+                self._frames.append(frame)
+
+            if new_frames:
+                logger.debug(
+                    f"[OB_HEATMAP] Tailed {len(new_frames)} new frames from disk, "
+                    f"newest_ts={new_frames[-1].ts if new_frames else 0}"
+                )
+
+            return len(new_frames)
+
     def add_frame(self, frame: OrderbookFrame):
         """Add a new frame to buffer and persist."""
         write_start = time.time()

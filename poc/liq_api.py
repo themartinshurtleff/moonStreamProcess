@@ -649,7 +649,43 @@ class SnapshotCache:
 _cache: Optional[SnapshotCache] = None
 _cache_v2: Optional[SnapshotCache] = None  # V2 cache
 _ob_buffer: Optional['OrderbookHeatmapBuffer'] = None  # Orderbook heatmap buffer
+_ob_buffer_refresh_thread: Optional[threading.Thread] = None
+_ob_buffer_refresh_running: bool = False
 _start_time: float = 0
+
+# OB buffer refresh interval (seconds) - must be <= frame interval to not miss frames
+OB_BUFFER_REFRESH_INTERVAL = 5.0
+
+
+def _start_ob_buffer_refresh():
+    """Start background thread to tail new OB frames from disk."""
+    global _ob_buffer_refresh_thread, _ob_buffer_refresh_running
+
+    if _ob_buffer_refresh_thread is not None:
+        return  # Already started
+
+    _ob_buffer_refresh_running = True
+
+    def refresh_loop():
+        while _ob_buffer_refresh_running:
+            try:
+                if _ob_buffer:
+                    new_frames = _ob_buffer.tail_from_disk()
+                    if new_frames > 0:
+                        logger.info(f"[OB_REFRESH] Tailed {new_frames} new frames from disk")
+            except Exception as e:
+                logger.error(f"[OB_REFRESH] Error tailing from disk: {e}")
+            time.sleep(OB_BUFFER_REFRESH_INTERVAL)
+
+    _ob_buffer_refresh_thread = threading.Thread(target=refresh_loop, daemon=True)
+    _ob_buffer_refresh_thread.start()
+    print(f"[OB_REFRESH] Started background refresh thread (interval={OB_BUFFER_REFRESH_INTERVAL}s)")
+
+
+def _stop_ob_buffer_refresh():
+    """Stop background refresh thread."""
+    global _ob_buffer_refresh_running
+    _ob_buffer_refresh_running = False
 
 
 def create_app() -> FastAPI:
@@ -693,6 +729,8 @@ def create_app() -> FastAPI:
                 _ob_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
                 ob_stats = _ob_buffer.get_stats()
                 print(f"Orderbook heatmap: {ob_stats['frames_in_memory']} frames loaded from {OB_HEATMAP_FILE}")
+                # Start background refresh thread to tail new frames from disk
+                _start_ob_buffer_refresh()
             except Exception as e:
                 print(f"ERROR: Failed to initialize OrderbookHeatmapBuffer: {e}")
                 _ob_buffer = None
@@ -712,6 +750,7 @@ def create_app() -> FastAPI:
             _cache.stop()
         if _cache_v2:
             _cache_v2.stop()
+        _stop_ob_buffer_refresh()
 
     @app.get("/v1/health")
     async def health():
