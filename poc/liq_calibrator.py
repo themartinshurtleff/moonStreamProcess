@@ -101,6 +101,21 @@ VOL_EWMA_ALPHA = 0.1       # EWMA smoothing for volatility (10% weight to new)
 DIST_BAND_NEAR = 0.010
 DIST_BAND_MID = 0.025
 
+# === EVENT PRICE SANITY CHECK ===
+# Maximum allowed deviation between event_price and src_price
+# Events with larger deviation are flagged as "price_insane" and excluded from calibration
+# This prevents corrupt data (e.g., event_price near $0) from poisoning offset estimates
+MAX_EVENT_PRICE_DEVIATION = 0.15  # 15% - any liquidation >15% from current price is suspicious
+
+# === OFFSET GUARDRAILS ===
+# Clamp learned offsets to prevent runaway values from bad data
+MAX_OFFSET_PCT = 0.005    # 0.5% max offset as fraction of price
+MAX_OFFSET_USD = 2000.0   # $2000 absolute max offset (safety net)
+
+# Minimum samples per leverage tier before using its learned offset
+# Tiers with fewer samples use fallback (interpolated from neighbors or global median)
+MIN_TIER_SAMPLES = 50
+
 # Implied distance band thresholds (distance from nearest implied level / src) - "implied_band"
 # IMPLIED_NEAR: <= 0.25% (very close to predicted level)
 # IMPLIED_MID:  (0.25%, 0.75%] (reasonably close)
@@ -929,6 +944,30 @@ class LiquidationCalibrator:
 
         # === DISTANCE BAND COMPUTATION (using event-time src) ===
         dist_pct_event = abs(event.price - src_used) / src_used if src_used > 0 else 0.0
+
+        # === EVENT PRICE SANITY CHECK ===
+        # Reject events with wildly incorrect prices (data corruption)
+        # These would poison offset estimates with garbage miss_usd values
+        price_insane = dist_pct_event > MAX_EVENT_PRICE_DEVIATION
+        price_insane_reason = None
+        if price_insane:
+            price_insane_reason = f"price_deviation={dist_pct_event*100:.1f}%>max={MAX_EVENT_PRICE_DEVIATION*100:.0f}%"
+            # Log the rejected event for debugging
+            if self.log_fh:
+                reject_entry = {
+                    "type": "event_rejected",
+                    "timestamp": datetime.fromtimestamp(event.timestamp).isoformat(),
+                    "reason": "price_insane",
+                    "detail": price_insane_reason,
+                    "event_price": round(event.price, 2),
+                    "src_price": round(src_used, 2),
+                    "dist_pct": round(dist_pct_event, 4),
+                    "side": event.side,
+                    "notional": round(event.notional, 2)
+                }
+                self.log_fh.write(json.dumps(reject_entry) + '\n')
+                self.log_fh.flush()
+
         if dist_pct_event <= DIST_BAND_NEAR:
             band = "NEAR"
         elif dist_pct_event <= DIST_BAND_MID:
@@ -946,12 +985,14 @@ class LiquidationCalibrator:
         else:
             self._src_source_counts["fallback"] += 1
 
-        # Update window high/low for approach gating
-        self.stats.window_high = max(self.stats.window_high, event.price)
-        self.stats.window_low = min(self.stats.window_low, event.price)
+        # Update window high/low for approach gating (skip if price is insane)
+        if not price_insane:
+            self.stats.window_high = max(self.stats.window_high, event.price)
+            self.stats.window_low = min(self.stats.window_low, event.price)
 
-        # Determine if this event should update calibration (NEAR + MID only)
-        updates_calibration = band in ("NEAR", "MID")
+        # Determine if this event should update calibration
+        # Requires: NEAR or MID band AND price is sane (not corrupted data)
+        updates_calibration = band in ("NEAR", "MID") and not price_insane
 
         # Determine which zones to check based on event side
         if event.side == "long":
@@ -1118,6 +1159,10 @@ class LiquidationCalibrator:
 
         # Log individual event with all Phase 0-4 fields
         if self.log_events and self.log_fh:
+            # Compute guardrail logging fields
+            offset_used_usd = self.long_offset_usd if event.side == "long" else self.short_offset_usd
+            offset_used_pct = offset_used_usd / src_used if src_used > 0 else 0.0
+
             self._log_event_v2(
                 event=event,
                 snapshot=snapshot,
@@ -1149,7 +1194,12 @@ class LiquidationCalibrator:
                 # Percent-space soft attribution params
                 tau_pct=tau_pct,
                 delta_pct=delta_pct,
-                vol_scale=vol_scale
+                vol_scale=vol_scale,
+                # Guardrail fields
+                price_insane=price_insane,
+                price_insane_reason=price_insane_reason,
+                offset_used_usd=offset_used_usd,
+                offset_used_pct=offset_used_pct
             )
 
     def _process_approach_events(self, snapshot: MinuteSnapshot, cache_entry: MinuteCacheEntry) -> None:
@@ -2004,17 +2054,44 @@ class LiquidationCalibrator:
             bias_update_info['short_updated'] = True
 
         # Keep old USD offset tuning for backward compatibility (deprecated)
+        # Now with robust update (median) and clamping
         old_long_offset = self.long_offset_usd
         old_short_offset = self.short_offset_usd
         offset_lr = 0.3
+        offset_clamped_long = False
+        offset_clamped_short = False
+
+        # Get current price for percent-space clamping
+        current_price = snapshot.src if snapshot.src > 0 else 80000.0  # fallback
+        max_offset_from_pct = current_price * MAX_OFFSET_PCT
 
         if len(self.stats.long_offsets) >= 3:
-            mean_long_miss = sum(self.stats.long_offsets) / len(self.stats.long_offsets)
-            self.long_offset_usd += offset_lr * mean_long_miss
+            # Use median instead of mean for robustness (winsorization light)
+            sorted_offsets = sorted(self.stats.long_offsets)
+            median_miss = sorted_offsets[len(sorted_offsets) // 2]
+            self.long_offset_usd += offset_lr * median_miss
+
+            # Clamp offset: min of percent-based and absolute USD limits
+            max_allowed = min(max_offset_from_pct, MAX_OFFSET_USD)
+            if abs(self.long_offset_usd) > max_allowed:
+                old_val = self.long_offset_usd
+                self.long_offset_usd = max(-max_allowed, min(max_allowed, self.long_offset_usd))
+                offset_clamped_long = True
+                logger.info(f"Long offset clamped: {old_val:.2f} -> {self.long_offset_usd:.2f}")
 
         if len(self.stats.short_offsets) >= 3:
-            mean_short_miss = sum(self.stats.short_offsets) / len(self.stats.short_offsets)
-            self.short_offset_usd += offset_lr * mean_short_miss
+            # Use median instead of mean for robustness
+            sorted_offsets = sorted(self.stats.short_offsets)
+            median_miss = sorted_offsets[len(sorted_offsets) // 2]
+            self.short_offset_usd += offset_lr * median_miss
+
+            # Clamp offset: min of percent-based and absolute USD limits
+            max_allowed = min(max_offset_from_pct, MAX_OFFSET_USD)
+            if abs(self.short_offset_usd) > max_allowed:
+                old_val = self.short_offset_usd
+                self.short_offset_usd = max(-max_allowed, min(max_allowed, self.short_offset_usd))
+                offset_clamped_short = True
+                logger.info(f"Short offset clamped: {old_val:.2f} -> {self.short_offset_usd:.2f}")
 
         # === APPROACH GATING FOR ZONES ===
         # Determine which predicted zones were "approachable" during this window
@@ -2050,7 +2127,9 @@ class LiquidationCalibrator:
             snapshot,
             bias_update_info=bias_update_info,
             old_bias_pct_long=old_bias_pct_long,
-            old_bias_pct_short=old_bias_pct_short
+            old_bias_pct_short=old_bias_pct_short,
+            offset_clamped_long=offset_clamped_long,
+            offset_clamped_short=offset_clamped_short
         )
 
         # === IDENTIFIABILITY DIAGNOSTICS LOG ===
@@ -2312,7 +2391,10 @@ class LiquidationCalibrator:
         # Phase 3: Bias update info
         bias_update_info: Dict = None,
         old_bias_pct_long: float = 0.0,
-        old_bias_pct_short: float = 0.0
+        old_bias_pct_short: float = 0.0,
+        # Guardrail fields
+        offset_clamped_long: bool = False,
+        offset_clamped_short: bool = False
     ) -> None:
         """Write calibration event to JSONL log with Phase 3/4 fields."""
         if not self.log_fh:
@@ -2396,7 +2478,13 @@ class LiquidationCalibrator:
                 'consecutive_buffer_at_bounds': self._consecutive_buffer_at_bounds,
                 'consecutive_tolerance_at_bounds': self._consecutive_tolerance_at_bounds,
                 'src_source_counts': self._src_source_counts.copy(),
-                'minutes_no_mark': self._total_minutes_no_mark
+                'minutes_no_mark': self._total_minutes_no_mark,
+                # Offset guardrails
+                'offset_clamped_long': offset_clamped_long,
+                'offset_clamped_short': offset_clamped_short,
+                'max_offset_pct': MAX_OFFSET_PCT,
+                'max_offset_usd': MAX_OFFSET_USD,
+                'max_event_price_deviation': MAX_EVENT_PRICE_DEVIATION
             }
         }
 
@@ -2541,7 +2629,12 @@ class LiquidationCalibrator:
         # Percent-space soft attribution params
         tau_pct: float = 0.0,
         delta_pct: float = 0.0,
-        vol_scale: float = 1.0
+        vol_scale: float = 1.0,
+        # Guardrail fields
+        price_insane: bool = False,
+        price_insane_reason: Optional[str] = None,
+        offset_used_usd: float = 0.0,
+        offset_used_pct: float = 0.0
     ) -> None:
         """
         Log individual liquidation event with all Phase 0-4 fields.
@@ -2620,7 +2713,12 @@ class LiquidationCalibrator:
             'tau_pct': round(tau_pct, 6),
             'delta_pct': round(delta_pct, 6),
             'vol_scale': round(vol_scale, 4),
-            'vol_ewma': round(self.vol_ewma, 6)
+            'vol_ewma': round(self.vol_ewma, 6),
+            # Guardrail fields
+            'price_insane': price_insane,
+            'price_insane_reason': price_insane_reason,
+            'offset_used_usd': round(offset_used_usd, 2),
+            'offset_used_pct': round(offset_used_pct, 6)
         }
 
         self.log_fh.write(json.dumps(log_entry) + '\n')
