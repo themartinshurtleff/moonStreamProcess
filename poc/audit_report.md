@@ -1,70 +1,64 @@
 # Liquidation Heatmap V2 Comprehensive Audit Report
 
-Generated: 2026-02-06T00:06:07.085998
+Generated: 2026-02-06T15:33:33.611000
 
 ## A. Data Inventory
 
 ### CALIBRATOR
-- **liq_calibrator.jsonl**: 27565.7 KB, 24484 lines
-  - Date range: 2026-02-03T00:20:00.081612 to 2026-02-05T17:00:35.511905
-  - Record types: {'minute_inputs': 3873, 'depth_band_stats': 3873, 'approach_minute_summary': 3873, 'event': 12354, 'calibration': 257, 'ident_diag': 252, 'safety_trip': 1, 'mark_stream_missing': 1}
-- **liq_calibrator.jsonl**: 8194.5 KB, 10348 lines
+- **liq_calibrator.jsonl**: 3217.0 KB, 2809 lines
+  - Date range: 2026-02-05T23:04:00.159135 to 2026-02-06T15:33:00.048789
+  - Record types: {'minute_inputs': 472, 'depth_band_stats': 472, 'approach_minute_summary': 472, 'event': 1330, 'calibration': 30, 'ident_diag': 30, 'event_rejected': 3}
+- **liq_calibrator.jsonl**: 8204.6 KB, 10348 lines
   - Date range: 2026-01-26T21:06:00.014212 to 2026-01-28T19:15:34.198588
   - Record types: {'minute_inputs': 2763, 'depth_band_stats': 2763, 'approach_minute_summary': 2763, 'event': 1721, 'calibration': 178, 'ident_diag': 160}
-- **liq_calibrator.20260203_0019.jsonl**: 3563.8 KB, 3627 lines
-  - Date range: 2026-01-28T20:15:00.190527 to 2026-01-30T01:59:00.066013
-  - Record types: {'minute_inputs': 760, 'depth_band_stats': 760, 'approach_minute_summary': 760, 'event': 1254, 'calibration': 48, 'ident_diag': 45}
 
 ### DEBUG
-- **liq_debug.jsonl**: 6954.0 KB, 11683 lines
-  - Date range: 2026-02-03T00:19:23.829492 to 2026-02-05T22:00:00.060425
-  - Record types: {'event_sanity_ok': 64, 'minute_inference': 3873, 'aggression_minute': 3873, 'zone_tracker_debug': 3873}
-- **liq_debug.jsonl**: 3483.6 KB, 5772 lines
+- **liq_debug.jsonl**: 7844.5 KB, 13199 lines
+  - Date range: 2026-02-03T00:19:23.829492 to 2026-02-06T15:33:00.028980
+  - Record types: {'event_sanity_ok': 164, 'minute_inference': 4345, 'aggression_minute': 4345, 'zone_tracker_debug': 4345}
+- **liq_debug.jsonl**: 3489.3 KB, 5772 lines
   - Date range: 2026-01-26T21:05:44.341176 to 2026-01-28T19:15:00.156714
   - Record types: {'event_sanity_ok': 246, 'aggression_minute': 2763, 'zone_tracker_debug': 2763}
-- **liq_debug.20260203_0019.jsonl**: 1405.6 KB, 2460 lines
-  - Date range: 2026-01-28T20:15:00.174471 to 2026-01-30T06:59:00.032836
-  - Record types: {'minute_inference': 760, 'aggression_minute': 760, 'zone_tracker_debug': 760, 'event_sanity_ok': 180}
 
 ### INFERENCE
-- **liq_inference.jsonl**: 2646.6 KB, 2120 lines
-  - Date range: 2026-01-29T01:21:00.171194 to 2026-02-05T21:59:00.000116
-  - Record types: {'inference': 2120}
-- **liq_inference.jsonl**: 776.6 KB, 1019 lines
-  - Date range: 2026-01-27T03:02:00.063097 to 2026-01-29T00:13:00.203527
+- **liq_inference.jsonl**: 2705.2 KB, 2161 lines
+  - Date range: 2026-01-28T20:21:00.171194 to 2026-02-06T15:33:00.005938
+  - Record types: {'inference': 2161}
+- **liq_inference.jsonl**: 777.6 KB, 1019 lines
+  - Date range: 2026-01-26T22:02:00.063097 to 2026-01-28T19:13:00.203527
   - Record types: {'inference': 1019}
 
 ### SWEEPS
-- **liq_sweeps.jsonl**: 1052.2 KB, 5460 lines
-  - Date range: 2026-01-29T01:28:00.233310 to 2026-02-05T21:57:00.026606
-  - Record types: {'sweep': 5460}
+- **liq_sweeps.jsonl**: 1170.5 KB, 6037 lines
+  - Date range: 2026-01-28T20:28:00.233310 to 2026-02-06T15:18:00.015284
+  - Record types: {'sweep': 6037}
 - **liq_sweeps.jsonl**: 0.0 KB, 0 lines
   - Date range: N/A to N/A
   - Record types: {}
 
 ### TAPE
-- **liq_tape.jsonl**: 2418.9 KB, 13620 lines
-  - Date range: 2026-01-29T01:16:52.296102 to 2026-02-05T22:00:35.533103
-  - Record types: {'forceOrder': 13620}
-- **liq_tape.jsonl**: 307.8 KB, 1732 lines
-  - Date range: 2026-01-27T02:05:44.342177 to 2026-01-29T00:15:34.199592
+- **liq_tape.jsonl**: 2673.2 KB, 14963 lines
+  - Date range: 2026-01-28T20:16:52.296102 to 2026-02-06T15:24:19.551155
+  - Record types: {'forceOrder': 14963}
+- **liq_tape.jsonl**: 309.5 KB, 1732 lines
+  - Date range: 2026-01-26T21:05:44.342177 to 2026-01-28T19:15:34.199592
   - Record types: {'forceOrder': 1732}
 
 ### PLOT_FEED
-- **plot_feed.jsonl**: 1321.2 KB, 3873 lines
-  - Date range: 2026-02-03T05:20:00.055581 to 2026-02-05T22:00:00.072332
-  - Record types: {'NO_TYPE': 3873}
-- **plot_feed.jsonl**: 792.5 KB, 2763 lines
-  - Date range: 2026-01-27T02:06:00.009113 to 2026-01-29T00:15:00.157714
+- **plot_feed.jsonl**: 1489.2 KB, 4345 lines
+  - Date range: 2026-02-03T00:20:00.055581 to 2026-02-06T15:33:00.028980
+  - Record types: {'NO_TYPE': 4345}
+- **plot_feed.jsonl**: 795.2 KB, 2763 lines
+  - Date range: 2026-01-26T21:06:00.009113 to 2026-01-28T19:15:00.157714
   - Record types: {'NO_TYPE': 2763}
-- **plot_feed.20260203_0019.jsonl**: 257.9 KB, 760 lines
-  - Date range: 2026-01-29T01:15:00.181014 to 2026-01-30T06:59:00.041859
+- **plot_feed.20260203_0019.jsonl**: 258.7 KB, 760 lines
+  - Date range: 2026-01-28T20:15:00.181014 to 2026-01-30T01:59:00.041859
   - Record types: {'NO_TYPE': 760}
 
-**Total forceOrder events loaded**: 15328
-- Long: 10318
-- Short: 5010
-- Date range: 2026-01-26T21:09:17.337410 to 2026-02-05T17:00:35.511905
+**Total forceOrder events loaded**: 3051
+- Long: 1363
+- Short: 1688
+- Date range: 2026-01-26T21:09:17.337410 to 2026-02-06T15:24:19.551155
 
 ## B. Metric Definitions
 
@@ -109,25 +103,25 @@ negative = zone created after event (reactive/same-event)
 
 | Lookback | 0.10% | 0.25% | 0.50% | 1.00% |
 |---|---|---|---|---|
-| 0m | 0.7% | 1.7% | 3.3% | 4.9% |
-| 1m | 1.2% | 2.5% | 4.4% | 6.7% |
-| 5m | 2.1% | 3.8% | 6.6% | 10.5% |
-| 15m | 4.3% | 6.9% | 10.3% | 15.0% |
+| 0m | 43.5% | 43.5% | 43.5% | 43.5% |
+| 1m | 43.5% | 43.5% | 43.5% | 43.5% |
+| 5m | 43.5% | 43.5% | 43.5% | 43.5% |
+| 15m | 43.5% | 43.5% | 43.5% | 43.5% |
 
 **Gap Rate (no zone available) (%):**
 
 | Lookback | 0.10% | 0.25% | 0.50% | 1.00% |
 |---|---|---|---|---|
-| 0m | 75.2% | 75.2% | 75.2% | 75.2% |
-| 1m | 65.6% | 65.6% | 65.6% | 65.6% |
-| 5m | 46.7% | 46.7% | 46.7% | 46.7% |
-| 15m | 29.7% | 29.7% | 29.7% | 29.7% |
+| 0m | 56.4% | 56.4% | 56.4% | 56.4% |
+| 1m | 56.4% | 56.4% | 56.4% | 56.4% |
+| 5m | 56.4% | 56.4% | 56.4% | 56.4% |
+| 15m | 56.4% | 56.4% | 56.4% | 56.4% |
 
 **Sample (5m lookback, 0.50% tolerance):**
-- Hits: 1019
-- Gaps: 7163
-- Misses: 7146
-- Total: 15328
+- Hits: 1328
+- Gaps: 1721
+- Misses: 2
+- Total: 3051
 
 ### Inference-only Zones
 
@@ -135,25 +129,25 @@ negative = zone created after event (reactive/same-event)
 
 | Lookback | 0.10% | 0.25% | 0.50% | 1.00% |
 |---|---|---|---|---|
-| 0m | 4.0% | 8.4% | 12.6% | 17.5% |
-| 1m | 6.5% | 12.9% | 19.3% | 26.4% |
-| 5m | 12.3% | 19.6% | 27.0% | 36.2% |
-| 15m | 17.2% | 23.4% | 29.8% | 38.4% |
+| 0m | 0.0% | 0.1% | 2.9% | 3.1% |
+| 1m | 0.1% | 0.4% | 4.4% | 4.9% |
+| 5m | 1.0% | 2.5% | 5.2% | 5.5% |
+| 15m | 2.7% | 3.8% | 5.3% | 5.5% |
 
 **Gap Rate (no zone available) (%):**
 
 | Lookback | 0.10% | 0.25% | 0.50% | 1.00% |
 |---|---|---|---|---|
-| 0m | 63.6% | 63.6% | 63.6% | 63.6% |
-| 1m | 43.8% | 43.8% | 43.8% | 43.8% |
-| 5m | 20.9% | 20.9% | 20.9% | 20.9% |
-| 15m | 19.4% | 19.4% | 19.4% | 19.4% |
+| 0m | 96.9% | 96.9% | 96.9% | 96.9% |
+| 1m | 95.1% | 95.1% | 95.1% | 95.1% |
+| 5m | 94.5% | 94.5% | 94.5% | 94.5% |
+| 15m | 94.5% | 94.5% | 94.5% | 94.5% |
 
 **Sample (5m lookback, 0.50% tolerance):**
-- Hits: 4134
-- Gaps: 3208
-- Misses: 7986
-- Total: 15328
+- Hits: 159
+- Gaps: 2884
+- Misses: 8
+- Total: 3051
 
 ### Combined Zones
 
@@ -161,25 +155,25 @@ negative = zone created after event (reactive/same-event)
 
 | Lookback | 0.10% | 0.25% | 0.50% | 1.00% |
 |---|---|---|---|---|
-| 0m | 4.7% | 10.0% | 15.2% | 21.2% |
-| 1m | 7.6% | 15.0% | 22.1% | 29.9% |
-| 5m | 13.9% | 21.9% | 29.6% | 38.5% |
-| 15m | 19.7% | 26.1% | 32.4% | 40.1% |
+| 0m | 43.5% | 43.5% | 43.5% | 43.5% |
+| 1m | 43.5% | 43.5% | 43.5% | 43.5% |
+| 5m | 43.5% | 43.5% | 43.5% | 43.5% |
+| 15m | 43.5% | 43.5% | 43.5% | 43.5% |
 
 **Gap Rate (no zone available) (%):**
 
 | Lookback | 0.10% | 0.25% | 0.50% | 1.00% |
 |---|---|---|---|---|
-| 0m | 48.0% | 48.0% | 48.0% | 48.0% |
-| 1m | 31.8% | 31.8% | 31.8% | 31.8% |
-| 5m | 19.6% | 19.6% | 19.6% | 19.6% |
-| 15m | 19.4% | 19.4% | 19.4% | 19.4% |
+| 0m | 56.4% | 56.4% | 56.4% | 56.4% |
+| 1m | 56.4% | 56.4% | 56.4% | 56.4% |
+| 5m | 56.4% | 56.4% | 56.4% | 56.4% |
+| 15m | 56.4% | 56.4% | 56.4% | 56.4% |
 
 **Sample (5m lookback, 0.50% tolerance):**
-- Hits: 4533
-- Gaps: 3009
-- Misses: 7786
-- Total: 15328
+- Hits: 1328
+- Gaps: 1721
+- Misses: 2
+- Total: 3051
 
 ## D. Lead-Time Analysis
 
@@ -188,83 +182,83 @@ negative = zone created after event (reactive/same-event)
 - Negative/zero lead-time = zone created AT/AFTER event (reactive)
 
 ### Tape-only Lead Times
-- N: 1019
+- N: 1328
 - P50: 0.0s
 - P90: 0.0s
 - P95: 0.0s
 - % with lead_time <= 0: 100.0%
 
 ### Inference-only Lead Times
-- N: 4134
-- P50: 4.7m
-- P90: 5.8m
-- P95: 5.9m
+- N: 159
+- P50: 5.1m
+- P90: 5.7m
+- P95: 5.8m
 - % with lead_time <= 0: 0.0%
 
 ## E. Reaction/SR Validity Metrics
 
-Analysis of 26526 inference zones:
-- Touch rate: 0.6%
-- Reaction rate (20bps reversal): 0.6%
-- Sweep rate (20bps continuation): 0.2%
+Analysis of 27100 inference zones:
+- Touch rate: 0.0%
+- Reaction rate (20bps reversal): 0.0%
+- Sweep rate (20bps continuation): 0.0%
 
 ### By Strength Quartile
 | Quartile | N | Touch % | React % | Sweep % |
 |---|---|---|---|---|
-| Q1 | 6631 | 0.4% | 0.4% | 0.1% |
-| Q2 | 6631 | 1.0% | 1.0% | 0.4% |
-| Q3 | 6631 | 0.8% | 0.8% | 0.2% |
-| Q4 | 6633 | 0.5% | 0.5% | 0.2% |
+| Q1 | 6775 | 0.0% | 0.0% | 0.0% |
+| Q2 | 6775 | 0.0% | 0.0% | 0.0% |
+| Q3 | 6775 | 0.0% | 0.0% | 0.0% |
+| Q4 | 6775 | 0.0% | 0.0% | 0.0% |
 
 ## F. Long/Short Asymmetry Diagnostics
 
 ### By Side
 | Side | N | Gap Rate | Hit Rate (0.5%) | Miss Dist P50 |
 |---|---|---|---|---|
-| long | 10318 | 17.1% | 38.9% | 0.624% |
-| short | 5010 | 24.8% | 10.5% | 2.822% |
+| long | 1363 | 62.5% | 37.3% | 0.007% |
+| short | 1688 | 51.5% | 48.5% | 0.007% |
 
 ### By Buy Weight Bucket
 | Bucket | N | Gap Rate | Hit Rate (0.5%) | Miss Dist P50 |
 |---|---|---|---|---|
-| low (bw) | 129 | 4.7% | 73.6% | 0.313% |
-| mid (bw) | 12082 | 0.3% | 36.0% | 1.279% |
-| high (bw) | 140 | 0.0% | 62.1% | 0.392% |
+| low (bw) | 1 | 0.0% | 100.0% | 0.006% |
+| mid (bw) | 1329 | 0.0% | 99.8% | 0.007% |
+| high (bw) | 0 | 0.0% | 0.0% | N/A |
 
 ### By OI Delta
 | OI Delta | N | Gap Rate | Hit Rate (0.5%) | Miss Dist P50 |
 |---|---|---|---|---|
-| negative | 6411 | 0.5% | 34.1% | 1.638% |
-| zero | 3 | 100.0% | 0.0% | N/A |
-| positive | 5937 | 0.1% | 39.5% | 0.916% |
+| negative | 583 | 0.0% | 99.8% | 0.008% |
+| zero | 2 | 0.0% | 100.0% | 0.004% |
+| positive | 745 | 0.0% | 99.9% | 0.007% |
 
 ## G. Approach Pipeline Audit
 
-- Total minutes analyzed: 4633
-- Total approach candidates: 25904
-- Total used: 11736
-- Total skipped: 14168
+- Total minutes analyzed: 472
+- Total approach candidates: 2408
+- Total used: 1181
+- Total skipped: 1227
 
 ### Skip Reasons
 | Reason | Count |
 |---|---|
-| unknown | 14168 |
+| unknown | 1227 |
 
 ## H. Inference Gap Audit
 
-- Total events: 15328
-- Events WITH inference zone (5m lookback): 12120
-- Events WITHOUT inference zone: 3208
+- Total events: 3051
+- Events WITH inference zone (5m lookback): 167
+- Events WITHOUT inference zone: 2884
 
 ### Gap Root Causes
 | Cause | Count | % of Gaps |
 |---|---|---|
-| oi_delta_negative | 216 | 6.7% |
-| oi_delta_zero | 3 | 0.1% |
-| no_context | 2970 | 92.6% |
-| unknown | 19 | 0.6% |
+| oi_delta_negative | 511 | 17.7% |
+| oi_delta_zero | 2 | 0.1% |
+| no_context | 1721 | 59.7% |
+| unknown | 650 | 22.5% |
 
-**Top cause**: `no_context` (2970 gaps)
+**Top cause**: `no_context` (1721 gaps)
 
 ## I. Calibrator Sanity Checks
 
@@ -272,11 +266,11 @@ Analysis of 26526 inference zones:
 
 | Leverage | N | Median | MAD | P05 | P95 | Long | Short |
 |---|---|---|---|---|---|---|---|
-| 10x | 213 | $-65485 | $3730 | $-80826 | $-56962 | 133 | 80 |
-| 50x (N<30, excluded) | 25 | $507 | $74 | $-31 | $583 | 3 | 22 |
-| 75x | 37 | $178 | $133 | $-270 | $315 | 16 | 21 |
-| 100x (N<30, excluded) | 13 | $-262 | $39 | $-321 | $183 | 12 | 1 |
-| 125x | 13320 | $210 | $77 | $-354 | $453 | 9303 | 4017 |
+| 10x (N<30, excluded) | 3 | $-58205 | $68 | $-66645 | $-58136 | 2 | 1 |
+| 50x (N<30, excluded) | 7 | $206 | $36 | $76 | $251 | 0 | 7 |
+| 75x (N<30, excluded) | 7 | $48 | $6 | $-8 | $137 | 0 | 7 |
+| 100x (N<30, excluded) | 1 | $211 | $0 | $211 | $211 | 0 | 1 |
+| 125x | 1312 | $-233 | $153 | $-408 | $390 | 509 | 803 |
 
 ### Sign Convention (from code)
 File: `liq_calibrator.py`
@@ -287,7 +281,7 @@ miss_usd = event_price - nearest_implied_corrected
 - Negative miss_usd: event occurred CLOSER to entry than predicted
 
 ### Potential Outliers Detected
-- 10x: median=$-65485, MAD=$3730
+- 10x: median=$-58205, MAD=$68
 
 ## Top 3 Fixes (Evidence-Based)
 
@@ -312,7 +306,7 @@ Reweight to favor high leverage: {125: 0.15, 150: 0.20, 200: 0.15, 250: 0.10}
 ### Fix 2: Add OI Memory for Projection Persistence
 
 **Evidence:**
-- Top gap cause: `no_context` (2970 gaps)
+- Top gap cause: `no_context` (1721 gaps)
 - Projections only created when OI delta > 0
 - ~50% of minutes have negative OI delta (positions closing)
 
@@ -331,7 +325,7 @@ Add rolling OI memory:
 ### Fix 3: Add Skip Reason Logging to Approach Pipeline
 
 **Evidence:**
-- 14168 candidates skipped but reason unknown
+- 1227 candidates skipped but reason unknown
 - Cannot diagnose why good candidates are filtered out
 
 **Change:**
