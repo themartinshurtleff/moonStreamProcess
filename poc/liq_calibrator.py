@@ -173,11 +173,19 @@ DEBUG_UNREACHED_ZONES = True  # Set to False to disable per-zone penalty logging
 
 # === PHASE 3: PERCENT-BASED ADAPTIVE BIAS ===
 # EMA update rate for bias correction (slow, reversible)
-BIAS_ETA = 0.05
-# Maximum bias cap (±0.30% of price)
-BIAS_CAP = 0.003
+# Changed 2026-02-10: was 0.05, increased to 0.10 for faster convergence
+BIAS_ETA = 0.10
+# Maximum bias cap (±0.80% of price)
+# Changed 2026-02-10: was 0.003 (0.30%), increased to 0.008 (0.80%)
+# Reason: Actual systematic bias is ~0.6% ($420 at $70k), old cap limited correction to 0.3%
+BIAS_CAP = 0.008
 # Minimum samples required to update bias per cycle
 MIN_BIAS_SAMPLES = 10
+
+# === HIT BUCKET TOLERANCE OVERRIDE ===
+# Force hit_bucket_tolerance to this value regardless of saved weights file
+# Changed 2026-02-10: was 7 (from saved weights), reduced to 4 for tighter matching
+HIT_BUCKET_TOLERANCE = 4
 
 # Epsilon for numerical stability
 EPS = 1e-9
@@ -498,6 +506,13 @@ class LiquidationCalibrator:
 
             logger.info(f"  Calibration count: {self.calibration_count}")
             logger.info(f"  Bias pct: long={self.bias_pct_long:.5f}, short={self.bias_pct_short:.5f}")
+            logger.info(f"  Bias config: BIAS_ETA={BIAS_ETA}, BIAS_CAP={BIAS_CAP:.4f} ({BIAS_CAP*100:.2f}%)")
+
+            # Override hit_bucket_tolerance with constant (2026-02-10 tuning)
+            if self.hit_bucket_tolerance != HIT_BUCKET_TOLERANCE:
+                logger.info(f"  Overriding hit_bucket_tolerance: {self.hit_bucket_tolerance} -> {HIT_BUCKET_TOLERANCE}")
+                self.hit_bucket_tolerance = HIT_BUCKET_TOLERANCE
+
             return True
 
         except Exception as e:
@@ -2040,6 +2055,10 @@ class LiquidationCalibrator:
             self.bias_pct_long = max(-BIAS_CAP, min(BIAS_CAP, new_bias_long))
             bias_update_info['long_updated'] = True
 
+            # Warn if bias is hitting cap (indicates need for larger BIAS_CAP)
+            if abs(self.bias_pct_long) >= BIAS_CAP * 0.95:
+                logger.warning(f"Long bias at cap: {self.bias_pct_long:.5f} (cap={BIAS_CAP:.4f}), unclamped={new_bias_long:.5f}")
+
         # Short bias update (only if enough samples)
         if len(self.stats.short_miss_pct) >= MIN_BIAS_SAMPLES:
             # Use median as robust aggregate
@@ -2053,11 +2072,16 @@ class LiquidationCalibrator:
             self.bias_pct_short = max(-BIAS_CAP, min(BIAS_CAP, new_bias_short))
             bias_update_info['short_updated'] = True
 
+            # Warn if bias is hitting cap (indicates need for larger BIAS_CAP)
+            if abs(self.bias_pct_short) >= BIAS_CAP * 0.95:
+                logger.warning(f"Short bias at cap: {self.bias_pct_short:.5f} (cap={BIAS_CAP:.4f}), unclamped={new_bias_short:.5f}")
+
         # Keep old USD offset tuning for backward compatibility (deprecated)
         # Now with robust update (median) and clamping
         old_long_offset = self.long_offset_usd
         old_short_offset = self.short_offset_usd
-        offset_lr = 0.3
+        # Changed 2026-02-10: was 0.3, increased to 0.5 for faster offset convergence
+        offset_lr = 0.5
         offset_clamped_long = False
         offset_clamped_short = False
 
