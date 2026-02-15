@@ -489,7 +489,7 @@ def create_embedded_app(
     @app.get("/v1/liq_heatmap_history")
     async def liq_heatmap_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
-        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
     ):
         """Get historical V1 liquidation heatmap data."""
@@ -592,7 +592,7 @@ def create_embedded_app(
     @app.get("/v2/liq_heatmap_history")
     async def liq_heatmap_history_v2(
         symbol: str = Query(default="BTC", description="Symbol to query"),
-        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
     ):
         """Get historical V2 liquidation heatmap data."""
@@ -796,7 +796,7 @@ def create_embedded_app(
     @app.get("/v2/orderbook_heatmap_30s_history")
     async def orderbook_heatmap_30s_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
-        minutes: int = Query(default=360, description="Minutes of history (clamped 5..720)"),
+        minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..60)"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),

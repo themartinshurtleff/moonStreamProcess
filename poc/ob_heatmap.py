@@ -1023,7 +1023,7 @@ class OrderbookHeatmapBuffer:
 
     def get_frames(
         self,
-        minutes: int = 360,
+        minutes: int = 720,  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = 1
     ) -> List[OrderbookFrame]:
         """
