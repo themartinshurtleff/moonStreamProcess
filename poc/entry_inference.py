@@ -27,6 +27,13 @@ from typing import Dict, List, Tuple, Optional
 
 from leverage_config import is_tier_disabled, get_tier_weight, log_disabled_tiers, DISABLED_TIERS
 
+# V3: Import zone manager for persistent zones
+try:
+    from active_zone_manager import ActiveZoneManager, get_zone_manager
+except ImportError:
+    ActiveZoneManager = None
+    get_zone_manager = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,7 +108,8 @@ class EntryInference:
         leverage_weights: Dict[int, float] = None,
         log_file: str = None,
         debug_log_file: str = None,
-        sweep_log_file: str = None
+        sweep_log_file: str = None,
+        zone_manager: 'ActiveZoneManager' = None  # V3: Persistent zone manager
     ):
         self.symbol = symbol
         self.steps = steps
@@ -154,8 +162,13 @@ class EntryInference:
             except Exception as e:
                 logger.warning(f"Could not open sweep log file: {e}")
 
+        # V3: Persistent zone manager (optional)
+        self.zone_manager = zone_manager
+
         # V3: Log disabled tiers at startup
         logger.info(f"EntryInference initialized for {symbol}")
+        if zone_manager:
+            logger.info(f"  Using ActiveZoneManager for persistent zones")
         log_disabled_tiers()
 
     def _bucket_price(self, price: float) -> float:
@@ -428,6 +441,19 @@ class EntryInference:
             buckets[bucket].inference_count += 1
             buckets[bucket].peak_size_usd = max(buckets[bucket].peak_size_usd, size_contribution)
 
+            # V3: Create or reinforce in persistent zone manager
+            if self.zone_manager:
+                # Weight is normalized size_contribution (as fraction of typical notional)
+                zone_weight = size_contribution / 100000.0  # Normalize to reasonable range
+                self.zone_manager.create_or_reinforce(
+                    price=bucket,
+                    side=side,
+                    weight=zone_weight,
+                    source="inference",
+                    tier=leverage,
+                    confidence=confidence
+                )
+
             # Track totals
             if side == "long":
                 self.total_inferred_long_usd += size_contribution
@@ -447,6 +473,12 @@ class EntryInference:
 
             for price in to_remove:
                 del buckets[price]
+
+        # V3: Apply decay and expiration to persistent zone manager
+        if self.zone_manager:
+            expired = self.zone_manager.apply_decay_and_expire(self.current_price)
+            if expired > 0:
+                logger.debug(f"[{self.symbol}] Zone manager expired {expired} zones")
 
     def _reduce_projections(self, buckets: Dict[float, PositionBucket], pct: float) -> None:
         """Reduce projection sizes by percentage (for position closing)."""
@@ -526,6 +558,12 @@ class EntryInference:
                 self._sweep_log_fh.flush()
 
             del self.projected_long_liqs[price]
+
+        # V3: Sweep zones in persistent zone manager
+        if self.zone_manager:
+            swept_zones = self.zone_manager.sweep(high, low, minute_key)
+            if swept_zones:
+                logger.debug(f"[{self.symbol}] Zone manager swept {len(swept_zones)} persistent zones")
 
         return swept_long, swept_short, swept_long_notional, swept_short_notional
 

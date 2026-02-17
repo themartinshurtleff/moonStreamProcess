@@ -24,6 +24,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 
+# V3: Import zone manager for persistent zones
+try:
+    from active_zone_manager import ActiveZoneManager
+except ImportError:
+    ActiveZoneManager = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +74,8 @@ class LiquidationTape:
         decay: float = DEFAULT_DECAY,
         retention_minutes: int = RETENTION_MINUTES,
         log_file: str = None,
-        sweep_log_file: str = None
+        sweep_log_file: str = None,
+        zone_manager: 'ActiveZoneManager' = None  # V3: Persistent zone manager
     ):
         self.symbol = symbol
         self.steps = steps
@@ -109,6 +116,11 @@ class LiquidationTape:
                 self._sweep_log_fh = open(sweep_log_file, 'a')
             except Exception as e:
                 logger.warning(f"Could not open sweep log file: {e}")
+
+        # V3: Persistent zone manager (optional)
+        self.zone_manager = zone_manager
+        if zone_manager:
+            logger.info(f"[{symbol}] LiquidationTape using ActiveZoneManager for persistent zones")
 
     def _bucket_price(self, price: float) -> float:
         """Round price to nearest bucket."""
@@ -174,6 +186,19 @@ class LiquidationTape:
         # Learn offset distribution if entry estimate provided
         if entry_estimate and entry_estimate > 0:
             self._learn_offset(side, price, entry_estimate)
+
+        # V3: Create or reinforce zone in persistent zone manager
+        # Tape events have high confidence - they are actual liquidations
+        if self.zone_manager:
+            # Weight based on notional (normalized to reasonable range)
+            zone_weight = notional / 100000.0
+            self.zone_manager.create_or_reinforce(
+                price=bucket,
+                side=side,
+                weight=zone_weight,
+                source="tape",
+                confidence=1.0  # Tape events are ground truth
+            )
 
         # Log to JSONL
         if self._log_fh:
@@ -313,6 +338,12 @@ class LiquidationTape:
                 self._sweep_log_fh.flush()
 
             del self.long_liqs[price]
+
+        # V3: Sweep zones in persistent zone manager
+        if self.zone_manager:
+            swept_zones = self.zone_manager.sweep(high, low, minute_key)
+            if swept_zones:
+                logger.debug(f"[{self.symbol}] Zone manager swept {len(swept_zones)} persistent zones from tape")
 
         return swept_count, swept_notional
 

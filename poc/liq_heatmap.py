@@ -25,6 +25,15 @@ from typing import Dict, List, Optional, Tuple
 from liq_tape import LiquidationTape
 from entry_inference import EntryInference
 
+# V3: Import zone manager for persistent zones
+try:
+    from active_zone_manager import ActiveZoneManager, get_zone_manager
+    HAS_ZONE_MANAGER = True
+except ImportError:
+    ActiveZoneManager = None
+    get_zone_manager = None
+    HAS_ZONE_MANAGER = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,13 +84,28 @@ class LiquidationHeatmap:
         inference_log = os.path.join(log_dir, "liq_inference.jsonl") if log_dir else None
         sweep_log = os.path.join(log_dir, "liq_sweeps.jsonl") if log_dir else None
         debug_log = os.path.join(log_dir, "liq_debug.jsonl") if log_dir else None
+        zone_log = os.path.join(log_dir, "liq_zones.jsonl") if log_dir else None
+        zone_persist = os.path.join(log_dir, "liq_active_zones.json") if log_dir else None
+
+        # V3: Create shared zone manager for persistent zones
+        self.zone_manager = None
+        if HAS_ZONE_MANAGER and log_dir:
+            self.zone_manager = ActiveZoneManager(
+                symbol=self.config.symbol,
+                steps=self.config.steps,
+                persist_file=zone_persist,
+                zone_log_file=zone_log,
+                auto_persist=True
+            )
+            logger.info(f"  V3 zone manager enabled: {zone_persist}")
 
         self.tape = LiquidationTape(
             symbol=self.config.symbol,
             steps=self.config.steps,
             decay=self.config.decay,
             log_file=tape_log,
-            sweep_log_file=sweep_log
+            sweep_log_file=sweep_log,
+            zone_manager=self.zone_manager  # V3: Share zone manager
         )
 
         self.inference = EntryInference(
@@ -91,7 +115,8 @@ class LiquidationHeatmap:
             decay=self.config.decay,
             log_file=inference_log,
             debug_log_file=debug_log,
-            sweep_log_file=sweep_log
+            sweep_log_file=sweep_log,
+            zone_manager=self.zone_manager  # V3: Share zone manager
         )
 
         # State tracking
@@ -205,6 +230,12 @@ class LiquidationHeatmap:
         )
 
         self.total_inferences += len(inferences)
+
+        # V3: Merge nearby zones and log summary (every minute)
+        if self.zone_manager:
+            merges = self.zone_manager.merge_nearby_zones()
+            if merges > 0:
+                logger.debug(f"[{self.config.symbol}] Zone manager merged {merges} nearby zones")
 
         # Periodic tape learning push to inference
         if minute_key - self.last_tape_learning_push >= self.tape_learning_interval:
@@ -508,7 +539,7 @@ class LiquidationHeatmap:
 
     def get_stats(self) -> dict:
         """Get comprehensive statistics."""
-        return {
+        stats = {
             "symbol": self.config.symbol,
             "current_minute": self.current_minute,
             "current_price": self.current_price,
@@ -524,11 +555,18 @@ class LiquidationHeatmap:
                 "projection_weight": self.config.projection_weight
             }
         }
+        # V3: Add zone manager stats if available
+        if self.zone_manager:
+            stats["zone_manager"] = self.zone_manager.get_summary()
+        return stats
 
     def close(self):
         """Clean up resources."""
         self.tape.close()
         self.inference.close()
+        # V3: Stop zone manager (saves state to disk)
+        if self.zone_manager:
+            self.zone_manager.stop()
 
 
 # Factory function for easy initialization

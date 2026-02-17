@@ -77,8 +77,17 @@ except ImportError as e:
 except Exception as e:
     OB_HEATMAP_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
+# V3: Import active zone manager for persistent zones
+HAS_ZONE_MANAGER = False
+try:
+    from active_zone_manager import get_zone_manager, ActiveZoneManager
+    HAS_ZONE_MANAGER = True
+except ImportError:
+    get_zone_manager = None
+    ActiveZoneManager = None
+
 # API version
-API_VERSION = "2.0.0"
+API_VERSION = "3.0.0"  # V3 with zone lifecycle support
 
 # Cache refresh interval
 CACHE_REFRESH_INTERVAL = 1.0  # seconds
@@ -1169,6 +1178,129 @@ def create_app() -> FastAPI:
 
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail="V2 snapshot file corrupted")
+
+    # =========================================================================
+    # V3 Zone Lifecycle Endpoints (Persistent Zones)
+    # =========================================================================
+
+    @app.get("/v3/liq_zones")
+    async def liq_zones_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        side: str = Query(default=None, description="Filter by side: 'long' or 'short'"),
+        min_leverage: int = Query(default=None, description="Minimum leverage tier to include"),
+        max_leverage: int = Query(default=None, description="Maximum leverage tier to include"),
+        min_weight: float = Query(default=None, description="Minimum zone weight to include")
+    ):
+        """
+        Get V3 active liquidation zones from zone lifecycle manager.
+
+        Returns persistent zones with lifecycle tracking:
+        - CREATED: New zones from inference or tape
+        - REINFORCED: Zones strengthened by repeated predictions
+        - (Zones are removed when SWEPT by price or EXPIRED by time/decay)
+
+        Query parameters allow filtering by side and leverage tier.
+        This enables leverage-level filtering for heatmap display.
+
+        Response format:
+        {
+            "symbol": "BTC",
+            "ts": 1234567890.123,
+            "zones": [
+                {
+                    "price": 92000.0,
+                    "side": "long",
+                    "weight": 1.2345,
+                    "created_at": 1234567890123,
+                    "last_reinforced_at": 1234567900123,
+                    "reinforcement_count": 5,
+                    "source": "combined",
+                    "tier_contributions": {"25": 0.5, "50": 0.3, "75": 0.2}
+                }, ...
+            ],
+            "summary": {
+                "active_zones_long": 15,
+                "active_zones_short": 12,
+                "total_weight_long": 8.5,
+                "total_weight_short": 6.2,
+                ...
+            }
+        }
+        """
+        if not HAS_ZONE_MANAGER:
+            raise HTTPException(
+                status_code=501,
+                detail="Zone manager not available. Install active_zone_manager module."
+            )
+
+        # Get or create zone manager instance
+        zone_mgr = get_zone_manager(symbol=symbol, persist_dir=POC_DIR, create_if_missing=True)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialize zone manager"
+            )
+
+        # Get active zones with filters
+        zones = zone_mgr.get_active_zones(
+            side=side,
+            min_leverage=min_leverage,
+            max_leverage=max_leverage
+        )
+
+        # Apply min_weight filter if specified
+        if min_weight is not None and min_weight > 0:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+
+        # Get summary stats
+        summary = zone_mgr.get_summary()
+
+        response = {
+            "symbol": symbol,
+            "ts": time.time(),
+            "zones": zones,
+            "zones_count": len(zones),
+            "summary": summary,
+            "filters": {
+                "side": side,
+                "min_leverage": min_leverage,
+                "max_leverage": max_leverage,
+                "min_weight": min_weight
+            }
+        }
+
+        return JSONResponse(content=response)
+
+    @app.get("/v3/liq_zones_summary")
+    async def liq_zones_summary_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query")
+    ):
+        """
+        Get V3 zone lifecycle summary statistics.
+
+        Returns counts and totals for zone lifecycle tracking:
+        - Active zone counts by side
+        - Total weights by side
+        - Lifecycle counters (created, reinforced, swept, expired, merged)
+        """
+        if not HAS_ZONE_MANAGER:
+            raise HTTPException(
+                status_code=501,
+                detail="Zone manager not available."
+            )
+
+        zone_mgr = get_zone_manager(symbol=symbol, persist_dir=POC_DIR, create_if_missing=True)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialize zone manager"
+            )
+
+        summary = zone_mgr.get_summary()
+        summary["symbol"] = symbol
+        summary["ts"] = time.time()
+
+        return JSONResponse(content=summary)
 
     # =========================================================================
     # Orderbook Heatmap Endpoints (30s DoM screenshots)
