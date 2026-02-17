@@ -313,6 +313,11 @@ class EntryInference:
                 self._reduce_projections(self.projected_long_liqs, close_factor)
                 self._reduce_projections(self.projected_short_liqs, close_factor)
 
+                # V3: Also apply close_factor to zone manager weights
+                # This reduces zone weights when OI drops, improving accuracy
+                if self.zone_manager:
+                    self._apply_oi_decay_to_zones(close_factor)
+
                 logger.debug(
                     f"[{self.symbol}] CLOSING: oi_delta={oi_delta:,.0f} "
                     f"close_factor={close_factor:.3f} total_projected={total_projected:,.0f}"
@@ -491,6 +496,22 @@ class EntryInference:
         for price in to_remove:
             del buckets[price]
 
+    def _apply_oi_decay_to_zones(self, close_factor: float) -> None:
+        """
+        V3: Apply OI-based decay to persistent zone weights.
+
+        When OI drops, positions are closing. This should reduce zone weights
+        proportionally to reflect the reduced liquidation potential.
+        """
+        if not self.zone_manager:
+            return
+
+        # Access zone manager internals to apply decay
+        # This is a direct weight reduction based on position closing
+        with self.zone_manager._lock:
+            for key, zone in self.zone_manager._zones.items():
+                zone.weight *= (1 - close_factor)
+
     def _sweep(self, high: float, low: float, minute_key: int = 0) -> Tuple[int, int, float, float]:
         """
         Remove projected zones that price has crossed.
@@ -565,7 +586,60 @@ class EntryInference:
             if swept_zones:
                 logger.debug(f"[{self.symbol}] Zone manager swept {len(swept_zones)} persistent zones")
 
+            # V3: Create "magnetic" zones from significant sweeps
+            # When a large sweep occurs, price has shown interest in that level
+            # New positions may open with entries near there, creating future liq potential
+            self._create_sweep_zones(swept_zones, high, low)
+
         return swept_long, swept_short, swept_long_notional, swept_short_notional
+
+    def _create_sweep_zones(self, swept_zones: list, high: float, low: float) -> None:
+        """
+        V3: Create zones from significant sweeps.
+
+        When price sweeps through a zone with significant weight, traders often
+        re-enter positions nearby. This creates "magnetic" zones at levels
+        slightly past the sweep point.
+        """
+        if not self.zone_manager or not swept_zones:
+            return
+
+        SWEEP_WEIGHT_THRESHOLD = 0.5  # Minimum weight to consider significant
+        SWEEP_ZONE_FACTOR = 0.3  # Weight factor for sweep-created zones
+
+        for zone in swept_zones:
+            if zone.weight < SWEEP_WEIGHT_THRESHOLD:
+                continue
+
+            # Create zone slightly past the sweep level
+            # For long sweeps (price went down), create zone below the sweep
+            # For short sweeps (price went up), create zone above the sweep
+            offset = self.steps  # One bucket past
+
+            if zone.side == "long":
+                # Long was swept going down - create zone below
+                new_price = zone.price - offset
+                new_side = "long"  # New longs entering below may liquidate lower
+            else:
+                # Short was swept going up - create zone above
+                new_price = zone.price + offset
+                new_side = "short"  # New shorts entering above may liquidate higher
+
+            # Create the sweep-based zone with reduced weight
+            sweep_weight = zone.weight * SWEEP_ZONE_FACTOR
+
+            self.zone_manager.create_or_reinforce(
+                price=new_price,
+                side=new_side,
+                weight=sweep_weight,
+                source="sweep",
+                confidence=0.5  # Lower confidence for sweep-based zones
+            )
+
+            logger.debug(
+                f"[{self.symbol}] Created sweep zone: {new_side} @ {new_price:.0f} "
+                f"weight={sweep_weight:.3f} (from sweep @ {zone.price:.0f})"
+            )
 
     def update_leverage_weights(self, new_weights: Dict[int, float]) -> None:
         """
