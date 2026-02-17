@@ -31,6 +31,8 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Callable
 import logging
 
+from leverage_config import is_tier_disabled, get_enabled_tiers, log_disabled_tiers, DISABLED_TIERS
+
 logger = logging.getLogger(__name__)
 
 
@@ -447,6 +449,9 @@ class LiquidationCalibrator:
         logger.info(f"  lr={learning_rate}, gamma={closer_level_gamma}")
         if self.current_weights:
             logger.info(f"  Loaded persisted weights: {self.current_weights}")
+
+        # Log disabled tiers at startup
+        log_disabled_tiers()
 
     def _load_weights(self) -> bool:
         """
@@ -1093,7 +1098,14 @@ class LiquidationCalibrator:
         # Find best leverage (highest responsibility)
         best_lev = max(responsibilities.keys(), key=lambda l: responsibilities[l])
 
-        # Track attributed leverage histogram
+        # === DISABLED TIER CHECK ===
+        # If the attributed tier is disabled, skip all calibration updates
+        # but still log the event with tier_disabled flag
+        tier_disabled = is_tier_disabled(best_lev)
+        if tier_disabled:
+            updates_calibration = False  # Do not update calibration for disabled tiers
+
+        # Track attributed leverage histogram (even for disabled tiers, for monitoring)
         if best_lev not in self.stats.attributed_leverage_counts:
             self.stats.attributed_leverage_counts[best_lev] = 0
         self.stats.attributed_leverage_counts[best_lev] += 1
@@ -1214,7 +1226,9 @@ class LiquidationCalibrator:
                 price_insane=price_insane,
                 price_insane_reason=price_insane_reason,
                 offset_used_usd=offset_used_usd,
-                offset_used_pct=offset_used_pct
+                offset_used_pct=offset_used_pct,
+                # V3: Tier disable flag
+                tier_disabled=tier_disabled
             )
 
     def _process_approach_events(self, snapshot: MinuteSnapshot, cache_entry: MinuteCacheEntry) -> None:
@@ -1250,10 +1264,19 @@ class LiquidationCalibrator:
 
         # === PHASE 1: Collect all approach candidates ===
         candidates = []
+        # V3: Track zones that were not approached (for skip reason logging)
+        not_approached = []
         for zone_price, zone_strength, zone_side in all_zones:
             # Check if price approached this zone
             dist_pct = abs(close - zone_price) / close
             if dist_pct > APPROACH_LEARN_PCT:
+                # V3: Track reason for skip
+                not_approached.append({
+                    'zone_price': zone_price,
+                    'zone_side': zone_side,
+                    'dist_pct': dist_pct,
+                    'skip_reason': 'too_far_from_price'
+                })
                 continue  # Not approached
 
             # Zone was approached - mark as reached using integer bucket key
@@ -1360,7 +1383,8 @@ class LiquidationCalibrator:
                 close=close,
                 candidates=candidates,
                 selected=selected,
-                skipped=skipped
+                skipped=skipped,
+                not_approached=not_approached  # V3: Include zones too far from price
             )
 
     def _compute_stress_score_with_breakdown(
@@ -1598,9 +1622,10 @@ class LiquidationCalibrator:
         close: float,
         candidates: List[Dict],
         selected: List[Dict],
-        skipped: List[Dict]
+        skipped: List[Dict],
+        not_approached: List[Dict] = None  # V3: Zones too far from price
     ) -> None:
-        """Log approach throttling summary for this minute with top-K selection details."""
+        """Log approach throttling summary for this minute with top-K selection details and skip reasons."""
         if not self.log_fh:
             return
 
@@ -1631,14 +1656,24 @@ class LiquidationCalibrator:
                 }
             })
 
-        # Build skipped zone summary (just basic info)
+        # Build skipped zone summary with skip reasons (V3)
         skipped_summary = []
         for cand in skipped:
             skipped_summary.append({
                 'zone_price': round(cand['zone_price'], 2),
                 'zone_side': cand['zone_side'],
-                'S_eff': round(cand['S_eff'], 4)
+                'S_eff': round(cand['S_eff'], 4),
+                # V3: Add explicit skip reason
+                'skip_reason': 'not_in_top_k',
+                'rank': candidates.index(cand) + 1  # 1-indexed rank by S_eff
             })
+
+        # V3: Build skip reason summary
+        skip_reasons = {}
+        if skipped:
+            skip_reasons['not_in_top_k'] = len(skipped)
+        if not_approached:
+            skip_reasons['too_far_from_price'] = len(not_approached)
 
         log_entry = {
             'type': 'approach_minute_summary',
@@ -1649,7 +1684,9 @@ class LiquidationCalibrator:
             # Throttling stats
             'approach_candidates': len(candidates),
             'approach_used': len(selected),
-            'approach_skipped': len(skipped),
+            'approach_skipped': len(skipped) + (len(not_approached) if not_approached else 0),
+            # V3: Explicit skip reason breakdown
+            'skip_reasons': skip_reasons,
             # Selected zones with full details
             'selected_zones': selected_details,
             # Skipped zones (just summary)
@@ -2658,7 +2695,9 @@ class LiquidationCalibrator:
         price_insane: bool = False,
         price_insane_reason: Optional[str] = None,
         offset_used_usd: float = 0.0,
-        offset_used_pct: float = 0.0
+        offset_used_pct: float = 0.0,
+        # V3: Tier disable flag
+        tier_disabled: bool = False
     ) -> None:
         """
         Log individual liquidation event with all Phase 0-4 fields.
@@ -2668,6 +2707,7 @@ class LiquidationCalibrator:
         Phase 3: Bias fields (miss_pct, miss_usd, bias_pct)
         Phase 4: Full verification outputs (ladder, implied_levels_raw, implied_levels_corrected)
         Soft attribution: tau_pct, delta_pct, vol_scale
+        V3: tier_disabled flag for excluded leverage tiers
         """
         if not self.log_fh:
             return
@@ -2742,7 +2782,9 @@ class LiquidationCalibrator:
             'price_insane': price_insane,
             'price_insane_reason': price_insane_reason,
             'offset_used_usd': round(offset_used_usd, 2),
-            'offset_used_pct': round(offset_used_pct, 6)
+            'offset_used_pct': round(offset_used_pct, 6),
+            # V3: Tier disable flag
+            'tier_disabled': tier_disabled
         }
 
         self.log_fh.write(json.dumps(log_entry) + '\n')

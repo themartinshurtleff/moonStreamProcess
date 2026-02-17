@@ -273,7 +273,10 @@ class LiquidationTape:
                     "minute_key": minute_key,
                     "side": "short",
                     "bucket": price,
-                    "notional_usd": round(bucket.notional, 2),
+                    # V3: Enhanced sweep logging
+                    "total_notional_usd": round(bucket.notional, 2),
+                    "trade_count": bucket.count,
+                    "peak_notional_usd": round(bucket.notional / max(bucket.count, 1), 2),  # avg as proxy
                     "layer": "tape",
                     "reason": f"high>={price:.0f}",
                     "trigger_high": high
@@ -298,7 +301,10 @@ class LiquidationTape:
                     "minute_key": minute_key,
                     "side": "long",
                     "bucket": price,
-                    "notional_usd": round(bucket.notional, 2),
+                    # V3: Enhanced sweep logging
+                    "total_notional_usd": round(bucket.notional, 2),
+                    "trade_count": bucket.count,
+                    "peak_notional_usd": round(bucket.notional / max(bucket.count, 1), 2),  # avg as proxy
                     "layer": "tape",
                     "reason": f"low<={price:.0f}",
                     "trigger_low": low

@@ -25,6 +25,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 
+from leverage_config import is_tier_disabled, get_tier_weight, log_disabled_tiers, DISABLED_TIERS
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,9 @@ class PositionBucket:
     entry_price: float    # Entry price (for offset calculation)
     last_ts: float
     leverage_est: int     # Estimated leverage tier
+    # V3: Track inference count for sweep logging
+    inference_count: int = 1
+    peak_size_usd: float = 0.0  # Largest single inference at this bucket
 
 
 class EntryInference:
@@ -63,10 +68,11 @@ class EntryInference:
     """
 
     # Default leverage distribution (will be updated by LiquidationTape learning)
+    # V3: 10x tier disabled (set to 0) due to persistent -$62K median miss corruption
     DEFAULT_LEVERAGE_WEIGHTS = {
-        10: 0.05,   # 5% at 10x
-        20: 0.15,   # 15% at 20x
-        25: 0.25,   # 25% at 25x (most common)
+        10: 0.00,   # DISABLED - was 5% at 10x
+        20: 0.18,   # 18% at 20x (redistributed)
+        25: 0.27,   # 27% at 25x (most common, redistributed)
         50: 0.30,   # 30% at 50x
         75: 0.15,   # 15% at 75x
         100: 0.08,  # 8% at 100x
@@ -147,6 +153,10 @@ class EntryInference:
                 self._sweep_log_fh = open(sweep_log_file, 'a')
             except Exception as e:
                 logger.warning(f"Could not open sweep log file: {e}")
+
+        # V3: Log disabled tiers at startup
+        logger.info(f"EntryInference initialized for {symbol}")
+        log_disabled_tiers()
 
     def _bucket_price(self, price: float) -> float:
         """Round price to nearest bucket."""
@@ -372,6 +382,9 @@ class EntryInference:
             return inferences
 
         for leverage, weight in self.leverage_weights.items():
+            # V3: Skip disabled tiers
+            if is_tier_disabled(leverage):
+                continue
             if weight < 0.01:
                 continue
 
@@ -404,11 +417,16 @@ class EntryInference:
                     side=side,
                     entry_price=src_price,
                     last_ts=time.time(),
-                    leverage_est=leverage
+                    leverage_est=leverage,
+                    inference_count=0,
+                    peak_size_usd=0.0
                 )
 
             buckets[bucket].size_usd += size_contribution
             buckets[bucket].last_ts = time.time()
+            # V3: Track inference count and peak for sweep logging
+            buckets[bucket].inference_count += 1
+            buckets[bucket].peak_size_usd = max(buckets[bucket].peak_size_usd, size_contribution)
 
             # Track totals
             if side == "long":
@@ -468,7 +486,10 @@ class EntryInference:
                     "minute_key": minute_key,
                     "side": "short",
                     "bucket": price,
-                    "notional_usd": round(bucket.size_usd, 2),
+                    # V3: Enhanced sweep logging
+                    "total_notional_usd": round(bucket.size_usd, 2),
+                    "trade_count": bucket.inference_count,
+                    "peak_notional_usd": round(bucket.peak_size_usd, 2),
                     "layer": "projection",
                     "reason": f"high>={price:.0f}",
                     "trigger_high": high
@@ -493,7 +514,10 @@ class EntryInference:
                     "minute_key": minute_key,
                     "side": "long",
                     "bucket": price,
-                    "notional_usd": round(bucket.size_usd, 2),
+                    # V3: Enhanced sweep logging
+                    "total_notional_usd": round(bucket.size_usd, 2),
+                    "trade_count": bucket.inference_count,
+                    "peak_notional_usd": round(bucket.peak_size_usd, 2),
                     "layer": "projection",
                     "reason": f"low<={price:.0f}",
                     "trigger_low": low

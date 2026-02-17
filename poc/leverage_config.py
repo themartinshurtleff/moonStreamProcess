@@ -6,7 +6,66 @@ Weights represent the relative likelihood of positions at each leverage level.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
+import logging
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# DISABLED TIERS CONFIGURATION
+# =============================================================================
+# Tiers in this list are excluded from:
+# - Offset learning
+# - Bias correction
+# - Zone production
+# - Hit rate calculation
+# - Sweep matching
+# Events from disabled tiers are still logged but tagged with tier_disabled: true
+# and do not contribute to calibration updates.
+#
+# Added 2026-02-17: 10x tier disabled due to persistent -$62K median miss corruption
+DISABLED_TIERS: Set[int] = {10}
+
+# Tier weights for V3 zone intensity calculation (higher leverage = higher weight)
+# 10x is 0.0 because it's disabled
+TIER_WEIGHTS: Dict[int, float] = {
+    5: 0.2,
+    10: 0.0,   # disabled
+    20: 0.4,
+    25: 0.5,
+    50: 0.8,
+    75: 0.9,
+    100: 1.0,
+    125: 1.0,
+    150: 0.9,
+    200: 0.8,
+    250: 0.7,
+}
+
+
+def is_tier_disabled(tier: int) -> bool:
+    """Check if a leverage tier is disabled."""
+    return tier in DISABLED_TIERS
+
+
+def get_tier_weight(tier: int) -> float:
+    """Get the weight for a leverage tier (0.0 if disabled)."""
+    if is_tier_disabled(tier):
+        return 0.0
+    return TIER_WEIGHTS.get(tier, 0.5)  # Default weight for unknown tiers
+
+
+def get_enabled_tiers(ladder: List[int]) -> List[int]:
+    """Filter a ladder to only include enabled tiers."""
+    return [t for t in ladder if not is_tier_disabled(t)]
+
+
+def log_disabled_tiers():
+    """Log the disabled tiers at startup."""
+    if DISABLED_TIERS:
+        logger.info(f"Disabled leverage tiers: {sorted(DISABLED_TIERS)} — excluded from all calibration and prediction")
+    else:
+        logger.info("No leverage tiers disabled")
 
 
 @dataclass
