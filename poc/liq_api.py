@@ -1302,6 +1302,128 @@ def create_app() -> FastAPI:
 
         return JSONResponse(content=summary)
 
+    @app.get("/v3/liq_heatmap")
+    async def liq_heatmap_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        min_notional: float = Query(default=0, description="Minimum USD notional to include"),
+        min_leverage: int = Query(default=None, description="Minimum leverage tier to include (5-250)"),
+        max_leverage: int = Query(default=None, description="Maximum leverage tier to include (5-250)"),
+        min_weight: float = Query(default=None, description="Minimum zone weight to include")
+    ):
+        """
+        Get V3 liquidation heatmap with full leverage filtering.
+
+        This endpoint uses the zone lifecycle manager for filtering by leverage tier.
+        Unlike V2, this supports filtering zones based on which leverage tiers
+        contributed to them.
+
+        Use cases:
+        - min_leverage=50: Only show high-leverage zones (50x+)
+        - max_leverage=25: Only show low-leverage zones (≤25x)
+        - min_leverage=20, max_leverage=75: Show mid-range leverage zones
+
+        Response format matches V2 but with additional tier_contributions field:
+        {
+            "symbol": "BTC",
+            "ts": 1234567890.123,
+            "long_levels": [
+                {
+                    "price": 92000.0,
+                    "weight": 1.5,
+                    "notional_usd": 250000.0,  // Estimated from weight
+                    "tier_contributions": {"25": 0.5, "50": 0.3, "75": 0.2},
+                    "reinforcement_count": 5,
+                    "source": "combined"
+                }, ...
+            ],
+            "short_levels": [...],
+            "meta": {
+                "min_leverage": 50,
+                "max_leverage": null,
+                "filtered": true
+            }
+        }
+        """
+        if not HAS_ZONE_MANAGER:
+            raise HTTPException(
+                status_code=501,
+                detail="Zone manager not available. Use /v2/liq_heatmap for snapshot-based data."
+            )
+
+        zone_mgr = get_zone_manager(symbol=symbol, persist_dir=POC_DIR, create_if_missing=True)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialize zone manager"
+            )
+
+        # Get zones with leverage filtering
+        zones = zone_mgr.get_active_zones(
+            side=None,  # Get both sides
+            min_leverage=min_leverage,
+            max_leverage=max_leverage
+        )
+
+        # Apply additional filters
+        if min_weight is not None and min_weight > 0:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+
+        # Separate into long and short levels
+        long_levels = []
+        short_levels = []
+
+        for z in zones:
+            # Estimate notional from weight (inverse of normalization)
+            estimated_notional = z['weight'] * 100000.0
+
+            if min_notional > 0 and estimated_notional < min_notional:
+                continue
+
+            level = {
+                "price": z['price'],
+                "weight": z['weight'],
+                "notional_usd": round(estimated_notional, 2),
+                "tier_contributions": z.get('tier_contributions', {}),
+                "reinforcement_count": z.get('reinforcement_count', 0),
+                "source": z.get('source', 'unknown'),
+                "created_at": z.get('created_at'),
+                "last_reinforced_at": z.get('last_reinforced_at')
+            }
+
+            if z['side'] == 'long':
+                long_levels.append(level)
+            else:
+                short_levels.append(level)
+
+        # Sort by weight descending
+        long_levels.sort(key=lambda x: -x['weight'])
+        short_levels.sort(key=lambda x: -x['weight'])
+
+        # Get summary for meta
+        summary = zone_mgr.get_summary()
+
+        response = {
+            "symbol": symbol,
+            "ts": time.time(),
+            "long_levels": long_levels,
+            "short_levels": short_levels,
+            "meta": {
+                "min_leverage": min_leverage,
+                "max_leverage": max_leverage,
+                "min_weight": min_weight,
+                "min_notional": min_notional,
+                "filtered": bool(min_leverage or max_leverage or min_weight or min_notional),
+                "long_pools_count": len(long_levels),
+                "short_pools_count": len(short_levels),
+                "total_long_weight": summary.get('total_weight_long', 0),
+                "total_short_weight": summary.get('total_weight_short', 0),
+                "zones_created": summary.get('zones_created_total', 0),
+                "zones_swept": summary.get('zones_swept_total', 0)
+            }
+        }
+
+        return JSONResponse(content=response)
+
     # =========================================================================
     # Orderbook Heatmap Endpoints (30s DoM screenshots)
     # =========================================================================
