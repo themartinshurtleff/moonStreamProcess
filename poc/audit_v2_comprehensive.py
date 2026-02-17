@@ -130,6 +130,87 @@ def safe_parse_jsonl(filepath: str) -> List[Dict]:
 
     return records
 
+def stream_jsonl(filepath: str):
+    """Generator that yields parsed JSON records one at a time (memory-safe)."""
+    if not os.path.exists(filepath):
+        return
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                pass
+
+def load_calibrator_single_pass(filenames, log_dir):
+    """
+    Single-pass loader for calibrator JSONL files.
+    Extracts events, price data, approach summaries, offset data, and errors
+    all in one pass to avoid loading the 36MB+ file multiple times.
+    """
+    events = []
+    prices = {}
+    summaries = []
+    offsets_by_leverage = defaultdict(list)
+    errors_list = []
+    seen_events = set()
+
+    for fn in filenames:
+        path = os.path.join(log_dir, fn)
+        for r in stream_jsonl(path):
+            rtype = r.get('type', '')
+
+            if rtype == 'event':
+                ts_str = r.get('timestamp', '')
+                price = r.get('event_price', 0)
+                side = r.get('side', '')
+                key = (ts_str, price, side)
+                if key not in seen_events:
+                    seen_events.add(key)
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        ts = dt.timestamp()
+                    except:
+                        continue
+                    events.append(ForceOrderEvent(
+                        timestamp=ts, ts_str=ts_str,
+                        symbol=r.get('symbol', 'BTC'), side=side,
+                        price=price, notional=r.get('event_notional', 0),
+                        src_price=r.get('event_src_price', 0),
+                        minute_key=int(ts // 60)
+                    ))
+                    # Also collect offset data from the same record
+                    miss_usd = r.get('miss_usd')
+                    attributed_lev = r.get('attributed_leverage')
+                    if miss_usd is not None and attributed_lev is not None:
+                        try:
+                            offsets_by_leverage[attributed_lev].append({
+                                'offset': float(miss_usd), 'side': side,
+                                'miss_pct': r.get('miss_pct'),
+                                'bias_correction': r.get('bias_correction_usd'),
+                                'raw_miss': r.get('raw_miss_usd'),
+                            })
+                        except:
+                            pass
+
+            elif rtype == 'minute_inputs':
+                mk = r.get('minute_key', 0)
+                prices[mk] = {
+                    'high': r.get('high', 0), 'low': r.get('low', 0),
+                    'close': r.get('close', 0), 'src': r.get('src', 0)
+                }
+
+            elif rtype == 'approach_minute_summary':
+                summaries.append(r)
+
+            elif rtype in ('error', 'rejected', 'safety_trip', 'warning'):
+                errors_list.append(r)
+
+    events.sort(key=lambda e: e.timestamp)
+    return events, prices, summaries, dict(offsets_by_leverage), errors_list
+
 # =============================================================================
 # SECTION A: DATA INVENTORY
 # =============================================================================
@@ -383,6 +464,262 @@ def load_approach_summaries() -> List[Dict]:
                 summaries.append(r)
 
     return summaries
+
+# =============================================================================
+# NEW ANALYSIS: OI STREAM HEALTH
+# =============================================================================
+
+def analyze_oi_health(contexts: Dict[int, 'MinuteContext']) -> Dict:
+    """Analyze OI stream health from minute contexts."""
+    if not contexts:
+        return {'total': 0, 'valid': 0, 'zero': 0, 'positive': 0, 'negative': 0,
+                'validity_rate': 0, 'gaps': [], 'max_gap_minutes': 0}
+
+    sorted_minutes = sorted(contexts.keys())
+    total = len(sorted_minutes)
+    zero_count = 0
+    pos_count = 0
+    neg_count = 0
+    oi_values = []
+
+    for mk in sorted_minutes:
+        oi = contexts[mk].oi_delta_usd
+        oi_values.append(oi)
+        if oi == 0:
+            zero_count += 1
+        elif oi > 0:
+            pos_count += 1
+        else:
+            neg_count += 1
+
+    # Gap analysis: find consecutive minute gaps
+    gaps = []
+    for i in range(1, len(sorted_minutes)):
+        gap = sorted_minutes[i] - sorted_minutes[i-1]
+        if gap > 1:
+            gaps.append(gap)
+
+    valid = total - zero_count
+    return {
+        'total': total,
+        'valid': valid,
+        'zero': zero_count,
+        'positive': pos_count,
+        'negative': neg_count,
+        'validity_rate': valid / total * 100 if total > 0 else 0,
+        'zero_rate': zero_count / total * 100 if total > 0 else 0,
+        'positive_rate': pos_count / total * 100 if total > 0 else 0,
+        'negative_rate': neg_count / total * 100 if total > 0 else 0,
+        'gaps': gaps,
+        'max_gap_minutes': max(gaps) if gaps else 0,
+        'n_gaps': len([g for g in gaps if g > 2]),  # significant gaps only
+        'min_minute': sorted_minutes[0] if sorted_minutes else 0,
+        'max_minute': sorted_minutes[-1] if sorted_minutes else 0,
+        'oi_p50': statistics.median(oi_values) if oi_values else 0,
+    }
+
+# =============================================================================
+# NEW ANALYSIS: ERROR SCAN
+# =============================================================================
+
+def analyze_errors(errors_list: List[Dict]) -> Dict:
+    """Analyze errors, rejected events, safety trips from calibrator."""
+    by_type = Counter()
+    samples = {}
+    for e in errors_list:
+        t = e.get('type', 'unknown')
+        by_type[t] += 1
+        if t not in samples:
+            samples[t] = e
+
+    return {
+        'total': len(errors_list),
+        'by_type': dict(by_type),
+        'samples': samples,
+    }
+
+# =============================================================================
+# NEW ANALYSIS: SWEEP ANALYSIS
+# =============================================================================
+
+def analyze_sweeps_detailed(sweeps: List[Dict]) -> Dict:
+    """Detailed analysis of sweep activity."""
+    if not sweeps:
+        return {'total': 0, 'by_side': {}, 'notional_stats': {}}
+
+    by_side = Counter()
+    notionals = []
+    counts = []
+    timestamps = []
+
+    for s in sweeps:
+        side = s.get('side', 'unknown')
+        by_side[side] += 1
+        notional = s.get('total_notional', 0) or s.get('notional', 0)
+        if notional:
+            notionals.append(notional)
+        count = s.get('count', 0) or s.get('swept_count', 0)
+        if count:
+            counts.append(count)
+        ts = s.get('ts', 0)
+        if ts:
+            timestamps.append(ts)
+
+    notional_stats = {}
+    if notionals:
+        notionals_sorted = sorted(notionals)
+        n = len(notionals_sorted)
+        notional_stats = {
+            'mean': sum(notionals) / n,
+            'median': statistics.median(notionals),
+            'p95': notionals_sorted[int(n * 0.95)] if n > 20 else notionals_sorted[-1],
+            'total': sum(notionals),
+        }
+
+    return {
+        'total': len(sweeps),
+        'by_side': dict(by_side),
+        'notional_stats': notional_stats,
+        'avg_count': sum(counts) / len(counts) if counts else 0,
+    }
+
+# =============================================================================
+# NEW ANALYSIS: ENHANCED MISS DISTANCE (P25/P75/P95)
+# =============================================================================
+
+def compute_miss_distance_stats(events, tape_zones, inference_zones) -> Dict:
+    """Compute per-side signed miss distance with full percentiles."""
+    results = {'long': [], 'short': []}
+
+    for event in events:
+        mk = event.minute_key
+        side = event.side
+
+        # Get combined zones with 5-min lookback
+        zone_prices = []
+        tape_prices = get_active_tape_zones(tape_zones, mk, 5, side)
+        zone_prices.extend(tape_prices)
+        inf_zones = get_active_inference_zones(inference_zones, mk, 5, side)
+        zone_prices.extend([z[0] for z in inf_zones])
+
+        if not zone_prices:
+            continue
+
+        # Signed miss = event_price - nearest_zone (positive = event further from entry)
+        nearest = min(zone_prices, key=lambda zp: abs(event.price - zp) if zp > 0 else float('inf'))
+        if nearest <= 0:
+            continue
+        signed_miss_usd = event.price - nearest
+        signed_miss_pct = signed_miss_usd / event.price * 100
+
+        results[side].append({
+            'miss_usd': signed_miss_usd,
+            'miss_pct': signed_miss_pct,
+            'abs_miss_pct': abs(signed_miss_pct),
+        })
+
+    stats = {}
+    for side in ['long', 'short']:
+        records = results[side]
+        n = len(records)
+        if n == 0:
+            stats[side] = {'n': 0}
+            continue
+
+        usd_vals = sorted([r['miss_usd'] for r in records])
+        pct_vals = sorted([r['miss_pct'] for r in records])
+        abs_pct_vals = sorted([r['abs_miss_pct'] for r in records])
+
+        stats[side] = {
+            'n': n,
+            'mean_usd': sum(usd_vals) / n,
+            'median_usd': statistics.median(usd_vals),
+            'p25_usd': usd_vals[int(n * 0.25)],
+            'p75_usd': usd_vals[int(n * 0.75)],
+            'p95_usd': usd_vals[int(n * 0.95)] if n > 20 else usd_vals[-1],
+            'mean_pct': sum(pct_vals) / n,
+            'median_pct': statistics.median(pct_vals),
+            'p25_pct': pct_vals[int(n * 0.25)],
+            'p75_pct': pct_vals[int(n * 0.75)],
+            'p95_pct': pct_vals[int(n * 0.95)] if n > 20 else pct_vals[-1],
+            'abs_mean_pct': sum(abs_pct_vals) / n,
+            'abs_median_pct': statistics.median(abs_pct_vals),
+        }
+
+    return stats
+
+# =============================================================================
+# NEW ANALYSIS: PER-SIDE HIT RATES
+# =============================================================================
+
+def compute_per_side_hit_rates(events, tape_zones, inference_zones, zone_type='combined') -> Dict:
+    """Compute hit rates broken down by long/short for all tolerances."""
+    results = {}
+    for side in ['long', 'short']:
+        side_events = [e for e in events if e.side == side]
+        results[side] = compute_hit_rate_grid(side_events, tape_zones, inference_zones, zone_type)
+    return results
+
+# =============================================================================
+# NEW ANALYSIS: TEMPORAL SELF-MATCHING FILTER FOR TAPE
+# =============================================================================
+
+def compute_tape_hit_rate_filtered(events, tape_zones, inference_zones) -> Dict:
+    """
+    Compute tape hit rate WITH temporal self-matching filter.
+    Excludes tape zones created in the same minute as the event
+    (these are likely the event itself being added to tape).
+    """
+    results = {}
+    for lookback in LOOKBACK_WINDOWS:
+        results[lookback] = {}
+        for tol in TOLERANCES:
+            hits = 0
+            gaps = 0
+            misses = 0
+
+            for event in events:
+                event_minute = event.minute_key
+                event_price = event.price
+                event_side = event.side
+
+                # Get tape zones but EXCLUDE same-minute (self-match filter)
+                zone_prices = []
+                for mk in range(event_minute - lookback, event_minute):  # exclusive of event_minute
+                    if mk in tape_zones:
+                        for z in tape_zones[mk]:
+                            if z.side == event_side:
+                                zone_prices.append(z.bucket)
+                zone_prices = list(set(zone_prices))
+
+                if not zone_prices:
+                    gaps += 1
+                    continue
+
+                is_hit = False
+                for zp in zone_prices:
+                    if zp <= 0:
+                        continue
+                    dist_pct = abs(event_price - zp) / event_price
+                    if dist_pct <= tol:
+                        is_hit = True
+                        break
+
+                if is_hit:
+                    hits += 1
+                else:
+                    misses += 1
+
+            total = hits + gaps + misses
+            results[lookback][tol] = {
+                'hit_rate': hits / total if total > 0 else 0,
+                'gap_rate': gaps / total if total > 0 else 0,
+                'miss_rate': misses / total if total > 0 else 0,
+                'n_hits': hits, 'n_gaps': gaps, 'n_misses': misses, 'n_total': total,
+                'lead_times': []
+            }
+
+    return results
 
 # =============================================================================
 # SECTION C: HIT RATE ANALYSIS
@@ -731,9 +1068,11 @@ def analyze_asymmetry(events: List[ForceOrderEvent],
     return results
 
 def summarize_asymmetry_bucket(records: List[Dict]) -> Dict:
-    """Summarize a bucket of asymmetry records."""
+    """Summarize a bucket of asymmetry records with full percentiles."""
     if not records:
-        return {'n': 0, 'gap_rate': 0, 'hit_rate_5bps': 0, 'miss_dist_p50': None}
+        return {'n': 0, 'gap_rate': 0, 'hit_rate_5bps': 0, 'miss_dist_p50': None,
+                'miss_dist_p25': None, 'miss_dist_p75': None, 'miss_dist_p95': None,
+                'miss_dist_mean': None}
 
     n = len(records)
     gaps = sum(1 for r in records if not r['has_zone'])
@@ -741,13 +1080,24 @@ def summarize_asymmetry_bucket(records: List[Dict]) -> Dict:
     hits_5bps = sum(1 for r in records if r['has_zone'] and r['min_dist'] is not None and r['min_dist'] <= 0.005)
 
     distances = [r['min_dist'] for r in records if r['min_dist'] is not None]
+    distances_sorted = sorted(distances) if distances else []
+    nd = len(distances_sorted)
+
     miss_dist_p50 = statistics.median(distances) if distances else None
+    miss_dist_p25 = distances_sorted[int(nd * 0.25)] if nd > 4 else (distances_sorted[0] if nd else None)
+    miss_dist_p75 = distances_sorted[int(nd * 0.75)] if nd > 4 else (distances_sorted[-1] if nd else None)
+    miss_dist_p95 = distances_sorted[int(nd * 0.95)] if nd > 20 else (distances_sorted[-1] if nd else None)
+    miss_dist_mean = sum(distances) / nd if nd > 0 else None
 
     return {
         'n': n,
         'gap_rate': gaps / n * 100 if n > 0 else 0,
         'hit_rate_5bps': hits_5bps / n * 100 if n > 0 else 0,
-        'miss_dist_p50': miss_dist_p50 * 100 if miss_dist_p50 else None  # Convert to %
+        'miss_dist_mean': miss_dist_mean * 100 if miss_dist_mean else None,
+        'miss_dist_p25': miss_dist_p25 * 100 if miss_dist_p25 else None,
+        'miss_dist_p50': miss_dist_p50 * 100 if miss_dist_p50 else None,
+        'miss_dist_p75': miss_dist_p75 * 100 if miss_dist_p75 else None,
+        'miss_dist_p95': miss_dist_p95 * 100 if miss_dist_p95 else None,
     }
 
 # =============================================================================
@@ -923,7 +1273,13 @@ def generate_report(inventory: Dict,
                     asymmetry_results: Dict,
                     approach_results: Dict,
                     gap_results: Dict,
-                    offset_results: Dict) -> str:
+                    offset_results: Dict,
+                    oi_health: Dict = None,
+                    error_scan: Dict = None,
+                    sweep_analysis: Dict = None,
+                    miss_distance_stats: Dict = None,
+                    per_side_results: Dict = None,
+                    tape_filtered_results: Dict = None) -> str:
     """Generate the full markdown report."""
 
     lines = []
@@ -1242,6 +1598,173 @@ def generate_report(inventory: Dict,
         lines.append("")
 
     # ==========================================================================
+    # SECTION J: PER-SIDE HIT RATES
+    # ==========================================================================
+    if per_side_results:
+        lines.append("## J. Per-Side Hit Rates (Combined Zones, 5m Lookback)")
+        lines.append("")
+        lines.append("| Side | 0.10% | 0.25% | 0.50% | 1.00% |")
+        lines.append("|---|---|---|---|---|")
+        for side in ['long', 'short']:
+            if side in per_side_results:
+                row = f"| {side} |"
+                for tol in TOLERANCES:
+                    hr = per_side_results[side][5][tol]['hit_rate'] * 100
+                    row += f" {hr:.1f}% |"
+                lines.append(row)
+        # Also show 0m lookback
+        lines.append("")
+        lines.append("**0m Lookback (same minute only):**")
+        lines.append("| Side | 0.10% | 0.25% | 0.50% | 1.00% |")
+        lines.append("|---|---|---|---|---|")
+        for side in ['long', 'short']:
+            if side in per_side_results:
+                row = f"| {side} |"
+                for tol in TOLERANCES:
+                    hr = per_side_results[side][0][tol]['hit_rate'] * 100
+                    row += f" {hr:.1f}% |"
+                lines.append(row)
+        lines.append("")
+
+    # ==========================================================================
+    # SECTION K: TAPE HIT RATES WITH SELF-MATCH FILTER
+    # ==========================================================================
+    if tape_filtered_results:
+        lines.append("## K. Tape Hit Rates (with Temporal Self-Match Filter)")
+        lines.append("")
+        lines.append("Excludes tape zones from the same minute as the event (removes self-matching).")
+        lines.append("")
+        lines.append("**Filtered Hit Rate Grid (%):**")
+        lines.append("")
+        header = "| Lookback |"
+        for tol in TOLERANCES:
+            header += f" {tol*100:.2f}% |"
+        lines.append(header)
+        lines.append("|" + "---|" * (len(TOLERANCES) + 1))
+        for lb in LOOKBACK_WINDOWS:
+            if lb == 0:
+                continue  # 0m with filter = no zones possible
+            row = f"| {lb}m |"
+            for tol in TOLERANCES:
+                hr = tape_filtered_results[lb][tol]['hit_rate'] * 100
+                row += f" {hr:.1f}% |"
+            lines.append(row)
+        lines.append("")
+        lines.append("**Unfiltered (for comparison):**")
+        lines.append("")
+        header = "| Lookback |"
+        for tol in TOLERANCES:
+            header += f" {tol*100:.2f}% |"
+        lines.append(header)
+        lines.append("|" + "---|" * (len(TOLERANCES) + 1))
+        for lb in LOOKBACK_WINDOWS:
+            row = f"| {lb}m |"
+            for tol in TOLERANCES:
+                hr = tape_results[lb][tol]['hit_rate'] * 100
+                row += f" {hr:.1f}% |"
+            lines.append(row)
+        lines.append("")
+
+    # ==========================================================================
+    # SECTION L: MISS DISTANCE ANALYSIS (FULL PERCENTILES)
+    # ==========================================================================
+    if miss_distance_stats:
+        lines.append("## L. Miss Distance Analysis (Per-Side, Full Percentiles)")
+        lines.append("")
+        lines.append("Signed miss = event_price - nearest_zone. Positive = event further from entry than predicted.")
+        lines.append("")
+        for side in ['long', 'short']:
+            s = miss_distance_stats.get(side, {})
+            if s.get('n', 0) == 0:
+                lines.append(f"### {side.title()} Side: No data")
+                continue
+            lines.append(f"### {side.title()} Side (N={s['n']})")
+            lines.append("")
+            lines.append("| Metric | USD | % of Price |")
+            lines.append("|---|---|---|")
+            lines.append(f"| Mean | ${s['mean_usd']:.0f} | {s['mean_pct']:.3f}% |")
+            lines.append(f"| P25 | ${s['p25_usd']:.0f} | {s['p25_pct']:.3f}% |")
+            lines.append(f"| Median | ${s['median_usd']:.0f} | {s['median_pct']:.3f}% |")
+            lines.append(f"| P75 | ${s['p75_usd']:.0f} | {s['p75_pct']:.3f}% |")
+            lines.append(f"| P95 | ${s['p95_usd']:.0f} | {s['p95_pct']:.3f}% |")
+            lines.append(f"| |Abs| Mean | | {s['abs_mean_pct']:.3f}% |")
+            lines.append(f"| |Abs| Median | | {s['abs_median_pct']:.3f}% |")
+            lines.append("")
+
+    # ==========================================================================
+    # SECTION M: OI STREAM HEALTH
+    # ==========================================================================
+    if oi_health:
+        lines.append("## M. OI Stream Health")
+        lines.append("")
+        lines.append(f"- Total minutes: {oi_health['total']}")
+        lines.append(f"- Valid (non-zero): {oi_health['valid']} ({oi_health['validity_rate']:.1f}%)")
+        lines.append(f"- Zero: {oi_health['zero']} ({oi_health['zero_rate']:.1f}%)")
+        lines.append(f"- Positive (both-sides mode): {oi_health['positive']} ({oi_health['positive_rate']:.1f}%)")
+        lines.append(f"- Negative (decay mode): {oi_health['negative']} ({oi_health['negative_rate']:.1f}%)")
+        lines.append(f"- OI Delta median: ${oi_health['oi_p50']:.0f}")
+        lines.append("")
+        lines.append(f"### Gap Analysis")
+        lines.append(f"- Significant gaps (>2min): {oi_health['n_gaps']}")
+        lines.append(f"- Max gap: {oi_health['max_gap_minutes']} minutes")
+        if oi_health['min_minute'] and oi_health['max_minute']:
+            span = oi_health['max_minute'] - oi_health['min_minute']
+            lines.append(f"- Data span: {span} minutes ({span/60:.1f} hours)")
+        lines.append("")
+        if oi_health['validity_rate'] > 99:
+            lines.append("**STATUS: HEALTHY** - OI stream is operational with >99% validity.")
+        elif oi_health['validity_rate'] > 90:
+            lines.append("**STATUS: DEGRADED** - OI stream has some gaps.")
+        else:
+            lines.append("**STATUS: CRITICAL** - OI stream has significant issues.")
+        lines.append("")
+
+    # ==========================================================================
+    # SECTION N: ERROR SCAN
+    # ==========================================================================
+    if error_scan:
+        lines.append("## N. Error Scan")
+        lines.append("")
+        lines.append(f"- Total error/warning records: {error_scan['total']}")
+        lines.append("")
+        if error_scan['by_type']:
+            lines.append("| Type | Count |")
+            lines.append("|---|---|")
+            for t, count in sorted(error_scan['by_type'].items(), key=lambda x: -x[1]):
+                lines.append(f"| {t} | {count} |")
+            lines.append("")
+            for t, sample in error_scan['samples'].items():
+                lines.append(f"### Sample `{t}` record:")
+                # Truncate long samples
+                sample_str = json.dumps(sample, default=str)
+                if len(sample_str) > 500:
+                    sample_str = sample_str[:500] + "..."
+                lines.append(f"```json\n{sample_str}\n```")
+                lines.append("")
+        else:
+            lines.append("**No errors found.** Clean run.")
+            lines.append("")
+
+    # ==========================================================================
+    # SECTION O: SWEEP ANALYSIS
+    # ==========================================================================
+    if sweep_analysis:
+        lines.append("## O. Sweep Analysis")
+        lines.append("")
+        lines.append(f"- Total sweeps: {sweep_analysis['total']}")
+        if sweep_analysis['by_side']:
+            lines.append(f"- By side: {dict(sweep_analysis['by_side'])}")
+        if sweep_analysis['notional_stats']:
+            ns = sweep_analysis['notional_stats']
+            lines.append(f"- Total notional swept: ${ns.get('total', 0):,.0f}")
+            lines.append(f"- Mean per sweep: ${ns.get('mean', 0):,.0f}")
+            lines.append(f"- Median per sweep: ${ns.get('median', 0):,.0f}")
+            lines.append(f"- P95 per sweep: ${ns.get('p95', 0):,.0f}")
+        if sweep_analysis['avg_count']:
+            lines.append(f"- Avg buckets per sweep: {sweep_analysis['avg_count']:.1f}")
+        lines.append("")
+
+    # ==========================================================================
     # TOP 3 FIXES
     # ==========================================================================
     lines.append("## Top 3 Fixes (Evidence-Based)")
@@ -1321,54 +1844,93 @@ def main():
     print()
 
     # Build inventory
-    print("[1/9] Building data inventory...")
+    print("[1/14] Building data inventory...")
     inventory = build_data_inventory()
 
-    # Load data
-    print("[2/9] Loading forceOrder events...")
-    events = load_all_calibrator_events()
-    print(f"      Loaded {len(events)} events")
+    # Single-pass calibrator load (memory-safe: loads 36MB+ file only once)
+    print("[2/14] Loading calibrator data (single pass)...")
+    cal_files = LOG_FILES['calibrator']
+    events, prices, summaries, offsets_by_leverage, errors_list = \
+        load_calibrator_single_pass(cal_files, LOG_DIR)
+    print(f"       Loaded {len(events)} events, {len(prices)} price records, "
+          f"{len(summaries)} summaries, {len(errors_list)} error/warning records")
 
-    print("[3/9] Loading tape zones...")
+    print("[3/14] Loading tape zones...")
     tape_zones = load_tape_zones()
-    print(f"      Loaded zones from {len(tape_zones)} minutes")
+    print(f"       Loaded zones from {len(tape_zones)} minutes")
 
-    print("[4/9] Loading inference zones...")
+    print("[4/14] Loading inference zones...")
     inference_zones = load_inference_zones()
-    print(f"      Loaded zones from {len(inference_zones)} minutes")
+    print(f"       Loaded zones from {len(inference_zones)} minutes")
 
-    print("[5/9] Loading minute contexts...")
+    print("[5/14] Loading minute contexts...")
     contexts = load_minute_contexts()
-    print(f"      Loaded {len(contexts)} minute contexts")
+    print(f"       Loaded {len(contexts)} minute contexts")
+
+    print("[6/14] Loading sweeps...")
+    sweeps = load_sweeps()
+    print(f"       Loaded {len(sweeps)} sweep records")
 
     # Compute hit rates
-    print("[6/9] Computing hit rate grids...")
+    print("[7/14] Computing hit rate grids (tape/inference/combined)...")
     tape_results = compute_hit_rate_grid(events, tape_zones, inference_zones, 'tape')
     inference_results = compute_hit_rate_grid(events, tape_zones, inference_zones, 'inference')
     combined_results = compute_hit_rate_grid(events, tape_zones, inference_zones, 'combined')
 
-    # Reaction analysis
-    print("[7/9] Analyzing zone reactions...")
-    prices = load_price_data()
+    print("[8/14] Computing tape hit rates with temporal self-match filter...")
+    tape_filtered_results = compute_tape_hit_rate_filtered(events, tape_zones, inference_zones)
+
+    print("[9/14] Computing per-side hit rates...")
+    per_side_results = compute_per_side_hit_rates(events, tape_zones, inference_zones, 'combined')
+
+    # Reaction analysis (uses prices from single-pass loader)
+    print("[10/14] Analyzing zone reactions...")
     reaction_results = analyze_zone_reactions(inference_zones, prices)
 
     # Asymmetry analysis
-    print("[8/9] Analyzing long/short asymmetry...")
+    print("[11/14] Analyzing long/short asymmetry & miss distances...")
     asymmetry_results = analyze_asymmetry(events, contexts, tape_zones, inference_zones)
+    miss_distance_stats = compute_miss_distance_stats(events, tape_zones, inference_zones)
 
-    # Pipeline audits
-    print("[9/9] Auditing pipelines...")
-    summaries = load_approach_summaries()
+    # Pipeline audits (uses summaries from single-pass loader)
+    print("[12/14] Auditing pipelines...")
     approach_results = audit_approach_pipeline(summaries)
     gap_results = audit_inference_gaps(events, inference_zones, contexts)
-    offset_results = audit_calibrator_offsets(events)
+
+    # Offset analysis (uses offsets from single-pass loader)
+    print("[13/14] Computing offset statistics...")
+    offset_results = {}
+    for lev, data in sorted(offsets_by_leverage.items()):
+        offsets = [d['offset'] for d in data]
+        n = len(offsets)
+        if n == 0:
+            continue
+        offsets_sorted = sorted(offsets)
+        median = statistics.median(offsets)
+        mad = statistics.median([abs(x - median) for x in offsets])
+        p05 = offsets_sorted[int(n * 0.05)] if n > 20 else offsets_sorted[0]
+        p95 = offsets_sorted[int(n * 0.95)] if n > 20 else offsets_sorted[-1]
+        offset_results[lev] = {
+            'n': n, 'median': median, 'mad': mad, 'p05': p05, 'p95': p95,
+            'long_count': sum(1 for d in data if d['side'] == 'long'),
+            'short_count': sum(1 for d in data if d['side'] == 'short')
+        }
+
+    # New analyses
+    print("[14/14] Running OI health, error scan, sweep analysis...")
+    oi_health = analyze_oi_health(contexts)
+    error_scan = analyze_errors(errors_list)
+    sweep_analysis = analyze_sweeps_detailed(sweeps)
 
     # Generate report
     print()
     print("Generating report...")
     report = generate_report(
         inventory, events, tape_results, inference_results, combined_results,
-        reaction_results, asymmetry_results, approach_results, gap_results, offset_results
+        reaction_results, asymmetry_results, approach_results, gap_results, offset_results,
+        oi_health=oi_health, error_scan=error_scan, sweep_analysis=sweep_analysis,
+        miss_distance_stats=miss_distance_stats, per_side_results=per_side_results,
+        tape_filtered_results=tape_filtered_results,
     )
 
     # Save to file
