@@ -132,6 +132,15 @@ class LiquidationHeatmap:
         self.total_force_orders: int = 0
         self.total_inferences: int = 0
 
+        # V3: Cycle summary logging
+        self.cycle_log_file = os.path.join(log_dir, "liq_cycles.jsonl") if log_dir else None
+        self._cycle_log_fh = None
+        if self.cycle_log_file:
+            try:
+                self._cycle_log_fh = open(self.cycle_log_file, 'a')
+            except Exception as e:
+                logger.warning(f"Could not open cycle log file: {e}")
+
         logger.info(f"LiquidationHeatmap initialized for {self.config.symbol}")
         logger.info(f"  steps={self.config.steps}, buffer={self.config.buffer}")
         logger.info(f"  tape_weight={self.config.tape_weight}, projection_weight={self.config.projection_weight}")
@@ -232,10 +241,14 @@ class LiquidationHeatmap:
         self.total_inferences += len(inferences)
 
         # V3: Merge nearby zones and log summary (every minute)
+        zone_merges = 0
         if self.zone_manager:
-            merges = self.zone_manager.merge_nearby_zones()
-            if merges > 0:
-                logger.debug(f"[{self.config.symbol}] Zone manager merged {merges} nearby zones")
+            zone_merges = self.zone_manager.merge_nearby_zones()
+            if zone_merges > 0:
+                logger.debug(f"[{self.config.symbol}] Zone manager merged {zone_merges} nearby zones")
+
+        # V3: Log per-minute cycle summary
+        self._log_cycle_summary(minute_key, src_price, high, low, zone_merges)
 
         # Periodic tape learning push to inference
         if minute_key - self.last_tape_learning_push >= self.tape_learning_interval:
@@ -277,6 +290,68 @@ class LiquidationHeatmap:
 
             self.inference.update_leverage_weights(blended)
             logger.info(f"Pushed tape learning to inference: {total_samples} samples")
+
+    def _log_cycle_summary(
+        self,
+        minute_key: int,
+        src_price: float,
+        high: float,
+        low: float,
+        zone_merges: int
+    ) -> None:
+        """
+        V3: Log per-minute cycle summary for diagnostics.
+
+        Captures snapshot of zone state and activity each minute.
+        """
+        if not self._cycle_log_fh:
+            return
+
+        import time as _time
+
+        # Gather zone manager stats if available
+        zone_stats = {}
+        if self.zone_manager:
+            zone_stats = self.zone_manager.get_summary()
+
+        # Tape stats
+        tape_stats = self.tape.get_stats()
+
+        # Inference stats
+        inference_stats = self.inference.get_stats()
+
+        cycle_entry = {
+            "type": "cycle_summary",
+            "ts": _time.time(),
+            "minute_key": minute_key,
+            "src_price": src_price,
+            "high": high,
+            "low": low,
+            "total_force_orders": self.total_force_orders,
+            "total_inferences": self.total_inferences,
+            "zone_merges": zone_merges,
+            # Zone manager state
+            "active_zones_long": zone_stats.get("active_zones_long", 0),
+            "active_zones_short": zone_stats.get("active_zones_short", 0),
+            "total_weight_long": zone_stats.get("total_weight_long", 0),
+            "total_weight_short": zone_stats.get("total_weight_short", 0),
+            "zones_created_total": zone_stats.get("zones_created_total", 0),
+            "zones_swept_total": zone_stats.get("zones_swept_total", 0),
+            "zones_expired_total": zone_stats.get("zones_expired_total", 0),
+            # Tape state
+            "tape_long_buckets": tape_stats.get("long_buckets", 0),
+            "tape_short_buckets": tape_stats.get("short_buckets", 0),
+            "tape_total_events": tape_stats.get("total_events", 0),
+            # Inference state
+            "proj_long_buckets": inference_stats.get("projected_long_buckets", 0),
+            "proj_short_buckets": inference_stats.get("projected_short_buckets", 0)
+        }
+
+        try:
+            self._cycle_log_fh.write(json.dumps(cycle_entry) + '\n')
+            self._cycle_log_fh.flush()
+        except Exception as e:
+            logger.warning(f"Failed to write cycle summary: {e}")
 
     def get_heatmap(self) -> Dict[str, any]:
         """
@@ -567,6 +642,10 @@ class LiquidationHeatmap:
         # V3: Stop zone manager (saves state to disk)
         if self.zone_manager:
             self.zone_manager.stop()
+        # V3: Close cycle log file
+        if self._cycle_log_fh:
+            self._cycle_log_fh.close()
+            self._cycle_log_fh = None
 
 
 # Factory function for easy initialization
