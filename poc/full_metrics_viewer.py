@@ -1137,20 +1137,21 @@ class FullMetricsProcessor:
                         "src_source": src_source
                     })
 
-            # Send to calibrator
-            self.calibrator.on_liquidation({
-                'timestamp': time.time(),
-                'symbol': 'BTC',
-                'side': calib_side,
-                'price': price,
-                'qty': qty,
-                'mark_price': mark_price,
-                'mid_price': mid_price,
-                'last_price': last_price
-            })
-
-            # Feed V2 heatmap tape (ground truth accumulation)
-            self.heatmap_v2.on_force_order(
+            # Route to calibrator AND heatmap V2 via engine manager.
+            # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
+            # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
+            self.engine_manager.on_force_order(
+                "BTC",
+                event_data={
+                    'timestamp': time.time(),
+                    'symbol': 'BTC',
+                    'side': calib_side,
+                    'price': price,
+                    'qty': qty,
+                    'mark_price': mark_price,
+                    'mid_price': mid_price,
+                    'last_price': last_price
+                },
                 timestamp=time.time(),
                 side=calib_side,
                 price=price,
@@ -1445,7 +1446,8 @@ class FullMetricsProcessor:
                 v2_ladder = sorted(v2_leverage_weights.keys())
                 v2_weights = [v2_leverage_weights[lev] for lev in v2_ladder]
 
-                self.calibrator.on_minute_snapshot(
+                self.engine_manager.on_minute_snapshot(
+                    "BTC",
                     symbol="BTC",
                     timestamp=time.time(),
                     src=src,
