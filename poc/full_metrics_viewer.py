@@ -568,7 +568,7 @@ class FullMetricsState:
     perp_TTP_ratio: float = 0.0
     perp_GTA_ratio: float = 0.0
 
-    # Predicted liquidation stress zones (from LiquidationStressEngine)
+    # Predicted liquidation stress zones (from V2 LiquidationHeatmap)
     pred_liq_longs_top: List[tuple] = field(default_factory=list)   # Top 5 long liq zones (support)
     pred_liq_shorts_top: List[tuple] = field(default_factory=list)  # Top 5 short liq zones (resistance)
     liq_engine_stats: Dict[str, Any] = field(default_factory=dict)  # Debug stats
