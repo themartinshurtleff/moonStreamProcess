@@ -44,6 +44,7 @@ from liq_calibrator import LiquidationCalibrator
 from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
 from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer, OrderbookReconstructor
+from engine_manager import EngineManager, EngineInstance
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -680,6 +681,21 @@ class FullMetricsProcessor:
             gap_tolerance=1000  # Tolerate pu gaps up to 1000 update IDs
         )
         print("[OB_RECON] Initialized with gap_tolerance=1000, will sync on first depth message")
+
+        # Engine Manager — bundles all per-symbol engines for multi-symbol routing.
+        # For now BTC only. Each symbol MUST have independent engines (CLAUDE.md rule).
+        self.engine_manager = EngineManager()
+        btc_engine = EngineInstance(
+            symbol_short="BTC",
+            symbol_full="BTCUSDT",
+            calibrator=self.calibrator,
+            heatmap_v2=self.heatmap_v2,
+            zone_manager=getattr(self.heatmap_v2, 'zone_manager', None),
+            ob_reconstructor=self.ob_reconstructor,
+            ob_accumulator=self.ob_accumulator,
+        )
+        self.engine_manager.register_engine("BTC", "BTCUSDT", btc_engine)
+        print(f"[ENGINE_MGR] Registered engines: {self.engine_manager.get_all_symbols()}")
 
     def _on_ob_frame_emitted(self, frame):
         """Callback when orderbook accumulator emits a 30s frame."""
