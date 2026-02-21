@@ -316,7 +316,8 @@ class EmbeddedAPIState:
         self._v1_cache_time: float = 0
         self._v2_cache: Optional[Dict] = None
         self._v2_cache_time: float = 0
-        self._cache_ttl: float = 1.0
+        # 5s minimum — CLAUDE.md rule: no disk I/O refresh intervals under 5s
+        self._cache_ttl: float = 5.0
 
         # History buffers for liquidation heatmap
         self.v1_history: Optional[LiquidationHeatmapBuffer] = None
