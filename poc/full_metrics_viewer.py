@@ -697,6 +697,16 @@ class FullMetricsProcessor:
         self.engine_manager.register_engine("BTC", "BTCUSDT", btc_engine)
         print(f"[ENGINE_MGR] Registered engines: {self.engine_manager.get_all_symbols()}")
 
+        # Remove direct attributes — all access now goes through self._btc()
+        del self.calibrator
+        del self.heatmap_v2
+        del self.ob_reconstructor
+        del self.ob_accumulator
+
+    def _btc(self) -> EngineInstance:
+        """Shortcut to BTC engine instance. Will be replaced with symbol-aware routing later."""
+        return self.engine_manager.get_engine("BTC")
+
     def _on_ob_frame_emitted(self, frame):
         """Callback when orderbook accumulator emits a 30s frame."""
         print(f"[OB_DEBUG] Frame emitted! ts={frame.ts} src={frame.src:.2f} n_prices={frame.n_prices}")
@@ -737,9 +747,9 @@ class FullMetricsProcessor:
                 self._last_accum_debug = now
                 slot = int(now // 30)
                 print(f"[OB_DEBUG] Feeding accumulator: mid={mid:.2f} bids={len(bids)} asks={len(asks)} "
-                      f"current_slot={self.ob_accumulator._current_slot} new_slot={slot}")
+                      f"current_slot={self._btc().ob_accumulator._current_slot} new_slot={slot}")
 
-            self.ob_accumulator.on_depth_update(
+            self._btc().ob_accumulator.on_depth_update(
                 bids=bids,
                 asks=asks,
                 src_price=mid,
@@ -780,11 +790,11 @@ class FullMetricsProcessor:
         """Callback when calibrator updates weights."""
         # Push updated weights to V2 inference engine
         # Convert list format to dict format expected by V2
-        v2_ladder = sorted(self.heatmap_v2.inference.leverage_weights.keys())
+        v2_ladder = sorted(self._btc().heatmap_v2.inference.leverage_weights.keys())
         if len(new_weights) == len(v2_ladder):
             new_weights_dict = dict(zip(v2_ladder, new_weights))
-            self.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-            self.heatmap_v2.config.buffer = new_buffer
+            self._btc().heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+            self._btc().heatmap_v2.config.buffer = new_buffer
 
     def _on_rest_poller_update(self, poller_state: PollerState):
         """Callback when REST poller has new OI/ratio data."""
@@ -847,11 +857,11 @@ class FullMetricsProcessor:
         if exchange == "binance":
             # Feed raw diff to reconstructor
             # The reconstructor callback will feed the accumulator with full book
-            self.ob_reconstructor.on_depth_diff(data)
+            self._btc().ob_reconstructor.on_depth_diff(data)
 
             # Update local orderbook from reconstructor for UI display
-            if self.ob_reconstructor.is_synced:
-                bids, asks = self.ob_reconstructor.get_full_book()
+            if self._btc().ob_reconstructor.is_synced:
+                bids, asks = self._btc().ob_reconstructor.get_full_book()
                 book = self.orderbooks[exchange]
                 book["bids"].clear()
                 book["asks"].clear()
@@ -1268,7 +1278,7 @@ class FullMetricsProcessor:
                 total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
                 buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
 
-                self.heatmap_v2.on_minute(
+                self._btc().heatmap_v2.on_minute(
                     minute_key=v2_minute_key,
                     src_price=v2_src,
                     high=self.state.perp_high,
@@ -1301,16 +1311,16 @@ class FullMetricsProcessor:
 
                 # Write V2 API snapshot (clustered pools with notional values)
                 # Use lower min_notional for snapshot so UI can filter
-                v2_snapshot = self.heatmap_v2.get_api_response(
+                v2_snapshot = self._btc().heatmap_v2.get_api_response(
                     price_center=v2_src,
                     price_range_pct=0.10,      # ±10% range for more visibility
                     min_notional_usd=1000.0    # Low threshold, UI can filter
                 )
-                v2_snapshot['stats'] = self.heatmap_v2.get_stats()
+                v2_snapshot['stats'] = self._btc().heatmap_v2.get_stats()
 
                 # Add intensity arrays for history buffer (same format as V1)
                 # Build price grid and map pools to intensity arrays
-                v2_steps = self.heatmap_v2.config.steps
+                v2_steps = self._btc().heatmap_v2.config.steps
                 band_pct = 0.10
                 price_min = round((v2_src * (1 - band_pct)) / v2_steps) * v2_steps
                 price_max = round((v2_src * (1 + band_pct)) / v2_steps) * v2_steps
@@ -1321,7 +1331,7 @@ class FullMetricsProcessor:
                     p += v2_steps
 
                 # Get raw heatmap data for intensity arrays
-                v2_heatmap = self.heatmap_v2.get_heatmap()
+                v2_heatmap = self._btc().heatmap_v2.get_heatmap()
                 v2_all_longs = v2_heatmap.get("long", {})
                 v2_all_shorts = v2_heatmap.get("short", {})
 
@@ -1351,19 +1361,19 @@ class FullMetricsProcessor:
 
                 # Apply persisted weights from calibrator on first update (to V2)
                 if not self._applied_persisted_weights:
-                    persisted = self.calibrator.get_persisted_weights()
+                    persisted = self._btc().calibrator.get_persisted_weights()
                     if persisted:
                         # Convert list format to dict for V2 inference
-                        v2_ladder = sorted(self.heatmap_v2.inference.leverage_weights.keys())
+                        v2_ladder = sorted(self._btc().heatmap_v2.inference.leverage_weights.keys())
                         if len(persisted['weights']) == len(v2_ladder):
                             new_weights_dict = dict(zip(v2_ladder, persisted['weights']))
-                            self.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-                            self.heatmap_v2.config.buffer = persisted['buffer']
+                            self._btc().heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+                            self._btc().heatmap_v2.config.buffer = persisted['buffer']
                             print(f"Loaded persisted weights to V2 (calibration #{persisted['calibration_count']})")
                     self._applied_persisted_weights = True
 
                 # Get top predicted liquidation zones from V2 engine (clustered pools)
-                v2_response = self.heatmap_v2.get_api_response(
+                v2_response = self._btc().heatmap_v2.get_api_response(
                     price_center=v2_src,
                     price_range_pct=0.25,      # ±25% range for more visibility
                     min_notional_usd=0         # No filtering, let UI handle it
@@ -1383,7 +1393,7 @@ class FullMetricsProcessor:
                 raw_shorts.sort(key=lambda x: x[1], reverse=True)
 
                 # Use V2 stats
-                self.state.liq_engine_stats = self.heatmap_v2.get_stats()
+                self.state.liq_engine_stats = self._btc().heatmap_v2.get_stats()
 
                 # Pass through ZoneTracker for UI stability
                 current_minute_ts = int(time.time() // 60)
@@ -1435,14 +1445,14 @@ class FullMetricsProcessor:
                        self.state.perp_low + self.state.perp_close) / 4
 
                 # Get V2 heatmap data for calibrator
-                v2_heatmap = self.heatmap_v2.get_heatmap()
-                v2_config = self.heatmap_v2.config
+                v2_heatmap = self._btc().heatmap_v2.get_heatmap()
+                v2_config = self._btc().heatmap_v2.config
 
                 # Build depth band for stress calculation (using V2 steps)
                 depth_band = self._build_depth_band(src, v2_config.steps)
 
                 # V2 leverage weights for calibrator
-                v2_leverage_weights = self.heatmap_v2.inference.leverage_weights
+                v2_leverage_weights = self._btc().heatmap_v2.inference.leverage_weights
                 v2_ladder = sorted(v2_leverage_weights.keys())
                 v2_weights = [v2_leverage_weights[lev] for lev in v2_ladder]
 
@@ -1507,7 +1517,7 @@ class FullMetricsProcessor:
         if src <= 0:
             return
 
-        steps = self.heatmap_v2.config.steps
+        steps = self._btc().heatmap_v2.config.steps
 
         # Build price range: ±8% around src, bucketed by steps
         band_pct = 0.08
@@ -1522,7 +1532,7 @@ class FullMetricsProcessor:
             p += steps
 
         # Get all zone strengths from V2 engine
-        v2_heatmap = self.heatmap_v2.get_heatmap()
+        v2_heatmap = self._btc().heatmap_v2.get_heatmap()
         all_longs = v2_heatmap.get("long", {})
         all_shorts = v2_heatmap.get("short", {})
 
