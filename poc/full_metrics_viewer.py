@@ -40,7 +40,6 @@ except ImportError:
     from rich import box
 
 from ws_connectors import MultiExchangeConnector
-from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
 from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
@@ -591,19 +590,6 @@ class FullMetricsProcessor:
         self.current_minute = datetime.now().minute
         self.prices_this_minute: List[float] = []
 
-        # Liquidation stress zone predictor
-        # Set debug_enabled=True and debug_log_file to see detailed output
-        self.liq_engine = LiquidationStressEngine(
-            steps=20.0,        # $20 price buckets for BTC
-            vol_length=50,     # 50-minute SMA for volume normalization
-            buffer=0.002,      # 0.2% buffer
-            fade=0.97,         # Decay factor
-            debug_symbol="BTC",
-            debug_enabled=True,
-            debug_log_file=os.path.join(POC_DIR, "liq_engine_debug.log"),
-            sweep_log_file=os.path.join(POC_DIR, "liq_sweeps.jsonl")  # JSONL sweep log
-        )
-
         # Self-calibrating system for leverage weights
         # Uses real Binance forceOrder liquidations as feedback
         self.calibrator = LiquidationCalibrator(
@@ -641,7 +627,7 @@ class FullMetricsProcessor:
 
         # ZoneTracker for UI stability (hysteresis + TTL)
         self.zone_tracker = ZoneTracker(
-            steps=20.0,              # Match liq_engine bucket size
+            steps=20.0,              # $20 price buckets for BTC
             max_zones=5,             # Display top 5 zones per side
             enter_margin=0.07,       # New zone must beat weakest by 7%
             exit_margin=0.05,        # Exit if below best non-displayed by 5%
@@ -1231,19 +1217,7 @@ class FullMetricsProcessor:
     def _check_minute_rollover(self):
         current_minute = datetime.now().minute
         if current_minute != self.current_minute:
-            # Update liquidation stress engine BEFORE resetting minute metrics
             if self.state.perp_close > 0:
-                # V1 engine disabled - using V2 exclusively
-                # minute_metrics = {
-                #     'perp_open': self.state.perp_open,
-                #     'perp_high': self.state.perp_high,
-                #     'perp_low': self.state.perp_low,
-                #     'perp_close': self.state.perp_close,
-                #     'perp_buyVol': self.state.perp_buyVol,
-                #     'perp_sellVol': self.state.perp_sellVol,
-                # }
-                # self.liq_engine.update("BTC", minute_metrics)
-
                 # Update V2 heatmap engine (OI inference layer)
                 # ohlc4 = (open + high + low + close) / 4
                 v2_src = (self.state.perp_open + self.state.perp_high +
