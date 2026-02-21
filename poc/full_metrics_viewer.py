@@ -1931,7 +1931,8 @@ def main():
                     snapshot_file=LIQ_API_SNAPSHOT,
                     snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
                     liq_heatmap_v1_file=LIQ_HEATMAP_V1_FILE,
-                    liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE
+                    liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE,
+                    engine_manager=processor.engine_manager
                 )
                 api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
                 console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")

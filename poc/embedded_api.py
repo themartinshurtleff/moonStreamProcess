@@ -13,7 +13,8 @@ Usage:
     app = create_embedded_app(
         ob_buffer=processor.ob_heatmap_buffer,
         snapshot_file=LIQ_API_SNAPSHOT,
-        snapshot_v2_file=LIQ_API_SNAPSHOT_V2
+        snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
+        engine_manager=processor.engine_manager
     )
     api_thread = start_api_thread(app, host="127.0.0.1", port=8899)
 """
@@ -55,8 +56,16 @@ try:
 except ImportError:
     pass
 
+# Try to import engine manager for V3 zone access
+HAS_ENGINE_MANAGER = False
+try:
+    from engine_manager import EngineManager, FULL_TO_SHORT
+    HAS_ENGINE_MANAGER = True
+except ImportError:
+    pass
+
 # API version
-API_VERSION = "2.1.0"  # Bumped for embedded mode
+API_VERSION = "3.0.0"  # V3 with zone lifecycle endpoints
 
 # Default grid parameters
 DEFAULT_STEP = 20.0
@@ -302,13 +311,15 @@ class EmbeddedAPIState:
         snapshot_file: Optional[str] = None,
         snapshot_v2_file: Optional[str] = None,
         liq_heatmap_v1_file: Optional[str] = None,
-        liq_heatmap_v2_file: Optional[str] = None
+        liq_heatmap_v2_file: Optional[str] = None,
+        engine_manager: Optional['EngineManager'] = None
     ):
         self.ob_buffer = ob_buffer
         self.snapshot_file = snapshot_file
         self.snapshot_v2_file = snapshot_v2_file
         self.liq_heatmap_v1_file = liq_heatmap_v1_file
         self.liq_heatmap_v2_file = liq_heatmap_v2_file
+        self.engine_manager = engine_manager
         self.start_time = time.time()
 
         # Cached snapshot data
@@ -383,7 +394,8 @@ def create_embedded_app(
     snapshot_file: Optional[str] = None,
     snapshot_v2_file: Optional[str] = None,
     liq_heatmap_v1_file: Optional[str] = None,
-    liq_heatmap_v2_file: Optional[str] = None
+    liq_heatmap_v2_file: Optional[str] = None,
+    engine_manager: Optional['EngineManager'] = None
 ) -> 'FastAPI':
     """
     Create FastAPI application with shared buffer references.
@@ -397,7 +409,8 @@ def create_embedded_app(
         snapshot_file=snapshot_file,
         snapshot_v2_file=snapshot_v2_file,
         liq_heatmap_v1_file=liq_heatmap_v1_file,
-        liq_heatmap_v2_file=liq_heatmap_v2_file
+        liq_heatmap_v2_file=liq_heatmap_v2_file,
+        engine_manager=engine_manager
     )
 
     app = FastAPI(
@@ -972,6 +985,216 @@ def create_embedded_app(
 
         return JSONResponse(content=debug_info)
 
+    # =========================================================================
+    # V3 Zone Lifecycle Endpoints (via EngineManager — live in-memory data)
+    # =========================================================================
+
+    def _resolve_symbol(symbol_full: str) -> Optional[str]:
+        """Convert full symbol (e.g. 'BTCUSDT') or short symbol (e.g. 'BTC') to short form."""
+        if HAS_ENGINE_MANAGER:
+            short = FULL_TO_SHORT.get(symbol_full)
+            if short:
+                return short
+        # Already short form or direct match
+        return symbol_full
+
+    def _get_zone_manager(symbol_short: str):
+        """Get the zone_manager for a symbol from the engine_manager."""
+        if not state.engine_manager:
+            return None
+        engine = state.engine_manager.get_engine(symbol_short)
+        if not engine:
+            return None
+        return getattr(engine.heatmap_v2, 'zone_manager', None)
+
+    @app.get("/v3/liq_zones")
+    async def liq_zones_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        side: str = Query(default=None, description="Filter by side: 'long' or 'short'"),
+        min_leverage: int = Query(default=None, description="Minimum leverage tier to include"),
+        max_leverage: int = Query(default=None, description="Maximum leverage tier to include"),
+        min_weight: float = Query(default=None, description="Minimum zone weight to include")
+    ):
+        """
+        Get V3 active liquidation zones from zone lifecycle manager.
+
+        Returns persistent zones with lifecycle tracking:
+        - CREATED: New zones from inference or tape
+        - REINFORCED: Zones strengthened by repeated predictions
+        - (Zones are removed when SWEPT by price or EXPIRED by time/decay)
+        """
+        symbol_short = _resolve_symbol(symbol)
+
+        if not state.engine_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Engine manager not available"
+            )
+
+        zone_mgr = _get_zone_manager(symbol_short)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+            )
+
+        # Get active zones with filters
+        zones = zone_mgr.get_active_zones(
+            side=side,
+            min_leverage=min_leverage,
+            max_leverage=max_leverage
+        )
+
+        # Apply min_weight filter if specified
+        if min_weight is not None and min_weight > 0:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+
+        # Get summary stats
+        summary = zone_mgr.get_summary()
+
+        response = {
+            "symbol": symbol_short,
+            "ts": time.time(),
+            "zones": zones,
+            "zones_count": len(zones),
+            "summary": summary,
+            "filters": {
+                "side": side,
+                "min_leverage": min_leverage,
+                "max_leverage": max_leverage,
+                "min_weight": min_weight
+            }
+        }
+
+        return JSONResponse(content=response)
+
+    @app.get("/v3/liq_zones_summary")
+    async def liq_zones_summary_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query")
+    ):
+        """
+        Get V3 zone lifecycle summary statistics.
+
+        Returns counts and totals for zone lifecycle tracking.
+        """
+        symbol_short = _resolve_symbol(symbol)
+
+        if not state.engine_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Engine manager not available"
+            )
+
+        zone_mgr = _get_zone_manager(symbol_short)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+            )
+
+        summary = zone_mgr.get_summary()
+        summary["symbol"] = symbol_short
+        summary["ts"] = time.time()
+
+        return JSONResponse(content=summary)
+
+    @app.get("/v3/liq_heatmap")
+    async def liq_heatmap_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        min_notional: float = Query(default=0, description="Minimum USD notional to include"),
+        min_leverage: int = Query(default=None, description="Minimum leverage tier to include (5-250)"),
+        max_leverage: int = Query(default=None, description="Maximum leverage tier to include (5-250)"),
+        min_weight: float = Query(default=None, description="Minimum zone weight to include")
+    ):
+        """
+        Get V3 liquidation heatmap with full leverage filtering.
+
+        Uses the zone lifecycle manager for filtering by leverage tier.
+        Unlike V2, this supports filtering zones based on which leverage tiers
+        contributed to them.
+        """
+        symbol_short = _resolve_symbol(symbol)
+
+        if not state.engine_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Engine manager not available. Use /v2/liq_heatmap for snapshot-based data."
+            )
+
+        zone_mgr = _get_zone_manager(symbol_short)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+            )
+
+        # Get zones with leverage filtering
+        zones = zone_mgr.get_active_zones(
+            side=None,  # Get both sides
+            min_leverage=min_leverage,
+            max_leverage=max_leverage
+        )
+
+        # Apply additional filters
+        if min_weight is not None and min_weight > 0:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+
+        # Separate into long and short levels
+        long_levels = []
+        short_levels = []
+
+        for z in zones:
+            # Estimate notional from weight (inverse of normalization)
+            estimated_notional = z['weight'] * 100000.0
+
+            if min_notional > 0 and estimated_notional < min_notional:
+                continue
+
+            level = {
+                "price": z['price'],
+                "weight": z['weight'],
+                "notional_usd": round(estimated_notional, 2),
+                "tier_contributions": z.get('tier_contributions', {}),
+                "reinforcement_count": z.get('reinforcement_count', 0),
+                "source": z.get('source', 'unknown'),
+                "created_at": z.get('created_at'),
+                "last_reinforced_at": z.get('last_reinforced_at')
+            }
+
+            if z['side'] == 'long':
+                long_levels.append(level)
+            else:
+                short_levels.append(level)
+
+        # Sort by weight descending
+        long_levels.sort(key=lambda x: -x['weight'])
+        short_levels.sort(key=lambda x: -x['weight'])
+
+        # Get summary for meta
+        summary = zone_mgr.get_summary()
+
+        response = {
+            "symbol": symbol_short,
+            "ts": time.time(),
+            "long_levels": long_levels,
+            "short_levels": short_levels,
+            "meta": {
+                "min_leverage": min_leverage,
+                "max_leverage": max_leverage,
+                "min_weight": min_weight,
+                "min_notional": min_notional,
+                "filtered": bool(min_leverage or max_leverage or min_weight or min_notional),
+                "long_pools_count": len(long_levels),
+                "short_pools_count": len(short_levels),
+                "total_long_weight": summary.get('total_weight_long', 0),
+                "total_short_weight": summary.get('total_weight_short', 0),
+                "zones_created": summary.get('zones_created_total', 0),
+                "zones_swept": summary.get('zones_swept_total', 0)
+            }
+        }
+
+        return JSONResponse(content=response)
+
     return app
 
 
@@ -1004,5 +1227,8 @@ def start_api_thread(
     print(f"  GET http://{host}:{port}/v2/liq_heatmap_history")
     print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s")
     print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s_history")
+    print(f"  GET http://{host}:{port}/v3/liq_zones")
+    print(f"  GET http://{host}:{port}/v3/liq_zones_summary")
+    print(f"  GET http://{host}:{port}/v3/liq_heatmap")
 
     return thread
