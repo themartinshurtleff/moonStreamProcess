@@ -12,14 +12,15 @@ Single source of truth for how this codebase works. Read this before making any 
 6. [Data Flow — Critical Paths](#data-flow--critical-paths)
 7. [Calibrator Integration Rules — CRITICAL](#calibrator-integration-rules--critical)
 8. [API Endpoint Inventory](#api-endpoint-inventory)
-9. [Snapshot Pipeline](#snapshot-pipeline)
-10. [NEVER DO — Code Rules](#never-do--code-rules)
-11. [Known Bugs and Past Issues](#known-bugs-and-past-issues)
-12. [Symbol Conventions](#symbol-conventions)
-13. [File and State Inventory](#file-and-state-inventory)
-14. [Multi-Exchange Implementation Notes](#multi-exchange-implementation-notes)
-15. [Testing Checklist](#testing-checklist-before-deployment)
-16. [Verification Steps](#verification-steps-after-code-changes)
+9. [Response Caching](#response-caching)
+10. [Snapshot Pipeline](#snapshot-pipeline)
+11. [NEVER DO — Code Rules](#never-do--code-rules)
+12. [Known Bugs and Past Issues](#known-bugs-and-past-issues)
+13. [Symbol Conventions](#symbol-conventions)
+14. [File and State Inventory](#file-and-state-inventory)
+15. [Multi-Exchange Implementation Notes](#multi-exchange-implementation-notes)
+16. [Testing Checklist](#testing-checklist-before-deployment)
+17. [Verification Steps](#verification-steps-after-code-changes)
 
 ---
 
@@ -32,7 +33,7 @@ All core code lives in `poc/`. The system collects Binance Futures market data v
 | `full_metrics_viewer.py` | **Main entry point.** Launches WebSocket/REST connections, instantiates all sub-engines, runs Rich terminal dashboard at 4 FPS, writes snapshot files, starts embedded API server. |
 | `ws_connectors.py` | `BinanceConnector` and `MultiExchangeConnector` — WebSocket streams for depth, aggTrade, forceOrder, markPrice. |
 | `rest_pollers.py` | Async REST pollers for open interest, top trader account/position ratios, global account ratios. |
-| `liq_engine.py` | V1 `LiquidationStressEngine` — volume-based liquidation zone prediction (superseded by V2). |
+| `liq_engine.py` | **ORPHANED (Phase 1).** V1 `LiquidationStressEngine` — volume-based liquidation zone prediction. Superseded by V2 heatmap. Still importable but no longer instantiated by the viewer. |
 | `liq_heatmap.py` | V2 `LiquidationHeatmap` — unified engine combining `LiquidationTape` + `EntryInference` for forward-looking liquidation pools. |
 | `liq_tape.py` | Ground-truth liquidation accumulator from forceOrder events. Tracks actual liquidation volumes by price bucket. |
 | `entry_inference.py` | Infers position entries from OI changes + taker aggression, projects liquidation prices across leverage tiers. |
@@ -40,8 +41,9 @@ All core code lives in `poc/`. The system collects Binance Futures market data v
 | `leverage_config.py` | Per-symbol leverage ladder definitions and tier weight constants (5x through 250x). |
 | `active_zone_manager.py` | V3 zone lifecycle manager. Persistent zones: CREATED → REINFORCED → SWEPT/EXPIRED. Disk persistence via JSON. |
 | `ob_heatmap.py` | Orderbook heatmap with `OrderbookReconstructor` (snapshot+diff) and `OrderbookAccumulator` (30-second frames). Binary ring buffer persistence. |
-| `liq_api.py` | **Standalone** FastAPI HTTP server (v3.0.0). Reads from snapshot files on disk. Includes V3 zone endpoints. Run separately from viewer. |
-| `embedded_api.py` | **Embedded** FastAPI server (v2.1.0). Runs as daemon thread inside viewer. Shares `ob_buffer` by direct Python reference. No V3 endpoints. |
+| `liq_api.py` | **ORPHANED (Phase 1).** Standalone FastAPI HTTP server (v3.0.0). Reads from snapshot files on disk. Superseded by `embedded_api.py` which now has all endpoints including V3 zones. |
+| `engine_manager.py` | `EngineManager` + `EngineInstance` — per-symbol container holding calibrator, heatmap_v2, zone_manager, ob_reconstructor, ob_accumulator. Single owner of all engine objects after init. |
+| `embedded_api.py` | **Embedded** FastAPI server (v3.0.0). Runs as daemon thread inside viewer. Shares `ob_buffer` by direct Python reference. Receives `EngineManager` for V3 zone endpoints. Includes `ResponseCache` for concurrent-user scaling. All endpoints (V1–V3) available. **This is now the only API server needed.** |
 | `liq_plotter.py` | Matplotlib live chart tailing `plot_feed.jsonl`. |
 | `metrics_viewer.py` | Earlier/simpler viewer (predecessor to `full_metrics_viewer.py`). |
 | `list_metrics.py` | Reference script listing all ~40 BTC perpetual metrics from Binance. |
@@ -71,11 +73,6 @@ Base URL: `wss://fstream.binance.com/ws`
 ## Engine Instantiation Parameters
 
 These are the actual values used in `full_metrics_viewer.py` `FullMetricsProcessor.__init__()`:
-
-### LiquidationStressEngine (V1) — line 596
-```python
-steps=20.0, vol_length=50, buffer=0.002, fade=0.97, debug_symbol="BTC"
-```
 
 ### LiquidationCalibrator — line 609
 ```python
@@ -231,14 +228,14 @@ Zone lifecycle: **CREATED** → **REINFORCED** (repeatable) → **SWEPT** (by pr
 
 ## Data Flow — Critical Paths
 
-### Path A: ForceOrder Event → Calibrator → Heatmap Rendering
+### Path A: ForceOrder Event → EngineManager → Calibrator → Heatmap Rendering
 
 ```
 Binance WS forceOrder
   → MultiExchangeConnector callback
     → full_metrics_viewer on_force_order()
-      → LiquidationTape.on_liquidation()       (V2 ground truth)
-      → LiquidationCalibrator.on_liquidation()  (calibration feedback)
+      → self._btc().heatmap_v2.tape.on_liquidation()       (V2 ground truth, via EngineManager)
+      → self._btc().calibrator.on_liquidation()             (calibration feedback, via EngineManager)
         → event appended to events_window (line 724)
         → _process_event() called
           → _get_snapshot_for_event() looks up self.snapshots
@@ -252,10 +249,9 @@ Binance WS forceOrder
 BinanceRESTPollerThread polls /fapi/v1/openInterest every ~5s
   → PollerState.oi updated
     → full_metrics_viewer reads poller_state.oi each cycle
-      → EntryInference.on_oi_update()
+      → EntryInference.on_oi_update()  (via self._btc().heatmap_v2)
         → detects OI delta → infers new position entries
         → projects liquidation prices per leverage tier
-      → LiquidationStressEngine also consumes OI for V1 zones
 ```
 
 ### Path C: Minute Rollover → Snapshot → API → Frontend
@@ -263,14 +259,14 @@ BinanceRESTPollerThread polls /fapi/v1/openInterest every ~5s
 ```
 full_metrics_viewer detects new minute boundary
   → computes OHLC4 from accumulated ticks
-  → calls calibrator.on_minute_snapshot(ohlc4, predictions, ladder, weights, ...)
-  → calls liq_engine.compute_snapshot() (V1)
-  → calls liq_heatmap.compute_snapshot() (V2)
+  → calls self._btc().calibrator.on_minute_snapshot(...)  (via EngineManager)
+  → calls self._btc().heatmap_v2.compute_snapshot()       (via EngineManager)
   → _write_api_snapshot(snapshot)       → poc/liq_api_snapshot.json
   → _write_api_snapshot_v2(snapshot_v2) → poc/liq_api_snapshot_v2.json
-  → API cache refresh thread reads JSON every 1 second
+  → Embedded API cache refresh thread reads JSON every 5 seconds
     → adds frame to LiquidationHeatmapBuffer (deduplicates by minute)
-    → serves via /v1/liq_heatmap or /v2/liq_heatmap endpoints
+    → ResponseCache serves cached responses (TTL-based per endpoint)
+    → serves via /liq_heatmap, /liq_heatmap_v2, /liq_zones endpoints
 ```
 
 ### Path D: Calibrator Learning Loop
@@ -319,27 +315,47 @@ If `on_minute_snapshot()` is never called, `self.snapshots` stays empty. If `sel
 
 ## API Endpoint Inventory
 
-### Standalone Server (liq_api.py, v3.0.0, port 8899)
+### Embedded Server (embedded_api.py, v3.0.0, port 8899)
 
-| Method | Path | Params | Data Source |
-|--------|------|--------|-------------|
-| GET | `/v1/health` | — | In-memory cache + disk file check |
-| GET | `/v1/liq_heatmap` | `symbol`, `window_minutes` | `SnapshotCache` ← `liq_api_snapshot.json` (1s refresh) |
-| GET | `/v1/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v1.bin` |
-| GET | `/v2/liq_heatmap` | `symbol`, `min_notional` | Direct disk read of `liq_api_snapshot_v2.json` |
-| GET | `/v2/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v2.bin` |
-| GET | `/v2/liq_stats` | `symbol` | Direct disk read of `liq_api_snapshot_v2.json` |
-| GET | `/v3/liq_zones` | `symbol`, `side`, `min_leverage`, `max_leverage`, `min_weight` | `ActiveZoneManager` (in-memory) |
-| GET | `/v3/liq_zones_summary` | `symbol` | `ActiveZoneManager` (in-memory) |
-| GET | `/v3/liq_heatmap` | `symbol`, `min_notional`, `min_leverage`, `max_leverage`, `min_weight` | `ActiveZoneManager` (in-memory) |
-| GET | `/v2/orderbook_heatmap_30s` | `symbol`, `range_pct`, `step`, `price_min`, `price_max`, `format` | `OrderbookHeatmapBuffer` ← `ob_heatmap_30s.bin` (5s tail) |
-| GET | `/v2/orderbook_heatmap_30s_history` | `symbol`, `minutes`, `stride`, `range_pct`, `step`, `price_min`, `price_max`, `format` | Same buffer |
-| GET | `/v2/orderbook_heatmap_30s_stats` | — | Buffer stats + `ob_recon_stats.json` |
-| GET | `/v2/orderbook_heatmap_30s_debug` | — | Module checks + buffer stats |
+**This is the only API server needed.** Runs as a daemon thread inside `full_metrics_viewer.py`. Shares `ob_buffer` by direct Python reference. Receives `EngineManager` for V3 zone access. All responses go through `ResponseCache` (see Response Caching section).
 
-### Embedded Server (embedded_api.py, v2.1.0, port 8899)
+Clean paths are primary. Old `/vN/` paths are backwards-compatible aliases via stacked FastAPI `@app.get()` decorators.
 
-Same endpoints as standalone EXCEPT: no `/v3/*` endpoints. Orderbook data comes from shared Python object reference (no disk I/O). Liq snapshots still read from disk JSON files.
+| Method | Primary Path | Alias | Params | Data Source | Cache TTL |
+|--------|-------------|-------|--------|-------------|-----------|
+| GET | `/health` | `/v1/health` | — | In-memory state | none |
+| GET | `/liq_heatmap` | `/v1/liq_heatmap` | `symbol` | `liq_api_snapshot.json` (5s refresh) | 5s |
+| GET | `/liq_heatmap_history` | `/v1/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v1.bin` | 30s |
+| GET | `/liq_heatmap_v2` | `/v2/liq_heatmap` | `symbol`, `min_notional` | `liq_api_snapshot_v2.json` (5s refresh) | 5s |
+| GET | `/liq_heatmap_v2_history` | `/v2/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v2.bin` | 30s |
+| GET | `/liq_stats` | `/v2/liq_stats` | `symbol` | `liq_api_snapshot_v2.json` | 5s |
+| GET | `/liq_zones` | `/v3/liq_zones` | `symbol`, `side`, `min_leverage`, `max_leverage`, `min_weight` | `EngineManager` → `ActiveZoneManager` (in-memory) | 5s |
+| GET | `/liq_zones_summary` | `/v3/liq_zones_summary` | `symbol` | `EngineManager` → `ActiveZoneManager` (in-memory) | 5s |
+| GET | `/liq_zones_heatmap` | `/v3/liq_heatmap` | `symbol`, `min_notional`, `min_leverage`, `max_leverage`, `min_weight` | `EngineManager` → `ActiveZoneManager` (in-memory) | 5s |
+| GET | `/orderbook_heatmap` | `/v2/orderbook_heatmap_30s` | `symbol`, `range_pct`, `step`, `price_min`, `price_max`, `format` | Shared `ob_buffer` (direct Python reference) | 5s (json only) |
+| GET | `/orderbook_heatmap_history` | `/v2/orderbook_heatmap_30s_history` | `symbol`, `minutes`, `stride`, `range_pct`, `step`, `price_min`, `price_max`, `format` | Shared `ob_buffer` | 30s (json only) |
+| GET | `/orderbook_heatmap_stats` | `/v2/orderbook_heatmap_30s_stats` | — | Buffer stats + `ob_recon_stats.json` | 10s |
+| GET | `/orderbook_heatmap_debug` | `/v2/orderbook_heatmap_30s_debug` | — | Module checks + buffer stats | 10s |
+
+**Note:** Binary format responses (`format=bin`) for orderbook endpoints bypass the `ResponseCache` and are always generated fresh.
+
+### Standalone Server (liq_api.py — ORPHANED)
+
+`liq_api.py` is no longer needed. All its endpoints (including V3 zones) are now served by `embedded_api.py`. The standalone server remains in the codebase for reference but should not be run alongside the viewer.
+
+## Response Caching
+
+Defined in `embedded_api.py` via the `ResponseCache` class. Thread-safe `Dict[str, Tuple[JSONResponse, float]]` protected by `threading.Lock`.
+
+| Endpoint Group | TTL | Rationale |
+|----------------|-----|-----------|
+| Live data (`/liq_heatmap`, `/liq_heatmap_v2`, `/liq_stats`, `/liq_zones`, `/liq_zones_summary`, `/liq_zones_heatmap`, `/orderbook_heatmap`) | **5 seconds** | Snapshot data updates every 60s (liq) or 30s (OB); 5s is the minimum allowed by CLAUDE.md rules |
+| History (`/liq_heatmap_history`, `/liq_heatmap_v2_history`, `/orderbook_heatmap_history`) | **30 seconds** | Historical data changes slowly; 30s avoids redundant recomputation |
+| Stats/debug (`/orderbook_heatmap_stats`, `/orderbook_heatmap_debug`) | **10 seconds** | Diagnostic data, moderate refresh |
+| Health (`/health`) | **none** | Always computed fresh for monitoring accuracy |
+| Binary responses (`format=bin`) | **none** | Binary `Response` objects bypass the cache (only `JSONResponse` is cached) |
+
+Cache keys include all query parameters that affect the response (e.g., `liq_zones?symbol=BTC&side=long&min_leverage=20`). This prevents cross-contamination between different filter combinations.
 
 ## Snapshot Pipeline
 
@@ -350,14 +366,16 @@ full_metrics_viewer.py (writer)
   ├─ liq_api_snapshot_v2.json   ← V2 heatmap (overwritten every minute)
   ├─ ob_heatmap_30s.bin         ← OB frames (appended every 30s, 4KB records)
   ├─ ob_recon_stats.json        ← OB reconstructor diagnostics
-  ├─ liq_heatmap_v1.bin         ← V1 history ring buffer (appended by standalone API)
-  ├─ liq_heatmap_v2.bin         ← V2 history ring buffer (appended by standalone API)
+  ├─ liq_heatmap_v1.bin         ← V1 history ring buffer (appended by embedded API)
+  ├─ liq_heatmap_v2.bin         ← V2 history ring buffer (appended by embedded API)
   └─ plot_feed.jsonl            ← OHLC + zone data for matplotlib plotter
 
-API Server (reader)
+Embedded API Server (reader — daemon thread in viewer)
   │
-  ├─ Standalone: reads JSON every 1s, tails .bin every 5s
-  └─ Embedded: shares ob_buffer by reference, reads JSON every 1s
+  ├─ Shares ob_buffer by direct Python reference (no disk I/O for OB)
+  ├─ Reads liq JSON snapshots every 5s (EmbeddedAPIState._cache_ttl)
+  ├─ Receives EngineManager for V3 zone access (in-memory, no disk)
+  └─ ResponseCache serves concurrent users from TTL-based cache
 
 Frontend (consumer)
   │
@@ -370,16 +388,18 @@ Frontend (consumer)
 
 ## NEVER DO — Code Rules
 
-1. **NEVER create standalone zone managers in API endpoints** — always route through the engine manager's live instances
+1. **NEVER create standalone engine or zone manager instances in API endpoints** — always route through `EngineManager`'s live `EngineInstance` objects
 2. **NEVER assume the calibrator is working just because `on_liquidation()` is being called** — verify `total_events` is incrementing by also wiring `on_minute_snapshot()`
 3. **NEVER change API response formats without documenting the exact JSON shape** — the frontend Rust parser must match exactly
-4. **NEVER set liq_api.py `refresh_interval` below 5.0 seconds**
+4. **NEVER set `EmbeddedAPIState._cache_ttl` below 5.0 seconds** — this controls disk I/O refresh for snapshot files
 5. **NEVER hardcode "127.0.0.1" as the API bind address** — use "0.0.0.0" for production configs
 6. **NEVER wire `on_liquidation()` without also wiring `on_minute_snapshot()`** — both are required or the calibrator silently drops all events
 7. **NEVER modify the calibrator's weight file format without updating `_load_weights()` migration logic**
 8. **NEVER share state between per-symbol engines** — each symbol gets independent calibrator, weights, zone manager, and frame buffer
 9. **NEVER create background threads with refresh intervals under 5 seconds for disk I/O or HTTP requests**
 10. **NEVER swallow exceptions silently in data pipelines** — always log the full traceback
+11. **NEVER access engine objects (calibrator, heatmap_v2, ob_reconstructor, ob_accumulator) as direct attributes of `FullMetricsProcessor`** — always go through `self._btc()` (or `self.engine_manager.get_engine(symbol)` for multi-symbol). Direct attributes are `del`'d after `EngineInstance` registration.
+12. **NEVER instantiate standalone `ActiveZoneManager` instances in API endpoints** — always resolve zones through `EngineManager → EngineInstance → heatmap_v2.zone_manager`. Creating standalone instances produces zones with no data.
 
 ## Known Bugs and Past Issues
 
@@ -402,7 +422,7 @@ Frontend (consumer)
 
 - **Calibrator uses short symbols:** `"BTC"`, `"ETH"`, `"SOL"`
 - **Exchange APIs use full symbols:** `"BTCUSDT"`, `"ETHUSDT"`, `"SOLUSDT"`
-- `SYMBOL_SHORT_MAP` must be used for conversion
+- `SYMBOL_SHORT_MAP` (ws_connectors) and `FULL_TO_SHORT` (engine_manager) must be used for conversion
 - The calibrator's `on_liquidation()` checks `event.symbol` against `self.symbol` — these MUST match or the event is silently dropped (line 720)
 - The viewer creates the calibrator with `symbol="BTC"` (line 609 of `full_metrics_viewer.py`)
 - ForceOrder events pass `'symbol': 'BTC'` (short form) — this matches correctly
@@ -411,12 +431,12 @@ Frontend (consumer)
 
 | File | Created By | Read By | Missing at Startup |
 |------|-----------|---------|-------------------|
-| `poc/liq_api_snapshot.json` | `full_metrics_viewer.py` (every minute) | API server (every 1s) | API returns 404 — normal on first run |
-| `poc/liq_api_snapshot_v2.json` | `full_metrics_viewer.py` (every minute) | API server (every 1s) | API returns 404 — normal on first run |
-| `poc/ob_heatmap_30s.bin` | `OrderbookAccumulator` (every 30s) | API server (loaded at startup, tailed every 5s) | API returns 404 for OB endpoints — normal on first run |
-| `poc/ob_recon_stats.json` | `full_metrics_viewer.py` (periodically) | API `/v2/orderbook_heatmap_30s_stats` | Stats show "file not found" — non-fatal |
-| `poc/liq_heatmap_v1.bin` | Standalone API `LiquidationHeatmapBuffer` | API (loaded at startup for history) | No history available — empty response, non-fatal |
-| `poc/liq_heatmap_v2.bin` | Standalone API `LiquidationHeatmapBuffer` | API (loaded at startup for history) | No history available — empty response, non-fatal |
+| `poc/liq_api_snapshot.json` | `full_metrics_viewer.py` (every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot_v2.json` | `full_metrics_viewer.py` (every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/ob_heatmap_30s.bin` | `OrderbookAccumulator` (every 30s) | Embedded API (shared buffer, no disk read) | API returns 404 for OB endpoints — normal on first run |
+| `poc/ob_recon_stats.json` | `full_metrics_viewer.py` (periodically) | Embedded API `/orderbook_heatmap_stats` | Stats show "file not found" — non-fatal |
+| `poc/liq_heatmap_v1.bin` | Embedded API `LiquidationHeatmapBuffer` | Embedded API (loaded at startup for history) | No history available — empty response, non-fatal |
+| `poc/liq_heatmap_v2.bin` | Embedded API `LiquidationHeatmapBuffer` | Embedded API (loaded at startup for history) | No history available — empty response, non-fatal |
 | `poc/old_logs/old_log/liq_calibrator_weights.json` | `LiquidationCalibrator._save_weights()` (atomic write) | `LiquidationCalibrator._load_weights()` at startup | Uses default uniform weights — non-fatal |
 | `poc/liq_calibrator_weights.json` | Calibrator (may also write here) | Calibrator | Falls back to default weights |
 | `poc/plot_feed.jsonl` | `full_metrics_viewer.py` (every minute) | `liq_plotter.py` (tail) | Plotter waits for data — non-fatal |
@@ -445,18 +465,20 @@ When implementing multi-exchange support:
 
 - [ ] All WebSocket streams connecting (depth, aggTrade, forceOrder, markPrice)
 - [ ] REST pollers returning data (OI, ratios)
-- [ ] V1 and V2 heatmap snapshots being written to disk
-- [ ] Calibrator `total_events` incrementing after forceOrder events arrive
+- [ ] V2 heatmap snapshots being written to disk (`liq_api_snapshot_v2.json`)
+- [ ] EngineManager has registered engine (`engine_manager.get_engine("BTC")` is not None)
+- [ ] Calibrator `total_events` incrementing after forceOrder events arrive (via `self._btc().calibrator`)
 - [ ] Calibrator `self.snapshots` dict is non-empty (proves `on_minute_snapshot()` is wired)
-- [ ] API endpoints return populated data (not empty arrays)
+- [ ] All API endpoints return populated data (not empty arrays), including V3 zone endpoints
 - [ ] OB heatmap frames accumulating in `ob_heatmap_30s.bin`
 - [ ] No silent exceptions in logs
 - [ ] Weight file being written/updated after calibration window (30 minutes)
 
 ## Verification Steps After Code Changes
 
-1. **Confirm calibrator `total_events` increments** after forceOrder events arrive
-2. **Confirm all API endpoints return populated data** (not empty arrays)
-3. **Confirm API response JSON format matches** what the frontend Rust structs expect
-4. **Confirm no silent exceptions in logs**
-5. **If multi-symbol:** confirm each symbol's calibrator is independently receiving and counting events
+1. **Confirm `engine_manager.get_engine("BTC")` returns a valid `EngineInstance`** with non-None calibrator and heatmap_v2
+2. **Confirm calibrator `total_events` increments** after forceOrder events arrive (via `self._btc().calibrator`)
+3. **Confirm all API endpoints return populated data** (not empty arrays), including V3 zone endpoints
+4. **Confirm API response JSON format matches** what the frontend Rust structs expect
+5. **Confirm no silent exceptions in logs**
+6. **If multi-symbol:** confirm each symbol's calibrator is independently receiving and counting events
