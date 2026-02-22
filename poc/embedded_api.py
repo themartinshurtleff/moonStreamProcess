@@ -438,7 +438,8 @@ def create_embedded_app(
     async def shutdown():
         state.stop()
 
-    @app.get("/v1/health")
+    @app.get("/health")
+    @app.get("/v1/health")  # backwards compat alias
     async def health():
         """Health check endpoint."""
         ob_stats = {}
@@ -474,7 +475,8 @@ def create_embedded_app(
             }
         }
 
-    @app.get("/v1/liq_heatmap")
+    @app.get("/liq_heatmap")
+    @app.get("/v1/liq_heatmap")  # backwards compat alias
     async def liq_heatmap(
         symbol: str = Query(default="BTC", description="Symbol to query")
     ):
@@ -500,7 +502,8 @@ def create_embedded_app(
 
         return JSONResponse(content=snapshot)
 
-    @app.get("/v1/liq_heatmap_history")
+    @app.get("/liq_heatmap_history")
+    @app.get("/v1/liq_heatmap_history")  # backwards compat alias
     async def liq_heatmap_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
@@ -565,7 +568,8 @@ def create_embedded_app(
             "step": step, "scale": 255, "_mode": "embedded"
         })
 
-    @app.get("/v2/liq_heatmap")
+    @app.get("/liq_heatmap_v2")
+    @app.get("/v2/liq_heatmap")  # backwards compat alias
     async def liq_heatmap_v2(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         min_notional: float = Query(default=0, description="Minimum USD notional to include")
@@ -603,7 +607,8 @@ def create_embedded_app(
 
         return JSONResponse(content=snapshot)
 
-    @app.get("/v2/liq_heatmap_history")
+    @app.get("/liq_heatmap_v2_history")
+    @app.get("/v2/liq_heatmap_history")  # backwards compat alias
     async def liq_heatmap_history_v2(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
@@ -668,7 +673,8 @@ def create_embedded_app(
             "step": step, "scale": 255, "_mode": "embedded"
         })
 
-    @app.get("/v2/liq_stats")
+    @app.get("/liq_stats")
+    @app.get("/v2/liq_stats")  # backwards compat alias
     async def liq_stats_v2(
         symbol: str = Query(default="BTC", description="Symbol to query")
     ):
@@ -690,7 +696,8 @@ def create_embedded_app(
     # Orderbook Heatmap Endpoints (30s DoM - uses shared buffer directly)
     # =========================================================================
 
-    @app.get("/v2/orderbook_heatmap_30s")
+    @app.get("/orderbook_heatmap")
+    @app.get("/v2/orderbook_heatmap_30s")  # backwards compat alias
     async def orderbook_heatmap_30s(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
@@ -807,7 +814,8 @@ def create_embedded_app(
 
         return JSONResponse(content=response)
 
-    @app.get("/v2/orderbook_heatmap_30s_history")
+    @app.get("/orderbook_heatmap_history")
+    @app.get("/v2/orderbook_heatmap_30s_history")  # backwards compat alias
     async def orderbook_heatmap_30s_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
@@ -912,7 +920,8 @@ def create_embedded_app(
             "_mode": "shared_buffer"
         })
 
-    @app.get("/v2/orderbook_heatmap_30s_stats")
+    @app.get("/orderbook_heatmap_stats")
+    @app.get("/v2/orderbook_heatmap_30s_stats")  # backwards compat alias
     async def orderbook_heatmap_30s_stats():
         """
         Get orderbook heatmap buffer and reconstructor statistics.
@@ -968,7 +977,8 @@ def create_embedded_app(
 
         return JSONResponse(content=stats)
 
-    @app.get("/v2/orderbook_heatmap_30s_debug")
+    @app.get("/orderbook_heatmap_debug")
+    @app.get("/v2/orderbook_heatmap_30s_debug")  # backwards compat alias
     async def orderbook_heatmap_30s_debug():
         """Debug endpoint for orderbook heatmap system."""
         debug_info = {
@@ -1007,7 +1017,8 @@ def create_embedded_app(
             return None
         return getattr(engine.heatmap_v2, 'zone_manager', None)
 
-    @app.get("/v3/liq_zones")
+    @app.get("/liq_zones")
+    @app.get("/v3/liq_zones")  # backwards compat alias
     async def liq_zones_v3(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         side: str = Query(default=None, description="Filter by side: 'long' or 'short'"),
@@ -1068,7 +1079,8 @@ def create_embedded_app(
 
         return JSONResponse(content=response)
 
-    @app.get("/v3/liq_zones_summary")
+    @app.get("/liq_zones_summary")
+    @app.get("/v3/liq_zones_summary")  # backwards compat alias
     async def liq_zones_summary_v3(
         symbol: str = Query(default="BTC", description="Symbol to query")
     ):
@@ -1098,7 +1110,8 @@ def create_embedded_app(
 
         return JSONResponse(content=summary)
 
-    @app.get("/v3/liq_heatmap")
+    @app.get("/liq_zones_heatmap")
+    @app.get("/v3/liq_heatmap")  # backwards compat alias
     async def liq_heatmap_v3(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         min_notional: float = Query(default=0, description="Minimum USD notional to include"),
@@ -1219,16 +1232,19 @@ def start_api_thread(
     thread.start()
 
     print(f"[EMBEDDED_API] Server started on http://{host}:{port}")
-    print(f"[EMBEDDED_API] Endpoints:")
-    print(f"  GET http://{host}:{port}/v1/health")
-    print(f"  GET http://{host}:{port}/v1/liq_heatmap")
-    print(f"  GET http://{host}:{port}/v1/liq_heatmap_history")
-    print(f"  GET http://{host}:{port}/v2/liq_heatmap")
-    print(f"  GET http://{host}:{port}/v2/liq_heatmap_history")
-    print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s")
-    print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s_history")
-    print(f"  GET http://{host}:{port}/v3/liq_zones")
-    print(f"  GET http://{host}:{port}/v3/liq_zones_summary")
-    print(f"  GET http://{host}:{port}/v3/liq_heatmap")
+    print(f"[EMBEDDED_API] Endpoints (clean paths, old /vN/ aliases still work):")
+    print(f"  GET http://{host}:{port}/health")
+    print(f"  GET http://{host}:{port}/liq_heatmap")
+    print(f"  GET http://{host}:{port}/liq_heatmap_history")
+    print(f"  GET http://{host}:{port}/liq_heatmap_v2")
+    print(f"  GET http://{host}:{port}/liq_heatmap_v2_history")
+    print(f"  GET http://{host}:{port}/liq_stats")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap_history")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap_stats")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap_debug")
+    print(f"  GET http://{host}:{port}/liq_zones")
+    print(f"  GET http://{host}:{port}/liq_zones_summary")
+    print(f"  GET http://{host}:{port}/liq_zones_heatmap")
 
     return thread
