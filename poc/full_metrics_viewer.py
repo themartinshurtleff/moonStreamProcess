@@ -1869,40 +1869,46 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         overview.add_column("Zones", justify="right")
         overview.add_column("Agg OI", justify="right")
 
-        for sym in ["BTC", "ETH", "SOL"]:
-            prices = processor.symbol_prices.get(sym, {})
-            price_text = fmt_price(prices.get("mark", 0.0))
+        dashboard_symbols = list(SYMBOL_CONFIGS.keys())
 
-            liq_events = sum(processor.liq_counts.get(sym, {}).values())
-            engine = processor.engine_manager.get_engine(sym)
+        for sym in dashboard_symbols:
+            try:
+                prices = processor.symbol_prices.get(sym, {})
+                price_text = fmt_price(prices.get("mark", 0.0))
 
-            cal_events = 0
-            cal_min = 0
-            zone_count = 0
-            if engine is not None:
-                calibrator = getattr(engine, "calibrator", None)
-                if calibrator is not None:
-                    cal_events = getattr(getattr(calibrator, "stats", None), "total_events", 0) or 0
-                    cal_min = getattr(calibrator, "minutes_since_calibration", 0) or 0
-                zone_manager = getattr(getattr(engine, "heatmap_v2", None), "zone_manager", None)
-                if zone_manager is not None:
-                    try:
-                        zone_count = len(zone_manager.get_active_zones())
-                    except Exception:
-                        zone_count = 0
+                liq_events = sum(processor.liq_counts.get(sym, {}).values())
+                engine = processor.engine_manager.get_engine(sym)
 
-            agg_oi = processor.oi_by_symbol.get(sym, {}).get("aggregated_oi", 0.0)
-            agg_oi_text = f"{agg_oi:,.0f}" if agg_oi and agg_oi > 0 else "0"
+                cal_events = 0
+                cal_min = 0
+                zone_count = 0
+                if engine is not None:
+                    calibrator = getattr(engine, "calibrator", None)
+                    if calibrator is not None:
+                        cal_events = getattr(getattr(calibrator, "stats", None), "total_events", 0) or 0
+                        cal_min = getattr(calibrator, "minutes_since_calibration", 0) or 0
+                    zone_manager = getattr(getattr(engine, "heatmap_v2", None), "zone_manager", None)
+                    if zone_manager is not None:
+                        try:
+                            zone_count = len(zone_manager.get_active_zones())
+                        except Exception:
+                            zone_count = 0
 
-            overview.add_row(
-                sym,
-                price_text,
-                f"{liq_events:,}",
-                f"{cal_events:,}",
-                f"{cal_min:,}",
-                f"{zone_count:,}",
-                agg_oi_text,
-            )
+                agg_oi = processor.oi_by_symbol.get(sym, {}).get("aggregated_oi", 0.0)
+                agg_oi_text = f"{agg_oi:,.0f}" if agg_oi and agg_oi > 0 else "0"
+
+                overview.add_row(
+                    sym,
+                    price_text,
+                    f"{liq_events:,}",
+                    f"{cal_events:,}",
+                    f"{cal_min:,}",
+                    f"{zone_count:,}",
+                    agg_oi_text,
+                )
+            except Exception:
+                # Keep all symbols visible even if one row has bad data.
+                overview.add_row(sym, "—", "0", "0", "0", "0", "0")
 
         layout["metrics"]["multi_symbol"]["overview"].update(
             Panel(overview, title="[bold cyan]MULTI-SYMBOL OVERVIEW[/]", border_style="cyan")
@@ -1914,14 +1920,17 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         liq_breakdown.add_column("Bybit", justify="right")
         liq_breakdown.add_column("OKX", justify="right")
 
-        for sym in ["BTC", "ETH", "SOL"]:
-            per_sym = processor.liq_counts.get(sym, {})
-            liq_breakdown.add_row(
-                sym,
-                f"{per_sym.get('binance', 0):,}",
-                f"{per_sym.get('bybit', 0):,}",
-                f"{per_sym.get('okx', 0):,}",
-            )
+        for sym in dashboard_symbols:
+            try:
+                per_sym = processor.liq_counts.get(sym, {})
+                liq_breakdown.add_row(
+                    sym,
+                    f"{per_sym.get('binance', 0):,}",
+                    f"{per_sym.get('bybit', 0):,}",
+                    f"{per_sym.get('okx', 0):,}",
+                )
+            except Exception:
+                liq_breakdown.add_row(sym, "0", "0", "0")
 
         layout["metrics"]["multi_symbol"]["liq_breakdown"].update(
             Panel(liq_breakdown, title="[bold magenta]EXCHANGE LIQ BREAKDOWN[/]", border_style="magenta")
