@@ -1,0 +1,97 @@
+{
+  "symbol": "ETH",
+  "saved_at": 1771890016.2704456,
+  "zone_count": 9,
+  "zones": [
+    {
+      "price": 1851.0,
+      "side": "long",
+      "weight": 0.02001587256,
+      "created_at": 1771889787.0311112,
+      "last_reinforced_at": 1771889799.8016062,
+      "reinforcement_count": 2,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1850.0,
+      "side": "long",
+      "weight": 0.039364324140000004,
+      "created_at": 1771889801.0359075,
+      "last_reinforced_at": 1771889829.0138514,
+      "reinforcement_count": 6,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1848.0,
+      "side": "short",
+      "weight": 0.0060057049000000005,
+      "created_at": 1771889823.0502014,
+      "last_reinforced_at": 1771889823.4920564,
+      "reinforcement_count": 2,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1849.0,
+      "side": "long",
+      "weight": 0.08108057938999998,
+      "created_at": 1771889836.755643,
+      "last_reinforced_at": 1771889847.9747515,
+      "reinforcement_count": 8,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1856.0,
+      "side": "long",
+      "weight": 0.0008168556000000001,
+      "created_at": 1771889838.5126085,
+      "last_reinforced_at": 1771889838.5126085,
+      "reinforcement_count": 0,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1846.0,
+      "side": "short",
+      "weight": 0.04188871629999999,
+      "created_at": 1771889848.4954698,
+      "last_reinforced_at": 1771889849.994369,
+      "reinforcement_count": 5,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1848.0,
+      "side": "long",
+      "weight": 0.010541896149999999,
+      "created_at": 1771889848.761497,
+      "last_reinforced_at": 1771889849.065572,
+      "reinforcement_count": 1,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1847.0,
+      "side": "short",
+      "weight": 0.004063048,
+      "created_at": 1771889848.994492,
+      "last_reinforced_at": 1771889848.994492,
+      "reinforcement_count": 0,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1847.0,
+      "side": "long",
+      "weight": 0.010159765000000001,
+      "created_at": 1771889849.841763,
+      "last_reinforced_at": 1771889849.841763,
+      "reinforcement_count": 0,
+      "source": "tape",
+      "tier_contributions": {}
+    }
+  ]
+}
