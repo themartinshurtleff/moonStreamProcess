@@ -570,6 +570,9 @@ Frontend (consumer)
 - ~~Per-symbol price feeds~~ **DONE** — BinanceConnector subscribes to `markPrice@1s` for BTC, ETH, SOL. `_process_markprice()` routes to `self.symbol_prices[sym]` for per-symbol mark price + OHLC tracking. `_process_liquidations()` reads `mark_price`/`last_price` from `symbol_prices` for all symbols (no more BTC-only conditional)
 - ~~Per-symbol OHLC~~ **DONE** — `symbol_prices[sym]` tracks open/high/low/close from markPrice stream. Minute snapshots compute per-symbol OHLC4 = (O+H+L+C)/4 for all 3 symbols. OHLC reset on minute rollover. BTC continues using orderbook mid-price OHLC (perp_*) as primary, with markPrice as secondary via `symbol_prices`
 - **Per-symbol price state:** `self.symbol_prices` dict in `FullMetricsProcessor` tracks `{mark, last, mid, open, high, low, close}` per symbol. `INSTRUMENT_TO_SHORT` maps lowercase instrument names (e.g. `"ethusdt"`) to short symbols (e.g. `"ETH"`) for markPrice routing
+- **Per-symbol liquidation counters:** `self.liq_counts` is `defaultdict(lambda: defaultdict(int))` in `FullMetricsProcessor`, incremented in `_process_liquidations()` after successful `engine_manager.on_force_order(...)` routing. Tracks per-symbol per-exchange liquidation event counts for dashboard display.
+- **Exchange heartbeat tracking:** `self.exchange_last_seen` is `defaultdict(float)` updated in `process_message()` as soon as the wrapped envelope is unpacked (`exchange`, `obj_type`, etc.). Used for LIVE/STALE/DOWN connection status in dashboard.
+- **Rich dashboard multi-symbol sections (4 FPS):** terminal UI now includes (A) `MULTI-SYMBOL OVERVIEW` with BTC/ETH/SOL rows (price, liq events, calibrator stats, zone count, aggregated OI), (B) `EXCHANGE LIQ BREAKDOWN` (Binance/Bybit/OKX counts per symbol), and (C) `EXCHANGE CONNECTIONS` status line from `exchange_last_seen`. Existing BTC-specific panels remain intact and are explicitly labeled BTC.
 
 ### Remaining TODO
 

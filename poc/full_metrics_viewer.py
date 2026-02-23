@@ -673,6 +673,12 @@ class FullMetricsProcessor:
         # Per-symbol OI state for API exposure
         self.oi_by_symbol: Dict[str, Dict] = {}
 
+        # Per-symbol, per-exchange liquidation event counters
+        self.liq_counts = defaultdict(lambda: defaultdict(int))
+
+        # Last-seen timestamps per exchange for dashboard connection health
+        self.exchange_last_seen = defaultdict(float)
+
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
         self._sanity_check_limit = 50
@@ -936,6 +942,8 @@ class FullMetricsProcessor:
         obj_type = msg.get("obj", "")
         instrument = msg.get("instrument", "")
         data = msg.get("data", {})
+
+        self.exchange_last_seen[exchange] = time.time()
 
         with self.lock:
             key = f"{exchange}_{obj_type}"
@@ -1236,6 +1244,7 @@ class FullMetricsProcessor:
                     qty=event.qty,
                     notional=event.notional,
                 )
+                self.liq_counts[event.symbol_short][event.exchange] += 1
             except Exception as e:
                 _write_debug_log({
                     "type": "liq_processing_error",
@@ -1792,6 +1801,10 @@ class FullMetricsProcessor:
 def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout:
     """Generate the display layout."""
     state = processor.get_state()
+
+    def fmt_price(value: float) -> str:
+        return f"${value:,.2f}" if value and value > 0 else "—"
+
     layout = Layout()
 
     layout.split_column(
@@ -1803,36 +1816,142 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     # Header
     runtime = int(time.time() - start_time)
     header = Text()
-    header.append("  BTC PERPETUAL - ALL METRICS  ", style="bold white on blue")
+    header.append("  MULTI-SYMBOL PERPETUAL - ALL METRICS  ", style="bold white on blue")
     header.append(f"\n  Exchanges: {', '.join(state.exchanges) or 'connecting...'}", style="dim")
     header.append(f"  |  Runtime: {runtime//60}m {runtime%60}s", style="dim")
     header.append(f"  |  {state.timestamp}", style="dim")
     layout["header"].update(Panel(header, box=box.DOUBLE))
 
     # Metrics columns
-    layout["metrics"].split_row(
+    layout["metrics"].split_column(
+        Layout(name="multi_symbol", size=16),
+        Layout(name="btc_metrics", ratio=1)
+    )
+
+    layout["metrics"]["multi_symbol"].split_column(
+        Layout(name="overview", ratio=2),
+        Layout(name="liq_breakdown", ratio=2),
+        Layout(name="connections", ratio=1)
+    )
+
+    layout["metrics"]["btc_metrics"].split_row(
         Layout(name="col1", ratio=1),
         Layout(name="col2", ratio=1),
         Layout(name="col3", ratio=1),
         Layout(name="col4", ratio=1)
     )
 
-    layout["metrics"]["col1"].split_column(
+    layout["metrics"]["btc_metrics"]["col1"].split_column(
         Layout(name="price", ratio=1),
         Layout(name="orderbook", ratio=1)
     )
-    layout["metrics"]["col2"].split_column(
+    layout["metrics"]["btc_metrics"]["col2"].split_column(
         Layout(name="trades", ratio=1),
         Layout(name="adjustments", ratio=1)
     )
-    layout["metrics"]["col3"].split_column(
+    layout["metrics"]["btc_metrics"]["col3"].split_column(
         Layout(name="funding", ratio=1),
         Layout(name="liquidations", ratio=1),
         Layout(name="positions", size=8)
     )
-    layout["metrics"]["col4"].split_column(
+    layout["metrics"]["btc_metrics"]["col4"].split_column(
         Layout(name="stress_zones", ratio=1)
     )
+
+    # Multi-symbol sections
+    try:
+        overview = Table(box=box.SIMPLE, show_header=True, padding=(0, 1))
+        overview.add_column("Symbol", style="cyan")
+        overview.add_column("Price", justify="right")
+        overview.add_column("Liq Events", justify="right")
+        overview.add_column("Cal Events", justify="right")
+        overview.add_column("Cal Min", justify="right")
+        overview.add_column("Zones", justify="right")
+        overview.add_column("Agg OI", justify="right")
+
+        for sym in ["BTC", "ETH", "SOL"]:
+            prices = processor.symbol_prices.get(sym, {})
+            price_text = fmt_price(prices.get("mark", 0.0))
+
+            liq_events = sum(processor.liq_counts.get(sym, {}).values())
+            engine = processor.engine_manager.get_engine(sym)
+
+            cal_events = 0
+            cal_min = 0
+            zone_count = 0
+            if engine is not None:
+                calibrator = getattr(engine, "calibrator", None)
+                if calibrator is not None:
+                    cal_events = getattr(getattr(calibrator, "stats", None), "total_events", 0) or 0
+                    cal_min = getattr(calibrator, "minutes_since_calibration", 0) or 0
+                zone_manager = getattr(getattr(engine, "heatmap_v2", None), "zone_manager", None)
+                if zone_manager is not None:
+                    try:
+                        zone_count = len(zone_manager.get_active_zones())
+                    except Exception:
+                        zone_count = 0
+
+            agg_oi = processor.oi_by_symbol.get(sym, {}).get("aggregated_oi", 0.0)
+            agg_oi_text = f"{agg_oi:,.0f}" if agg_oi and agg_oi > 0 else "0"
+
+            overview.add_row(
+                sym,
+                price_text,
+                f"{liq_events:,}",
+                f"{cal_events:,}",
+                f"{cal_min:,}",
+                f"{zone_count:,}",
+                agg_oi_text,
+            )
+
+        layout["metrics"]["multi_symbol"]["overview"].update(
+            Panel(overview, title="[bold cyan]MULTI-SYMBOL OVERVIEW[/]", border_style="cyan")
+        )
+
+        liq_breakdown = Table(box=box.SIMPLE, show_header=True, padding=(0, 1))
+        liq_breakdown.add_column("Symbol", style="magenta")
+        liq_breakdown.add_column("Binance", justify="right")
+        liq_breakdown.add_column("Bybit", justify="right")
+        liq_breakdown.add_column("OKX", justify="right")
+
+        for sym in ["BTC", "ETH", "SOL"]:
+            per_sym = processor.liq_counts.get(sym, {})
+            liq_breakdown.add_row(
+                sym,
+                f"{per_sym.get('binance', 0):,}",
+                f"{per_sym.get('bybit', 0):,}",
+                f"{per_sym.get('okx', 0):,}",
+            )
+
+        layout["metrics"]["multi_symbol"]["liq_breakdown"].update(
+            Panel(liq_breakdown, title="[bold magenta]EXCHANGE LIQ BREAKDOWN[/]", border_style="magenta")
+        )
+
+        now_ts = time.time()
+        statuses = []
+        for ex in ["binance", "bybit", "okx"]:
+            age = now_ts - processor.exchange_last_seen.get(ex, 0.0)
+            if age < 30:
+                st = "[green]LIVE[/green]"
+            elif age < 120:
+                st = "[yellow]STALE[/yellow]"
+            else:
+                st = "[red]DOWN[/red]"
+            statuses.append(f"{ex}: {st}")
+
+        layout["metrics"]["multi_symbol"]["connections"].update(
+            Panel("  |  ".join(statuses), title="[bold white]EXCHANGE CONNECTIONS[/]", border_style="white")
+        )
+    except Exception as e:
+        layout["metrics"]["multi_symbol"]["overview"].update(
+            Panel(f"[red]Overview render error:[/] {e}", title="[bold cyan]MULTI-SYMBOL OVERVIEW[/]")
+        )
+        layout["metrics"]["multi_symbol"]["liq_breakdown"].update(
+            Panel("[yellow]Awaiting liquidation data...[/]", title="[bold magenta]EXCHANGE LIQ BREAKDOWN[/]")
+        )
+        layout["metrics"]["multi_symbol"]["connections"].update(
+            Panel("binance: [red]DOWN[/red]  |  bybit: [red]DOWN[/red]  |  okx: [red]DOWN[/red]", title="[bold white]EXCHANGE CONNECTIONS[/]")
+        )
 
     # Price panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1845,7 +1964,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     t.add_row("perp_high", f"[green]${state.perp_high:,.2f}[/]")
     t.add_row("perp_low", f"[red]${state.perp_low:,.2f}[/]")
     t.add_row("perp_Vola", f"{state.perp_Vola:.4f}")
-    layout["metrics"]["col1"]["price"].update(Panel(t, title="[bold cyan]PRICE[/]", border_style="cyan"))
+    layout["metrics"]["btc_metrics"]["col1"]["price"].update(Panel(t, title="[bold cyan]BTC PRICE[/]", border_style="cyan"))
 
     # Orderbook panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1863,7 +1982,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         t.add_row("[bold]perp_books[/] (top 3)", "")
         for level, qty in sorted(state.perp_books.items(), key=lambda x: x[1], reverse=True)[:3]:
             t.add_row(f"  ${float(level):,.0f}", f"{qty:.4f}")
-    layout["metrics"]["col1"]["orderbook"].update(Panel(t, title="[bold green]ORDERBOOK[/]", border_style="green"))
+    layout["metrics"]["btc_metrics"]["col1"]["orderbook"].update(Panel(t, title="[bold green]BTC ORDERBOOK[/]", border_style="green"))
 
     # Trades panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1881,7 +2000,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     t.add_row("", "")
     t.add_row("orderedBuyTrades", f"{len(state.perp_orderedBuyTrades)} items")
     t.add_row("orderedSellTrades", f"{len(state.perp_orderedSellTrades)} items")
-    layout["metrics"]["col2"]["trades"].update(Panel(t, title="[bold yellow]TRADES[/]", border_style="yellow"))
+    layout["metrics"]["btc_metrics"]["col2"]["trades"].update(Panel(t, title="[bold yellow]BTC TRADES[/]", border_style="yellow"))
 
     # Adjustments panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1899,7 +2018,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         t.add_row("[bold]perp_reinforces[/] (top 3)", "")
         for level, qty in sorted(state.perp_reinforces.items(), key=lambda x: x[1], reverse=True)[:3]:
             t.add_row(f"  ${float(level):,.0f}", f"[green]{qty:.4f}[/]")
-    layout["metrics"]["col2"]["adjustments"].update(Panel(t, title="[bold magenta]ADJUSTMENTS[/]", border_style="magenta"))
+    layout["metrics"]["btc_metrics"]["col2"]["adjustments"].update(Panel(t, title="[bold magenta]BTC ADJUSTMENTS[/]", border_style="magenta"))
 
     # Funding panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1919,7 +2038,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         for ex, rate in state.perp_fundings_per_instrument.items():
             style = "green" if rate >= 0 else "red"
             t.add_row(f"  {ex}", f"[{style}]{rate*100:.4f}%[/]")
-    layout["metrics"]["col3"]["funding"].update(Panel(t, title="[bold blue]FUNDING & OI[/]", border_style="blue"))
+    layout["metrics"]["btc_metrics"]["col3"]["funding"].update(Panel(t, title="[bold blue]BTC FUNDING & OI[/]", border_style="blue"))
 
     # Liquidations panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1937,7 +2056,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         t.add_row("[bold]liquidations_shorts[/]", "")
         for level, qty in sorted(state.perp_liquidations_shorts.items(), key=lambda x: x[1], reverse=True)[:3]:
             t.add_row(f"  ${float(level):,.0f}", f"[red]{qty:.4f}[/]")
-    layout["metrics"]["col3"]["liquidations"].update(Panel(t, title="[bold red]LIQUIDATIONS[/]", border_style="red"))
+    layout["metrics"]["btc_metrics"]["col3"]["liquidations"].update(Panel(t, title="[bold red]BTC LIQUIDATIONS[/]", border_style="red"))
 
     # Positions panel
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -1946,7 +2065,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     t.add_row("perp_TTA_ratio", f"{state.perp_TTA_ratio:.4f}")
     t.add_row("perp_TTP_ratio", f"{state.perp_TTP_ratio:.4f}")
     t.add_row("perp_GTA_ratio", f"{state.perp_GTA_ratio:.4f}")
-    layout["metrics"]["col3"]["positions"].update(Panel(t, title="[bold]POSITIONS[/]", border_style="white"))
+    layout["metrics"]["btc_metrics"]["col3"]["positions"].update(Panel(t, title="[bold]BTC POSITIONS[/]", border_style="white"))
 
     # Stress Zones panel (predicted liquidation zones)
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
@@ -2001,8 +2120,8 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         stats.get('short_zones_count', 0) if stats else 0
     ), "")
 
-    layout["metrics"]["col4"]["stress_zones"].update(
-        Panel(t, title="[bold yellow]STRESS ZONES[/]", border_style="yellow")
+    layout["metrics"]["btc_metrics"]["col4"]["stress_zones"].update(
+        Panel(t, title="[bold yellow]BTC STRESS ZONES[/]", border_style="yellow")
     )
 
     # Footer
