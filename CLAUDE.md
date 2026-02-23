@@ -43,7 +43,7 @@ All core code lives in `poc/`. The system collects Binance Futures market data v
 | `ob_heatmap.py` | Orderbook heatmap with `OrderbookReconstructor` (snapshot+diff) and `OrderbookAccumulator` (30-second frames). Binary ring buffer persistence. |
 | `liq_api.py` | **ORPHANED (Phase 1).** Standalone FastAPI HTTP server (v3.0.0). Reads from snapshot files on disk. Superseded by `embedded_api.py` which now has all endpoints including V3 zones. |
 | `engine_manager.py` | `EngineManager` + `EngineInstance` — per-symbol container holding calibrator, heatmap_v2, zone_manager, ob_reconstructor, ob_accumulator. Single owner of all engine objects after init. |
-| `embedded_api.py` | **Embedded** FastAPI server (v3.0.0). Runs as daemon thread inside viewer. Shares `ob_buffer` by direct Python reference. Receives `EngineManager` for V3 zone endpoints. Includes `ResponseCache` for concurrent-user scaling. All endpoints (V1–V3) available. **This is now the only API server needed.** |
+| `embedded_api.py` | **Embedded** FastAPI server (v3.0.0). Runs as daemon thread inside viewer. Shares `ob_buffer` by direct Python reference. Receives `EngineManager` for V3 zone endpoints. Includes `ResponseCache` with eviction for concurrent-user scaling. Cache refresh loops log errors instead of swallowing exceptions. All endpoints (V1–V3) available. **This is now the only API server needed.** |
 | `liq_plotter.py` | Matplotlib live chart tailing `plot_feed.jsonl`. |
 | `metrics_viewer.py` | Earlier/simpler viewer (predecessor to `full_metrics_viewer.py`). |
 | `list_metrics.py` | Reference script listing all ~40 BTC perpetual metrics from Binance. |
@@ -357,6 +357,8 @@ Defined in `embedded_api.py` via the `ResponseCache` class. Thread-safe `Dict[st
 
 Cache keys include all query parameters that affect the response (e.g., `liq_zones?symbol=BTC&side=long&min_leverage=20`). This prevents cross-contamination between different filter combinations.
 
+`ResponseCache` evicts expired entries (>60s) every 100 cache sets to prevent unbounded memory growth. Error responses and binary format responses bypass the cache.
+
 ## Snapshot Pipeline
 
 ```
@@ -400,6 +402,7 @@ Frontend (consumer)
 10. **NEVER swallow exceptions silently in data pipelines** — always log the full traceback
 11. **NEVER access engine objects (calibrator, heatmap_v2, ob_reconstructor, ob_accumulator) as direct attributes of `FullMetricsProcessor`** — always go through `self._btc()` (or `self.engine_manager.get_engine(symbol)` for multi-symbol). Direct attributes are `del`'d after `EngineInstance` registration.
 12. **NEVER instantiate standalone `ActiveZoneManager` instances in API endpoints** — always resolve zones through `EngineManager → EngineInstance → heatmap_v2.zone_manager`. Creating standalone instances produces zones with no data.
+13. **NEVER pass `min_weight` to `ActiveZoneManager.get_active_zones()`** — it doesn't accept it (signature: `side`, `min_leverage`, `max_leverage` only). Filter `min_weight` in Python after the call returns.
 
 ## Known Bugs and Past Issues
 
@@ -412,6 +415,14 @@ Frontend (consumer)
 ### BUG: 10x tier disabled due to -$62K median miss corruption
 - **Root cause:** The 10x leverage tier was producing systematically wrong implied liquidation prices, with a persistent -$62K median miss distance that corrupted offset learning and bias correction.
 - **Fix:** Added `DISABLED_TIERS = {10}` in `leverage_config.py` (2026-02-17). Events from disabled tiers are still logged but tagged `tier_disabled: true` and excluded from all calibration updates.
+
+### RESOLVED: BTC-only liquidation filter silently dropped non-BTC events
+- **Root cause:** `_process_liquidations()` in `full_metrics_viewer.py` had a hardcoded `"BTC" not in order.get("s", "")` check that silently dropped all non-BTC forceOrder events. Any new symbol registered in `EngineManager` would never receive liquidation data.
+- **Fix:** Replaced with dynamic lookup that iterates `engine_manager.engines` and matches `engine.symbol_full` against the incoming symbol. Adding a new symbol now only requires registering it in the `EngineManager`.
+
+### RESOLVED: Hardcoded BTC fallback prices in embedded_api.py
+- **Root cause:** Four locations in `embedded_api.py` used `range(92000, 108000)` as fallback price ranges when no data exists. These BTC-specific values would produce nonsensical axes for ETH (~$3000) or SOL (~$150).
+- **Fix:** Added `_get_fallback_price_range(symbol)` helper returning per-symbol ranges: BTC (85000, 115000), ETH (1500, 5000), SOL (50, 400), with a generic default of (100, 10000).
 
 ### DESIGN NOTE: Snapshot JSON writes are NOT atomic
 - `_write_api_snapshot()` and `_write_api_snapshot_v2()` use plain `json.dump()` — no tmp+rename. The API reader could see partial JSON on slow I/O. Only the calibrator weight file uses atomic writes (tmp + flush + fsync + rename).
@@ -457,7 +468,8 @@ When implementing multi-exchange support:
 - The API must route requests by `symbol` parameter to the correct engine instance
 - Frame buffer snapshots must be per-symbol (not shared)
 - The frontend requests data with a `symbol` parameter — the API must route accordingly
-- Current hardcoded BTC fallback prices (92000–108000) in API must become symbol-aware
+- ~~Current hardcoded BTC fallback prices (92000–108000) in API must become symbol-aware~~ **DONE** — `_get_fallback_price_range(symbol)` provides per-symbol fallback ranges
+- The liquidation handler (`_process_liquidations`) now dynamically matches incoming forceOrder symbols against all registered engines. No hardcoded symbol filters remain — adding a new symbol only requires registering it in the `EngineManager`
 - Snapshot files need per-symbol naming: `liq_api_snapshot_{symbol}.json`
 - Binary history files need per-symbol naming: `liq_heatmap_v1_{symbol}.bin`
 
