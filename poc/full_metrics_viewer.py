@@ -45,6 +45,7 @@ from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
 from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer, OrderbookReconstructor
 from engine_manager import EngineManager, EngineInstance
+from liq_normalizer import normalize_liquidation
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1106,141 +1107,96 @@ class FullMetricsProcessor:
         self.taker_aggression.on_trade(price, qty, is_buyer_maker)
 
     def _process_liquidations(self, exchange: str, data: dict):
-        order = data.get("o", {})
-        if not order:
-            return
+        """Process liquidation events from any exchange via the normalizer layer.
 
-        # Match symbol against all registered engines (supports BTC, ETH, SOL, etc.)
-        raw_symbol = order.get("s", "").upper()
-        matched_symbol = None
-        for short_sym, engine in self.engine_manager.engines.items():
-            if engine.symbol_full.upper() == raw_symbol:
-                matched_symbol = short_sym
-                break
-        if matched_symbol is None:
-            return  # no engine registered for this symbol
+        The normalizer (liq_normalizer.py) handles all exchange-specific parsing,
+        side convention inversion, OKX contract-to-base conversion, and symbol
+        extraction.  This method only works with CommonLiqEvent fields.
+        """
+        events = normalize_liquidation(exchange, data)
 
-        try:
-            # Extract raw values
-            raw_side = order.get("S", "")
-            side = raw_side.lower()
-            price = float(order.get("p", 0))
-            qty = float(order.get("q", 0))
-            notional = price * qty
+        for event in events:
+            # Check if we have an engine for this symbol
+            engine = self.engine_manager.get_engine(event.symbol_short)
+            if engine is None:
+                continue  # skip symbols we don't track
 
-            level = str(int(price / self.level_size) * self.level_size)
+            try:
+                # Update BTC UI liquidation counters (BTC only — other symbols
+                # don't have per-level dashboard tracking yet)
+                if event.symbol_short == "BTC":
+                    level = str(int(event.price / self.level_size) * self.level_size)
+                    if event.side == "long":
+                        self.state.perp_liquidations_longsTotal += event.qty
+                        self.state.perp_liquidations_longs[level] = (
+                            self.state.perp_liquidations_longs.get(level, 0) + event.qty
+                        )
+                    else:
+                        self.state.perp_liquidations_shortsTotal += event.qty
+                        self.state.perp_liquidations_shorts[level] = (
+                            self.state.perp_liquidations_shorts.get(level, 0) + event.qty
+                        )
 
-            if side == "buy":
-                self.state.perp_liquidations_longsTotal += qty
-                self.state.perp_liquidations_longs[level] = self.state.perp_liquidations_longs.get(level, 0) + qty
-            else:
-                self.state.perp_liquidations_shortsTotal += qty
-                self.state.perp_liquidations_shorts[level] = self.state.perp_liquidations_shorts.get(level, 0) + qty
-
-            # Binance forceOrder: "S": "BUY" means shorts got liquidated (they had to buy back)
-            # "S": "SELL" means longs got liquidated (they had to sell)
-            calib_side = "short" if side == "buy" else "long"
-
-            # Phase 1: Compute event-time src prices for better attribution
-            # Priority: markPrice > mid > last > fallback
-            mark_price = self.state.perp_markPrice if hasattr(self.state, 'perp_markPrice') else 0.0
-            mid_price = 0.0
-            if self.state.best_bid > 0 and self.state.best_ask > 0:
-                mid_price = (self.state.best_bid + self.state.best_ask) / 2
-            last_price = self.state.btc_price
-
-            # Determine event_src_price and src_source (same logic as calibrator)
-            if mark_price > 0:
-                event_src_price = mark_price
-                src_source = "mark"
-            elif mid_price > 0:
-                event_src_price = mid_price
-                src_source = "mid"
-            elif last_price > 0:
-                event_src_price = last_price
-                src_source = "last"
-            else:
-                event_src_price = 0.0
-                src_source = "none"
-
-            # Event sanity validator - log first N events for verification
-            if self._sanity_check_count < self._sanity_check_limit:
-                self._sanity_check_count += 1
-                sanity_failures = []
-
-                # Run assertions
-                if not (price > 0):
-                    sanity_failures.append(f"price<=0: {price}")
-                if not (qty > 0):
-                    sanity_failures.append(f"qty<=0: {qty}")
-                if not (event_src_price > 0):
-                    sanity_failures.append(f"event_src_price<=0: {event_src_price} (src_source={src_source})")
-                if calib_side not in {"long", "short"}:
-                    sanity_failures.append(f"invalid calib_side: {calib_side}")
-
-                if sanity_failures:
-                    # Log failure
-                    _write_debug_log({
-                        "type": "event_sanity_fail",
-                        "event_num": self._sanity_check_count,
-                        "failures": sanity_failures,
-                        "raw_symbol": raw_symbol,
-                        "raw_side": raw_side,
-                        "calib_side": calib_side,
-                        "price": price,
-                        "qty": qty,
-                        "notional": notional,
-                        "mark_price": mark_price,
-                        "mid_price": mid_price,
-                        "last_price": last_price,
-                        "event_src_price": event_src_price,
-                        "src_source": src_source
-                    })
+                # Event-time src prices for calibrator attribution.
+                # TODO: Per-symbol price feeds needed for ETH/SOL.  Currently
+                #       only BTC has mark/mid/last from Binance markPrice stream.
+                if event.symbol_short == "BTC":
+                    mark_price = getattr(self.state, 'perp_markPrice', 0.0)
+                    mid_price = 0.0
+                    if self.state.best_bid > 0 and self.state.best_ask > 0:
+                        mid_price = (self.state.best_bid + self.state.best_ask) / 2
+                    last_price = self.state.btc_price
                 else:
-                    # Log successful sanity check
+                    mark_price = 0.0
+                    mid_price = 0.0
+                    last_price = 0.0
+
+                # Sanity log for first N events (across all exchanges/symbols)
+                if self._sanity_check_count < self._sanity_check_limit:
+                    self._sanity_check_count += 1
                     _write_debug_log({
                         "type": "event_sanity_ok",
                         "event_num": self._sanity_check_count,
-                        "raw_symbol": raw_symbol,
-                        "raw_side": raw_side,
-                        "calib_side": calib_side,
-                        "price": price,
-                        "qty": qty,
-                        "notional": notional,
+                        "exchange": event.exchange,
+                        "symbol": event.symbol_short,
+                        "side": event.side,
+                        "price": event.price,
+                        "qty": event.qty,
+                        "notional": event.notional,
                         "mark_price": mark_price,
                         "mid_price": mid_price,
                         "last_price": last_price,
-                        "event_src_price": event_src_price,
-                        "src_source": src_source
                     })
 
-            # Route to calibrator AND heatmap V2 via engine manager.
-            # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
-            # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
-            self.engine_manager.on_force_order(
-                matched_symbol,
-                event_data={
-                    'timestamp': time.time(),
-                    'symbol': matched_symbol,
-                    'side': calib_side,
-                    'price': price,
-                    'qty': qty,
-                    'mark_price': mark_price,
-                    'mid_price': mid_price,
-                    'last_price': last_price
-                },
-                timestamp=time.time(),
-                side=calib_side,
-                price=price,
-                qty=qty,
-                notional=notional
-            )
-        except Exception as e:
-            _write_debug_log({
-                "type": "liq_processing_error",
-                "error": str(e),
-                "error_type": type(e).__name__
-            })
+                # Route to calibrator AND heatmap V2 via engine manager.
+                # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
+                # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
+                self.engine_manager.on_force_order(
+                    event.symbol_short,
+                    event_data={
+                        'timestamp': event.timestamp,
+                        'symbol': event.symbol_short,
+                        'side': event.side,
+                        'price': event.price,
+                        'qty': event.qty,
+                        'mark_price': mark_price,
+                        'mid_price': mid_price,
+                        'last_price': last_price,
+                    },
+                    timestamp=event.timestamp,
+                    side=event.side,
+                    price=event.price,
+                    qty=event.qty,
+                    notional=event.notional,
+                )
+            except Exception as e:
+                _write_debug_log({
+                    "type": "liq_processing_error",
+                    "exchange": event.exchange,
+                    "symbol": event.symbol_short,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                })
 
     def _process_funding(self, exchange: str, data: dict):
         if "r" in data:
@@ -1965,13 +1921,18 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
 
 
 def run_websocket_thread(connector, processor, stop_event):
-    """Run websocket connections in a separate thread with its own event loop."""
+    """Run websocket connections in a separate thread with its own event loop.
+
+    Starts all exchange connectors (Binance, Bybit, OKX) via
+    MultiExchangeConnector.connect_all().  Each sub-connector runs as an
+    independent asyncio task so a failure in one exchange does not block
+    the others.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     async def run():
-        connector.binance.running = True
-        await connector.binance.connect_all()
+        await connector.connect_all()  # starts Binance + Bybit + OKX
 
     try:
         while not stop_event.is_set():
