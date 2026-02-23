@@ -75,7 +75,8 @@ class LiquidationHeatmap:
     def __init__(
         self,
         config: HeatmapConfig = None,
-        log_dir: str = None
+        log_dir: str = None,
+        zone_persist_file: str = None,
     ):
         self.config = config or HeatmapConfig()
 
@@ -85,7 +86,9 @@ class LiquidationHeatmap:
         sweep_log = os.path.join(log_dir, "liq_sweeps.jsonl") if log_dir else None
         debug_log = os.path.join(log_dir, "liq_debug.jsonl") if log_dir else None
         zone_log = os.path.join(log_dir, "liq_zones.jsonl") if log_dir else None
-        zone_persist = os.path.join(log_dir, "liq_active_zones.json") if log_dir else None
+        zone_persist = zone_persist_file or (
+            os.path.join(log_dir, "liq_active_zones.json") if log_dir else None
+        )
 
         # V3: Create shared zone manager for persistent zones
         self.zone_manager = None

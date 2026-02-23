@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 import threading
 import signal
+import logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'StreamEngineBase'))
@@ -115,6 +116,14 @@ SYMBOL_CONFIGS = {
 INSTRUMENT_TO_SHORT: Dict[str, str] = {
     cfg["symbol_full"].lower(): sym for sym, cfg in SYMBOL_CONFIGS.items()
 }
+
+ZONE_PERSIST_FILES = {
+    "BTC": os.path.join(POC_DIR, "liq_active_zones_BTC.json"),
+    "ETH": os.path.join(POC_DIR, "liq_active_zones_ETH.json"),
+    "SOL": os.path.join(POC_DIR, "liq_active_zones_SOL.json"),
+}
+
+logger = logging.getLogger(__name__)
 
 
 def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: float = 24) -> bool:
@@ -740,6 +749,7 @@ class FullMetricsProcessor:
         )
 
         # V2 Heatmap — per-symbol tape + OI inference
+        zone_persist_file = ZONE_PERSIST_FILES.get(sym_short, os.path.join(POC_DIR, f"liq_active_zones_{sym_short}.json"))
         heatmap_v2 = LiquidationHeatmap(
             config=HeatmapConfig(
                 symbol=sym_short,
@@ -750,6 +760,7 @@ class FullMetricsProcessor:
                 projection_weight=0.65,
             ),
             log_dir=POC_DIR,
+            zone_persist_file=zone_persist_file,
         )
 
         # Orderbook engines — BTC only for MVP
@@ -871,14 +882,17 @@ class FullMetricsProcessor:
 
     def _on_calibrator_weights_updated(self, symbol: str, new_weights: list, new_buffer: float):
         """Callback when calibrator updates weights — routes to correct symbol's heatmap."""
-        engine = self.engine_manager.get_engine(symbol)
-        if engine is None:
-            return
-        v2_ladder = sorted(engine.heatmap_v2.inference.leverage_weights.keys())
-        if len(new_weights) == len(v2_ladder):
-            new_weights_dict = dict(zip(v2_ladder, new_weights))
-            engine.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-            engine.heatmap_v2.config.buffer = new_buffer
+        try:
+            engine = self.engine_manager.get_engine(symbol)
+            if engine is None:
+                return
+            v2_ladder = sorted(engine.heatmap_v2.inference.leverage_weights.keys())
+            if len(new_weights) == len(v2_ladder):
+                new_weights_dict = dict(zip(v2_ladder, new_weights))
+                engine.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+                engine.heatmap_v2.config.buffer = new_buffer
+        except Exception as e:
+            logger.error(f"Weight update callback failed for {symbol}: {e}", exc_info=True)
 
     def _on_oi_update(self, symbol_short: str, aggregated_oi: float,
                       per_exchange: Dict[str, float]):
@@ -1543,62 +1557,65 @@ class FullMetricsProcessor:
                            self.state.perp_low + self.state.perp_close) / 4
 
                 for sym_short in self.engine_manager.get_all_symbols():
-                    eng = self.engine_manager.get_engine(sym_short)
-                    if eng is None:
-                        continue
+                    try:
+                        eng = self.engine_manager.get_engine(sym_short)
+                        if eng is None:
+                            continue
 
-                    v2_hm = eng.heatmap_v2.get_heatmap()
-                    v2_cfg = eng.heatmap_v2.config
-                    lw = eng.heatmap_v2.inference.leverage_weights
-                    ladder = sorted(lw.keys())
-                    weights = [lw[lev] for lev in ladder]
+                        v2_hm = eng.heatmap_v2.get_heatmap()
+                        v2_cfg = eng.heatmap_v2.config
+                        lw = eng.heatmap_v2.inference.leverage_weights
+                        ladder = sorted(lw.keys())
+                        weights = [lw[lev] for lev in ladder]
 
-                    if sym_short == "BTC":
-                        # BTC: primary price from orderbook mid (perp_*),
-                        # backed by markPrice stream in symbol_prices
-                        sym_src = btc_src
-                        sym_high = self.state.perp_high
-                        sym_low = self.state.perp_low
-                        sym_close = self.state.perp_close
-                        sym_buy_vol = self.state.perp_buyVol
-                        sym_sell_vol = self.state.perp_sellVol
-                        sym_oi_change = self.state.perp_oi_change
-                        sym_depth = self._build_depth_band(btc_src, v2_cfg.steps)
-                    else:
-                        # ETH/SOL: OHLC from Binance markPrice@1s stream
-                        prices = self.symbol_prices.get(sym_short, {})
-                        o = prices.get("open", 0.0)
-                        h = prices.get("high", 0.0)
-                        l = prices.get("low", 0.0)
-                        c = prices.get("close", 0.0)
-                        sym_src = (o + h + l + c) / 4 if c > 0 else 0.0
-                        sym_high = h
-                        sym_low = l
-                        sym_close = c
-                        sym_buy_vol = 0.0
-                        sym_sell_vol = 0.0
-                        sym_oi_change = 0.0
-                        sym_depth = {}
+                        if sym_short == "BTC":
+                            # BTC: primary price from orderbook mid (perp_*),
+                            # backed by markPrice stream in symbol_prices
+                            sym_src = btc_src
+                            sym_high = self.state.perp_high
+                            sym_low = self.state.perp_low
+                            sym_close = self.state.perp_close
+                            sym_buy_vol = self.state.perp_buyVol
+                            sym_sell_vol = self.state.perp_sellVol
+                            sym_oi_change = self.state.perp_oi_change
+                            sym_depth = self._build_depth_band(btc_src, v2_cfg.steps)
+                        else:
+                            # ETH/SOL: OHLC from Binance markPrice@1s stream
+                            prices = self.symbol_prices.get(sym_short, {})
+                            o = prices.get("open", 0.0)
+                            h = prices.get("high", 0.0)
+                            l = prices.get("low", 0.0)
+                            c = prices.get("close", 0.0)
+                            sym_src = (o + h + l + c) / 4 if c > 0 else 0.0
+                            sym_high = h
+                            sym_low = l
+                            sym_close = c
+                            sym_buy_vol = 0.0
+                            sym_sell_vol = 0.0
+                            sym_oi_change = 0.0
+                            sym_depth = {}
 
-                    self.engine_manager.on_minute_snapshot(
-                        sym_short,
-                        symbol=sym_short,
-                        timestamp=time.time(),
-                        src=sym_src,
-                        pred_longs=v2_hm.get("long", {}),
-                        pred_shorts=v2_hm.get("short", {}),
-                        ladder=ladder,
-                        weights=weights,
-                        buffer=v2_cfg.buffer,
-                        steps=v2_cfg.steps,
-                        high=sym_high,
-                        low=sym_low,
-                        close=sym_close,
-                        perp_buy_vol=sym_buy_vol,
-                        perp_sell_vol=sym_sell_vol,
-                        perp_oi_change=sym_oi_change,
-                        depth_band=sym_depth,
-                    )
+                        self.engine_manager.on_minute_snapshot(
+                            sym_short,
+                            symbol=sym_short,
+                            timestamp=time.time(),
+                            src=sym_src,
+                            pred_longs=v2_hm.get("long", {}),
+                            pred_shorts=v2_hm.get("short", {}),
+                            ladder=ladder,
+                            weights=weights,
+                            buffer=v2_cfg.buffer,
+                            steps=v2_cfg.steps,
+                            high=sym_high,
+                            low=sym_low,
+                            close=sym_close,
+                            perp_buy_vol=sym_buy_vol,
+                            perp_sell_vol=sym_sell_vol,
+                            perp_oi_change=sym_oi_change,
+                            depth_band=sym_depth,
+                        )
+                    except Exception as e:
+                        logger.error(f"Minute snapshot failed for {sym_short}: {e}", exc_info=True)
 
                 # Per-minute OI/funding/ratio log line
                 oi_str = f"OI={self.state.perp_total_oi:,.0f}"
@@ -2019,6 +2036,7 @@ def run_websocket_thread(connector, processor, stop_event):
                 loop.run_until_complete(run())
             except Exception as e:
                 if not stop_event.is_set():
+                    logger.error(f"WebSocket thread exception: {e}", exc_info=True)
                     time.sleep(1)
     finally:
         loop.close()

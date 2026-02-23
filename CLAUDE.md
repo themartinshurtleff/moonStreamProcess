@@ -486,6 +486,7 @@ Frontend (consumer)
 12. **NEVER instantiate standalone `ActiveZoneManager` instances in API endpoints** — always resolve zones through `EngineManager → EngineInstance → heatmap_v2.zone_manager`. Creating standalone instances produces zones with no data.
 13. **NEVER pass `min_weight` to `ActiveZoneManager.get_active_zones()`** — it doesn't accept it (signature: `side`, `min_leverage`, `max_leverage` only). Filter `min_weight` in Python after the call returns.
 14. **NEVER parse raw exchange liquidation messages in `_process_liquidations()`** — always use `normalize_liquidation(exchange, data)` from `liq_normalizer.py`. All exchange-specific format handling, side convention mapping, and OKX contract conversion belongs in the normalizer, not the viewer.
+15. **NEVER add code to the per-symbol minute snapshot loop without exception isolation — one symbol failure must not block others**
 
 ## Known Bugs and Past Issues
 
@@ -498,6 +499,11 @@ Frontend (consumer)
 ### BUG: 10x tier disabled due to -$62K median miss corruption
 - **Root cause:** The 10x leverage tier was producing systematically wrong implied liquidation prices, with a persistent -$62K median miss distance that corrupted offset learning and bias correction.
 - **Fix:** Added `DISABLED_TIERS = {10}` in `leverage_config.py` (2026-02-17). Events from disabled tiers are still logged but tagged `tier_disabled: true` and excluded from all calibration updates.
+
+
+### RESOLVED: Calibration stalled after first run
+- **Root cause:** The per-symbol minute snapshot loop in `_check_minute_rollover()` was unguarded. After the first calibration, an exception from a symbol iteration (including weight update callback paths) could abort the entire loop, preventing all symbols from receiving future `on_minute_snapshot()` calls.
+- **Fix:** Added per-symbol try/except isolation in `_check_minute_rollover()`, callback isolation in `_on_calibrator_weights_updated()` and `liq_calibrator._run_calibration()`, and per-symbol zone persistence files (`liq_active_zones_{SYMBOL}.json`).
 
 ### RESOLVED: BTC-only liquidation filter silently dropped non-BTC events
 - **Root cause:** `_process_liquidations()` in `full_metrics_viewer.py` had a hardcoded `"BTC" not in order.get("s", "")` check that silently dropped all non-BTC forceOrder events. Any new symbol registered in `EngineManager` would never receive liquidation data.

@@ -2428,7 +2428,10 @@ class LiquidationCalibrator:
         }
 
         if self.on_weights_updated:
-            self.on_weights_updated(self.symbol, new_weights, new_buffer)
+            try:
+                self.on_weights_updated(self.symbol, new_weights, new_buffer)
+            except Exception as e:
+                logger.error(f"on_weights_updated callback failed for {self.symbol}: {e}", exc_info=True)
 
         return result
 
