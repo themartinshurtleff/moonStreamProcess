@@ -1823,8 +1823,12 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
     layout["header"].update(Panel(header, box=box.DOUBLE))
 
     # Metrics columns
+    # Keep enough vertical room so each multi-symbol table can always display
+    # header + all symbol rows (BTC/ETH/SOL) without clipping.
+    symbol_row_count = len(SYMBOL_CONFIGS)
+    multi_symbol_height = max(16, 10 + (symbol_row_count * 4))
     layout["metrics"].split_column(
-        Layout(name="multi_symbol", size=16),
+        Layout(name="multi_symbol", size=multi_symbol_height),
         Layout(name="btc_metrics", ratio=1)
     )
 
