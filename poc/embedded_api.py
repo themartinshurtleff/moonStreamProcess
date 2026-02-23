@@ -71,6 +71,17 @@ API_VERSION = "3.0.0"  # V3 with zone lifecycle endpoints
 DEFAULT_STEP = 20.0
 DEFAULT_BAND_PCT = 0.08
 
+
+def _get_fallback_price_range(symbol: str):
+    """Returns (price_min, price_max) fallback range for a symbol when no data exists."""
+    symbol = symbol.upper().replace("USDT", "")
+    ranges = {
+        "BTC": (85000, 115000),
+        "ETH": (1500, 5000),
+        "SOL": (50, 400),
+    }
+    return ranges.get(symbol, (100, 10000))  # wide default for unknown symbols
+
 # History buffer size (12 hours at 1-minute resolution)
 HISTORY_MINUTES = 720
 
@@ -102,6 +113,7 @@ class ResponseCache:
     def __init__(self):
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._lock = threading.Lock()
+        self._sets_count: int = 0
 
     def get(self, key: str, ttl: float) -> Optional[JSONResponse]:
         """Return cached JSONResponse if within TTL, else None."""
@@ -115,6 +127,17 @@ class ResponseCache:
         """Store a JSONResponse in the cache."""
         with self._lock:
             self._cache[key] = (response, time.time())
+            self._sets_count += 1
+            if self._sets_count % 100 == 0:
+                self._evict_expired()
+
+    def _evict_expired(self) -> None:
+        """Remove entries older than max_ttl to prevent unbounded growth. Caller must hold _lock."""
+        now = time.time()
+        max_ttl = 60.0  # nothing should be cached longer than this
+        expired = [k for k, (_, ts) in self._cache.items() if (now - ts) > max_ttl]
+        for k in expired:
+            del self._cache[k]
 
 
 @dataclass
@@ -407,8 +430,8 @@ class EmbeddedAPIState:
             # Add to history buffer
             if self.v1_history:
                 self.v1_history.add_frame(data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Cache refresh error (v1): %s", e)
 
     def _refresh_v2_cache(self):
         if not self.snapshot_v2_file or not os.path.exists(self.snapshot_v2_file):
@@ -421,8 +444,8 @@ class EmbeddedAPIState:
             # Add to history buffer
             if self.v2_history:
                 self.v2_history.add_frame(data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Cache refresh error (v2): %s", e)
 
 
 def create_embedded_app(
@@ -583,7 +606,8 @@ def create_embedded_app(
                     p += step
             else:
                 step = DEFAULT_STEP
-                prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+                fb_min, fb_max = _get_fallback_price_range(symbol)
+                prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
             response = JSONResponse(content={
                 "t": [], "prices": prices, "long": [], "short": [],
@@ -602,7 +626,8 @@ def create_embedded_app(
         prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
 
         if not prices:
-            prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+            fb_min, fb_max = _get_fallback_price_range(symbol)
+            prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
         t_arr = []
         long_flat = []
@@ -704,7 +729,8 @@ def create_embedded_app(
                     p += step
             else:
                 step = DEFAULT_STEP
-                prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+                fb_min, fb_max = _get_fallback_price_range(symbol)
+                prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
             response = JSONResponse(content={
                 "t": [], "prices": prices, "long": [], "short": [],
@@ -723,7 +749,8 @@ def create_embedded_app(
         prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
 
         if not prices:
-            prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+            fb_min, fb_max = _get_fallback_price_range(symbol)
+            prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
         t_arr = []
         long_flat = []

@@ -1049,12 +1049,21 @@ class FullMetricsProcessor:
 
     def _process_liquidations(self, exchange: str, data: dict):
         order = data.get("o", {})
-        if not order or "BTC" not in order.get("s", ""):
+        if not order:
             return
+
+        # Match symbol against all registered engines (supports BTC, ETH, SOL, etc.)
+        raw_symbol = order.get("s", "").upper()
+        matched_symbol = None
+        for short_sym, engine in self.engine_manager.engines.items():
+            if engine.symbol_full.upper() == raw_symbol:
+                matched_symbol = short_sym
+                break
+        if matched_symbol is None:
+            return  # no engine registered for this symbol
 
         try:
             # Extract raw values
-            raw_symbol = order.get("s", "")
             raw_side = order.get("S", "")
             side = raw_side.lower()
             price = float(order.get("p", 0))
@@ -1151,10 +1160,10 @@ class FullMetricsProcessor:
             # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
             # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
             self.engine_manager.on_force_order(
-                "BTC",
+                matched_symbol,
                 event_data={
                     'timestamp': time.time(),
-                    'symbol': 'BTC',
+                    'symbol': matched_symbol,
                     'side': calib_side,
                     'price': price,
                     'qty': qty,

@@ -289,9 +289,11 @@ class EngineManager:
             return None
         if engine.zone_manager is None:
             return None
-        return engine.zone_manager.get_active_zones(
+        zones = engine.zone_manager.get_active_zones(
             side=side,
             min_leverage=min_leverage,
             max_leverage=max_leverage,
-            min_weight=min_weight,
         )
+        if min_weight is not None:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+        return zones
