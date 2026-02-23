@@ -32,7 +32,7 @@ All core code lives in `poc/`. The system collects market data from **Binance, B
 |------|------|
 | `full_metrics_viewer.py` | **Main entry point.** Launches WebSocket/REST connections, instantiates all sub-engines, runs Rich terminal dashboard at 4 FPS, writes snapshot files, starts embedded API server. |
 | `ws_connectors.py` | `BinanceConnector`, `BybitConnector`, `OKXConnector`, and `MultiExchangeConnector` — WebSocket streams for depth, aggTrade, forceOrder/liquidations, markPrice. All three exchanges active. |
-| `liq_normalizer.py` | **Liquidation normalizer.** Converts raw exchange-specific liquidation messages into `CommonLiqEvent` before reaching `EngineManager`. Handles Binance side inversion, Bybit inverted side convention, OKX contract-to-base conversion. |
+| `liq_normalizer.py` | **Liquidation normalizer.** Converts raw exchange-specific liquidation messages into `CommonLiqEvent` before reaching `EngineManager`. Handles Binance/Bybit order-side → position-side inversion (both use same convention), OKX contract-to-base conversion. |
 | `oi_poller.py` | `MultiExchangeOIPoller` + `OIPollerThread` — polls OI from Binance, Bybit, OKX every 15s per symbol (BTC, ETH, SOL). Aggregates across exchanges, delivers per-symbol updates via callback. All OI in base asset. |
 | `rest_pollers.py` | `BinanceRESTPollerThread` — polls trader ratios (TTA, TTP, GTA) from Binance REST. OI polling moved to `oi_poller.py`. |
 | `liq_engine.py` | **ORPHANED (Phase 1).** V1 `LiquidationStressEngine` — volume-based liquidation zone prediction. Superseded by V2 heatmap. Still importable but no longer instantiated by the viewer. |
@@ -99,8 +99,8 @@ Each exchange uses different side semantics. The normalizer (`liq_normalizer.py`
 |----------|-----------|-------|---------|-------------------|
 | Binance | `o.S` | `"BUY"` | Shorts bought back | `"short"` |
 | Binance | `o.S` | `"SELL"` | Longs sold | `"long"` |
-| Bybit | `S` | `"Buy"` | Longs liquidated | `"long"` |
-| Bybit | `S` | `"Sell"` | Shorts liquidated | `"short"` |
+| Bybit | `S` | `"Buy"` | Shorts bought back | `"short"` |
+| Bybit | `S` | `"Sell"` | Longs sold | `"long"` |
 | OKX | `posSide` | `"long"` | Direct | `"long"` |
 | OKX | `posSide` | `"short"` | Direct | `"short"` |
 
@@ -508,6 +508,11 @@ Frontend (consumer)
 - **Root cause:** Four locations in `embedded_api.py` used `range(92000, 108000)` as fallback price ranges when no data exists. These BTC-specific values would produce nonsensical axes for ETH (~$3000) or SOL (~$150).
 - **Fix:** Added `_get_fallback_price_range(symbol)` helper returning per-symbol ranges: BTC (85000, 115000), ETH (1500, 5000), SOL (50, 400), with a generic default of (100, 10000).
 
+### RESOLVED: Bybit side convention was inverted in normalizer
+- **Root cause:** `normalize_bybit()` in `liq_normalizer.py` mapped `"Buy"` → `"long"` and `"Sell"` → `"short"`. This was incorrect. Bybit's `allLiquidation` `S` field is the **order side** (same convention as Binance), not the position side: `"Buy"` = exchange buys to close a short position (shorts liquidated), `"Sell"` = exchange sells to close a long position (longs liquidated).
+- **Impact:** All Bybit liquidation events had longs/shorts swapped, corrupting calibrator learning, heatmap directionality, and zone predictions for Bybit data. The inline tests also encoded the wrong expected values, masking the bug.
+- **Fix (Phase 2):** Corrected mapping to `"Buy"` → `"short"`, `"Sell"` → `"long"` — matching Binance convention exactly. Updated all inline test assertions. All 36 tests pass.
+
 ### DESIGN NOTE: Snapshot JSON writes are NOT atomic
 - `_write_api_snapshot()` and `_write_api_snapshot_v2()` use plain `json.dump()` — no tmp+rename. The API reader could see partial JSON on slow I/O. Only the calibrator weight file uses atomic writes (tmp + flush + fsync + rename).
 
@@ -546,7 +551,7 @@ Frontend (consumer)
 ### Completed (Phase 2)
 
 - **Three exchanges active:** Binance, Bybit, OKX — all started by `MultiExchangeConnector.connect_all()` in `run_websocket_thread()`
-- **Normalizer layer:** `liq_normalizer.py` converts all raw exchange messages into `CommonLiqEvent` before reaching engines. Handles Binance/Bybit side inversion, OKX contract-to-base conversion, multi-symbol extraction
+- **Normalizer layer:** `liq_normalizer.py` converts all raw exchange messages into `CommonLiqEvent` before reaching engines. Handles Binance/Bybit order-side inversion (both use same convention: Buy=shorts liquidated, Sell=longs liquidated), OKX contract-to-base conversion, multi-symbol extraction
 - **Per-symbol engines:** BTC, ETH, SOL each have independent `EngineInstance` (calibrator + heatmap). BTC additionally has orderbook engines. Created via `SYMBOL_CONFIGS` dict and `_create_engine_for_symbol()` factory
 - **Per-symbol log/weight files:** `liq_calibrator_{SYM}.jsonl`, `liq_calibrator_weights_{SYM}.json`
 - **Dynamic liquidation routing:** `_process_liquidations()` uses `normalize_liquidation(exchange, data)` → iterates `CommonLiqEvent` list → routes each to correct engine via `engine_manager.on_force_order(event.symbol_short, ...)`

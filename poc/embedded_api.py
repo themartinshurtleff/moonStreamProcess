@@ -550,8 +550,8 @@ def create_embedded_app(
 
         Returns per-exchange breakdown and aggregate (in base asset).
         """
-        symbol_upper = symbol.strip().upper()
-        cache_key = f"oi?symbol={symbol_upper}"
+        symbol_short = _resolve_symbol(symbol.strip().upper())
+        cache_key = f"oi?symbol={symbol_short}"
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
@@ -562,11 +562,11 @@ def create_embedded_app(
                 detail="OI poller not available"
             )
 
-        snapshot = state.oi_poller.get_snapshot(symbol_upper)
+        snapshot = state.oi_poller.get_snapshot(symbol_short)
         if not snapshot:
             raise HTTPException(
                 status_code=404,
-                detail=f"No OI data available for {symbol_upper}. Poller may still be initializing."
+                detail=f"No OI data available for {symbol_short}. Poller may still be initializing."
             )
 
         payload = {

@@ -13,7 +13,7 @@ Supported exchanges:
 
 Side conventions (CRITICAL — each exchange is different):
   - Binance: "BUY" = shorts liquidated, "SELL" = longs liquidated
-  - Bybit:   "Buy" = longs liquidated,  "Sell" = shorts liquidated
+  - Bybit:   "Buy" = shorts liquidated, "Sell" = longs liquidated  (same as Binance)
   - OKX:     "posSide" gives the position side directly ("long"/"short")
 """
 
@@ -196,7 +196,7 @@ def normalize_bybit(data: dict) -> List[CommonLiqEvent]:
     Bybit sends batches at 500ms intervals:
         data["data"]  → list of liquidation items
         item["s"]     → symbol ("BTCUSDT")
-        item["S"]     → side: "Buy" = longs liquidated, "Sell" = shorts liquidated
+        item["S"]     → side: "Buy" = shorts liquidated, "Sell" = longs liquidated
         item["p"]     → bankruptcy price (string)
         item["v"]     → quantity in base asset (string)
         item["T"]     → timestamp in ms
@@ -223,9 +223,9 @@ def normalize_bybit(data: dict) -> List[CommonLiqEvent]:
 
                 raw_side = item.get("S", "")
                 if raw_side == "Buy":
-                    side = "long"   # longs liquidated (forced sell)
+                    side = "short"  # shorts liquidated (exchange buys to close short)
                 elif raw_side == "Sell":
-                    side = "short"  # shorts liquidated (forced buy)
+                    side = "long"   # longs liquidated (exchange sells to close long)
                 else:
                     logger.warning("normalize_bybit: unknown side %r", raw_side)
                     continue
@@ -464,14 +464,14 @@ if __name__ == "__main__":
             {
                 "T": 1739502302929,
                 "s": "BTCUSDT",
-                "S": "Sell",       # shorts liquidated
+                "S": "Sell",       # longs liquidated (exchange sells to close long)
                 "v": "0.003",
                 "p": "43511.70",
             },
             {
                 "T": 1739502303100,
                 "s": "BTCUSDT",
-                "S": "Buy",        # longs liquidated
+                "S": "Buy",        # shorts liquidated (exchange buys to close short)
                 "v": "0.010",
                 "p": "43600.50",
             },
@@ -483,10 +483,10 @@ if __name__ == "__main__":
         ev0, ev1 = result[0], result[1]
         check("event 0: exchange=bybit", ev0.exchange == "bybit", ev0.exchange)
         check("event 0: symbol=BTC", ev0.symbol_short == "BTC", ev0.symbol_short)
-        check("event 0: Sell → side=short", ev0.side == "short", ev0.side)
+        check("event 0: Sell → side=long", ev0.side == "long", ev0.side)
         check("event 0: price", ev0.price == 43511.70, str(ev0.price))
         check("event 0: qty", ev0.qty == 0.003, str(ev0.qty))
-        check("event 1: Buy → side=long", ev1.side == "long", ev1.side)
+        check("event 1: Buy → side=short", ev1.side == "short", ev1.side)
         check("event 1: qty", ev1.qty == 0.010, str(ev1.qty))
 
     # -------------------------------------------------------------------
