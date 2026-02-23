@@ -64,7 +64,7 @@ Base URL: `wss://fstream.binance.com/ws`
 | `btcusdt@depth@100ms` | Orderbook diffs (100ms throttle) | `OrderbookReconstructor` → `OrderbookAccumulator` → 30s OB heatmap frames |
 | `btcusdt@aggTrade` | Aggregated trades (buyer_is_maker) | `TakerAggressionAccumulator`, price tracking, volume accumulation |
 | `!forceOrder@arr` | Liquidation events (ALL symbols) | `liq_normalizer` → `EngineManager` → calibrator + heatmap |
-| `btcusdt@markPrice@1s` | Mark price, funding rate, OI | Mark price for event-time src, funding display |
+| `{sym}usdt@markPrice@1s` (×3) | Mark price, funding rate | Per-symbol mark price for calibrator OHLC + event-time src, funding display. BTC, ETH, SOL. |
 
 #### Bybit (`BybitConnector`)
 Base URL: `wss://stream.bybit.com/v5/public/linear`
@@ -561,10 +561,12 @@ Frontend (consumer)
 - **Multi-exchange OI aggregation:** `oi_poller.py` polls Binance + Bybit + OKX every 15s for BTC, ETH, SOL. Aggregated per-symbol OI delivered via callback. Exposed via `/oi` API endpoint with per-exchange breakdown
 - ~~OI data from all exchanges gets aggregated per-symbol before feeding the engine~~ **DONE**
 
+- ~~Per-symbol price feeds~~ **DONE** — BinanceConnector subscribes to `markPrice@1s` for BTC, ETH, SOL. `_process_markprice()` routes to `self.symbol_prices[sym]` for per-symbol mark price + OHLC tracking. `_process_liquidations()` reads `mark_price`/`last_price` from `symbol_prices` for all symbols (no more BTC-only conditional)
+- ~~Per-symbol OHLC~~ **DONE** — `symbol_prices[sym]` tracks open/high/low/close from markPrice stream. Minute snapshots compute per-symbol OHLC4 = (O+H+L+C)/4 for all 3 symbols. OHLC reset on minute rollover. BTC continues using orderbook mid-price OHLC (perp_*) as primary, with markPrice as secondary via `symbol_prices`
+- **Per-symbol price state:** `self.symbol_prices` dict in `FullMetricsProcessor` tracks `{mark, last, mid, open, high, low, close}` per symbol. `INSTRUMENT_TO_SHORT` maps lowercase instrument names (e.g. `"ethusdt"`) to short symbols (e.g. `"ETH"`) for markPrice routing
+
 ### Remaining TODO
 
-- **Per-symbol price feeds:** ETH/SOL `mark_price`, `mid_price`, `last_price` are passed as 0 to the calibrator because only BTC has a markPrice stream. Need per-symbol price tracking for calibrator attribution accuracy
-- **Per-symbol OHLC:** Minute snapshots for ETH/SOL use `src=0` — need per-symbol price accumulation for proper calibrator learning
 - Snapshot files need per-symbol naming: `liq_api_snapshot_{symbol}.json`
 - Binary history files need per-symbol naming: `liq_heatmap_v1_{symbol}.bin`
 - Frame buffer snapshots must be per-symbol (not shared)
@@ -572,7 +574,7 @@ Frontend (consumer)
 
 ## Testing Checklist Before Deployment
 
-- [ ] All WebSocket streams connecting — Binance (depth, aggTrade, forceOrder, markPrice), Bybit (allLiquidation ×3), OKX (liquidation-orders)
+- [ ] All WebSocket streams connecting — Binance (depth, aggTrade, forceOrder, markPrice ×3), Bybit (allLiquidation ×3), OKX (liquidation-orders)
 - [ ] Multi-exchange OI poller returning data for BTC, ETH, SOL (check `/oi?symbol=BTC`)
 - [ ] REST pollers returning data (ratios)
 - [ ] V2 heatmap snapshots being written to disk (`liq_api_snapshot_v2.json`)

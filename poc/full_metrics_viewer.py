@@ -110,6 +110,12 @@ SYMBOL_CONFIGS = {
     },
 }
 
+# Map lowercase instrument names (from ws_connectors wrapper envelope) to short symbols.
+# Used by _process_markprice to route mark price updates to the correct symbol_prices entry.
+INSTRUMENT_TO_SHORT: Dict[str, str] = {
+    cfg["symbol_full"].lower(): sym for sym, cfg in SYMBOL_CONFIGS.items()
+}
+
 
 def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: float = 24) -> bool:
     """Rotate log file if it exceeds size or age limits."""
@@ -626,6 +632,15 @@ class FullMetricsProcessor:
         self.current_minute = datetime.now().minute
         self.prices_this_minute: List[float] = []
 
+        # Per-symbol price tracking for calibrator attribution.
+        # BTC prices also update self.state.perp_* for backwards compat.
+        # Updated from Binance markPrice@1s streams (all 3 symbols).
+        self.symbol_prices: Dict[str, Dict[str, float]] = {
+            sym: {"mark": 0.0, "last": 0.0, "mid": 0.0,
+                  "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0}
+            for sym in SYMBOL_CONFIGS
+        }
+
         # Track if we've applied persisted weights (per-symbol)
         self._applied_persisted_weights: Dict[str, bool] = {}
 
@@ -905,6 +920,7 @@ class FullMetricsProcessor:
 
         exchange = msg.get("exchange", "unknown")
         obj_type = msg.get("obj", "")
+        instrument = msg.get("instrument", "")
         data = msg.get("data", {})
 
         with self.lock:
@@ -920,7 +936,9 @@ class FullMetricsProcessor:
                 self._process_trades(exchange, data)
             elif obj_type == "liquidations":
                 self._process_liquidations(exchange, data)
-            elif obj_type in ["markprice", "funding"]:
+            elif obj_type == "markprice":
+                self._process_markprice(exchange, instrument, data)
+            elif obj_type == "funding":
                 self._process_funding(exchange, data)
             elif obj_type in ["oi", "oifunding"]:
                 self._process_oi(exchange, data)
@@ -1156,18 +1174,15 @@ class FullMetricsProcessor:
                         )
 
                 # Event-time src prices for calibrator attribution.
-                # TODO: Per-symbol price feeds needed for ETH/SOL.  Currently
-                #       only BTC has mark/mid/last from Binance markPrice stream.
+                # All symbols get mark_price from Binance markPrice@1s stream
+                # via self.symbol_prices.  BTC also has mid_price from orderbook.
+                sym_prices = self.symbol_prices.get(event.symbol_short, {})
+                mark_price = sym_prices.get("mark", 0.0)
+                last_price = sym_prices.get("close", 0.0)
+                mid_price = 0.0
                 if event.symbol_short == "BTC":
-                    mark_price = getattr(self.state, 'perp_markPrice', 0.0)
-                    mid_price = 0.0
                     if self.state.best_bid > 0 and self.state.best_ask > 0:
                         mid_price = (self.state.best_bid + self.state.best_ask) / 2
-                    last_price = self.state.btc_price
-                else:
-                    mark_price = 0.0
-                    mid_price = 0.0
-                    last_price = 0.0
 
                 # Sanity log for first N events (across all exchanges/symbols)
                 if self._sanity_check_count < self._sanity_check_limit:
@@ -1215,6 +1230,38 @@ class FullMetricsProcessor:
                     "error": str(e),
                     "error_type": type(e).__name__,
                 })
+
+    def _process_markprice(self, exchange: str, instrument: str, data: dict):
+        """Process Binance markPrice@1s stream for all tracked symbols.
+
+        Updates per-symbol mark price and OHLC tracking in self.symbol_prices.
+        BTC also updates self.state.perp_markPrice for backwards compat.
+        Extracts funding rate via _process_funding if present.
+        """
+        sym = INSTRUMENT_TO_SHORT.get(instrument)
+        if sym is None:
+            return
+
+        # Extract mark price (field "p" in Binance markPrice stream)
+        if "p" in data:
+            mark = float(data["p"])
+            if mark > 0:
+                prices = self.symbol_prices[sym]
+                prices["mark"] = mark
+                prices["close"] = mark
+
+                # OHLC accumulation: first tick sets open, then track high/low
+                if prices["open"] == 0.0:
+                    prices["open"] = mark
+                prices["high"] = max(prices["high"], mark) if prices["high"] > 0 else mark
+                prices["low"] = min(prices["low"], mark) if prices["low"] > 0 else mark
+
+                # BTC backwards compat: update self.state.perp_markPrice
+                if sym == "BTC":
+                    self.state.perp_markPrice = mark
+
+        # Also extract funding rate if present (markPrice stream includes it)
+        self._process_funding(exchange, data)
 
     def _process_funding(self, exchange: str, data: dict):
         if "r" in data:
@@ -1489,11 +1536,9 @@ class FullMetricsProcessor:
                 # 60 seconds, otherwise on_liquidation() silently drops all events
                 # (CLAUDE.md: Calibrator Integration Rules).
                 #
-                # For MVP, BTC OHLC comes from the viewer's own price tracking.
-                # ETH/SOL don't have per-symbol OHLC yet — we use a minimal
-                # snapshot with src=0 so the calibrator's snapshot deque is
-                # non-empty (enabling event processing) but approach/stress
-                # calculations will be skipped when src=0.
+                # BTC OHLC comes from the viewer's orderbook mid-price tracking
+                # (perp_open/high/low/close) AND from markPrice stream (symbol_prices).
+                # ETH/SOL OHLC comes from Binance markPrice@1s via symbol_prices.
                 btc_src = (self.state.perp_open + self.state.perp_high +
                            self.state.perp_low + self.state.perp_close) / 4
 
@@ -1509,6 +1554,8 @@ class FullMetricsProcessor:
                     weights = [lw[lev] for lev in ladder]
 
                     if sym_short == "BTC":
+                        # BTC: primary price from orderbook mid (perp_*),
+                        # backed by markPrice stream in symbol_prices
                         sym_src = btc_src
                         sym_high = self.state.perp_high
                         sym_low = self.state.perp_low
@@ -1518,11 +1565,16 @@ class FullMetricsProcessor:
                         sym_oi_change = self.state.perp_oi_change
                         sym_depth = self._build_depth_band(btc_src, v2_cfg.steps)
                     else:
-                        # ETH/SOL: no per-symbol OHLC yet — minimal snapshot
-                        sym_src = 0.0
-                        sym_high = 0.0
-                        sym_low = 0.0
-                        sym_close = 0.0
+                        # ETH/SOL: OHLC from Binance markPrice@1s stream
+                        prices = self.symbol_prices.get(sym_short, {})
+                        o = prices.get("open", 0.0)
+                        h = prices.get("high", 0.0)
+                        l = prices.get("low", 0.0)
+                        c = prices.get("close", 0.0)
+                        sym_src = (o + h + l + c) / 4 if c > 0 else 0.0
+                        sym_high = h
+                        sym_low = l
+                        sym_close = c
                         sym_buy_vol = 0.0
                         sym_sell_vol = 0.0
                         sym_oi_change = 0.0
@@ -1575,6 +1627,15 @@ class FullMetricsProcessor:
             self.state.perp_liquidations_shorts = {}
             self.state.perp_open = self.state.btc_price
             self.prices_this_minute = [self.state.btc_price] if self.state.btc_price > 0 else []
+
+            # Reset per-symbol OHLC for new minute.
+            # Carry forward last close as new open (first tick will override).
+            for sym in self.symbol_prices:
+                last_close = self.symbol_prices[sym]["close"]
+                self.symbol_prices[sym]["open"] = last_close if last_close > 0 else 0.0
+                self.symbol_prices[sym]["high"] = last_close if last_close > 0 else 0.0
+                self.symbol_prices[sym]["low"] = last_close if last_close > 0 else 0.0
+
             self.current_minute = current_minute
 
     def _write_api_heatmap_snapshot(

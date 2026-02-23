@@ -120,10 +120,18 @@ class BinanceConnector:
              f"{self.BASE_WS}/!forceOrder@arr",
              ("binance", "btcusdt", "perpetual", "liquidations"), None),
 
-            # Mark price stream (includes funding rate)
+            # Mark price streams (includes funding rate) — all tracked symbols
             ("markprice_btcusdt",
              f"{self.BASE_WS}/btcusdt@markPrice@1s",
              ("binance", "btcusdt", "perpetual", "markprice"), None),
+
+            ("markprice_ethusdt",
+             f"{self.BASE_WS}/ethusdt@markPrice@1s",
+             ("binance", "ethusdt", "perpetual", "markprice"), None),
+
+            ("markprice_solusdt",
+             f"{self.BASE_WS}/solusdt@markPrice@1s",
+             ("binance", "solusdt", "perpetual", "markprice"), None),
         ]
 
         # Start all stream connections
