@@ -1,15 +1,19 @@
 """
 Websocket connectors for real-time exchange data.
-Connects to Binance BTC perpetual streams for proof-of-concept.
+Supports Binance, Bybit, and OKX perpetual streams.
 """
 
 import asyncio
 import json
 import time
 import websockets
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from collections import deque
+
+# Default symbols for multi-symbol connectors (Bybit, OKX).
+# Binance uses !forceOrder@arr which already gets all symbols.
+DEFAULT_SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
 @dataclass
@@ -136,13 +140,28 @@ class BinanceConnector:
 
 
 class OKXConnector:
-    """Connects to OKX websocket streams for BTC perpetuals."""
+    """Connects to OKX websocket streams for perpetuals (multi-symbol).
+
+    The liquidation-orders subscription uses instType=SWAP which receives
+    liquidations for ALL SWAP instruments (BTC, ETH, SOL, etc.) in a
+    single subscription — no per-symbol filtering needed.
+    """
 
     WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
-    def __init__(self, on_message: Callable[[str], None], btc_price_getter: Callable[[], float]):
+    # OKX uses "BTC-USDT-SWAP" format. Map from our BTCUSDT to OKX instId.
+    _SYMBOL_TO_OKX_INST = {
+        "BTCUSDT": "BTC-USDT-SWAP",
+        "ETHUSDT": "ETH-USDT-SWAP",
+        "SOLUSDT": "SOL-USDT-SWAP",
+    }
+
+    def __init__(self, on_message: Callable[[str], None],
+                 btc_price_getter: Callable[[], float],
+                 symbols: Optional[List[str]] = None):
         self.on_message = on_message
         self.get_btc_price = btc_price_getter
+        self.symbols = symbols or list(DEFAULT_SYMBOLS)
         self.running = False
         self.message_counts: Dict[str, int] = {}
         self.last_messages: Dict[str, float] = {}
@@ -160,24 +179,49 @@ class OKXConnector:
         }
         return json.dumps(wrapped)
 
+    @staticmethod
+    def _extract_instrument(data: dict) -> str:
+        """Extract instrument from OKX message data.
+
+        For liquidation-orders: data["data"][0]["instId"] → "BTC-USDT-SWAP" → "btcusdt"
+        For per-instrument channels: data["arg"]["instId"] → same conversion.
+        Falls back to "unknown".
+        """
+        # Try data[0].instId first (liquidation-orders, etc.)
+        items = data.get("data")
+        if items and isinstance(items, list) and len(items) > 0:
+            inst_id = items[0].get("instId", "")
+            if inst_id:
+                # "BTC-USDT-SWAP" → "btcusdt"
+                return inst_id.replace("-SWAP", "").replace("-", "").lower()
+
+        # Try arg.instId (per-instrument subscriptions)
+        inst_id = data.get("arg", {}).get("instId", "")
+        if inst_id:
+            return inst_id.replace("-SWAP", "").replace("-", "").lower()
+
+        return "unknown"
+
     async def connect_all(self):
-        """Connect to OKX BTC perpetual streams."""
+        """Connect to OKX perpetual streams for all configured symbols."""
         self.running = True
 
         while self.running:
             try:
                 async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
-                    # Subscribe to channels
-                    subscribe = {
-                        "op": "subscribe",
-                        "args": [
-                            {"channel": "books5", "instId": "BTC-USDT-SWAP"},
-                            {"channel": "trades", "instId": "BTC-USDT-SWAP"},
-                            {"channel": "funding-rate", "instId": "BTC-USDT-SWAP"},
-                            {"channel": "open-interest", "instId": "BTC-USDT-SWAP"},
-                            {"channel": "liquidation-orders", "instType": "SWAP"},
-                        ]
-                    }
+                    # Build subscription args
+                    args = []
+                    # BTC-specific data streams (orderbook, trades, funding, OI)
+                    args.append({"channel": "books5", "instId": "BTC-USDT-SWAP"})
+                    args.append({"channel": "trades", "instId": "BTC-USDT-SWAP"})
+                    args.append({"channel": "funding-rate", "instId": "BTC-USDT-SWAP"})
+                    args.append({"channel": "open-interest", "instId": "BTC-USDT-SWAP"})
+                    # Liquidation-orders for ALL SWAP instruments (one subscription
+                    # covers BTC, ETH, SOL, and everything else — no per-symbol
+                    # filtering needed)
+                    args.append({"channel": "liquidation-orders", "instType": "SWAP"})
+
+                    subscribe = {"op": "subscribe", "args": args}
                     await ws.send(json.dumps(subscribe))
 
                     async for message in ws:
@@ -199,8 +243,10 @@ class OKXConnector:
                             }
                             obj = obj_map.get(channel, channel)
 
+                            instrument = self._extract_instrument(data)
+
                             wrapped = self._wrap_message(
-                                data, "okx", "btcusdt", "perpetual", obj
+                                data, "okx", instrument, "perpetual", obj
                             )
                             self.message_counts[obj] = self.message_counts.get(obj, 0) + 1
                             self.last_messages[obj] = time.time()
@@ -220,13 +266,16 @@ class OKXConnector:
 
 
 class BybitConnector:
-    """Connects to Bybit websocket streams for BTC perpetuals."""
+    """Connects to Bybit V5 websocket streams for perpetuals (multi-symbol)."""
 
     WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
-    def __init__(self, on_message: Callable[[str], None], btc_price_getter: Callable[[], float]):
+    def __init__(self, on_message: Callable[[str], None],
+                 btc_price_getter: Callable[[], float],
+                 symbols: Optional[List[str]] = None):
         self.on_message = on_message
         self.get_btc_price = btc_price_getter
+        self.symbols = symbols or list(DEFAULT_SYMBOLS)
         self.running = False
         self.message_counts: Dict[str, int] = {}
         self.last_messages: Dict[str, float] = {}
@@ -244,22 +293,49 @@ class BybitConnector:
         }
         return json.dumps(wrapped)
 
+    @staticmethod
+    def _extract_instrument(data: dict) -> str:
+        """Extract instrument from Bybit message data.
+
+        For liquidation messages, the symbol is in data["data"][0]["s"].
+        For other messages, parse from the topic string.
+        Falls back to "unknown".
+        """
+        topic = data.get("topic", "")
+
+        # Liquidation messages: allLiquidation.BTCUSDT → data[].s
+        if "Liquidation" in topic or "liquidation" in topic:
+            items = data.get("data")
+            if items and isinstance(items, list) and len(items) > 0:
+                sym = items[0].get("s", "")
+                if sym:
+                    return sym.lower()
+
+        # Other topics: "orderbook.50.BTCUSDT" → BTCUSDT
+        parts = topic.split(".")
+        if len(parts) >= 2:
+            return parts[-1].lower()
+
+        return "unknown"
+
     async def connect_all(self):
-        """Connect to Bybit BTC perpetual streams."""
+        """Connect to Bybit perpetual streams for all configured symbols."""
         self.running = True
 
         while self.running:
             try:
                 async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
-                    subscribe = {
-                        "op": "subscribe",
-                        "args": [
-                            "orderbook.50.BTCUSDT",
-                            "publicTrade.BTCUSDT",
-                            "tickers.BTCUSDT",
-                            "liquidation.BTCUSDT"
-                        ]
-                    }
+                    # Build subscription args for all symbols
+                    args = []
+                    # BTC-specific data streams (orderbook, trades, tickers)
+                    args.append("orderbook.50.BTCUSDT")
+                    args.append("publicTrade.BTCUSDT")
+                    args.append("tickers.BTCUSDT")
+                    # Liquidation streams for ALL configured symbols
+                    for sym in self.symbols:
+                        args.append(f"allLiquidation.{sym}")
+
+                    subscribe = {"op": "subscribe", "args": args}
                     await ws.send(json.dumps(subscribe))
 
                     async for message in ws:
@@ -278,13 +354,15 @@ class BybitConnector:
                                 obj = "trades"
                             elif "tickers" in topic:
                                 obj = "oifunding"
-                            elif "liquidation" in topic:
+                            elif "Liquidation" in topic or "liquidation" in topic:
                                 obj = "liquidations"
                             else:
                                 obj = topic
 
+                            instrument = self._extract_instrument(data)
+
                             wrapped = self._wrap_message(
-                                data, "bybit", "btcusdt", "perpetual", obj
+                                data, "bybit", instrument, "perpetual", obj
                             )
                             self.message_counts[obj] = self.message_counts.get(obj, 0) + 1
                             self.last_messages[obj] = time.time()
@@ -304,15 +382,26 @@ class BybitConnector:
 
 
 class MultiExchangeConnector:
-    """Manages connections to multiple exchanges."""
+    """Manages connections to multiple exchanges.
 
-    def __init__(self, on_message: Callable[[str], None]):
+    Args:
+        on_message: Callback receiving wrapped JSON message strings.
+        symbols:    List of symbols for multi-symbol connectors (Bybit, OKX).
+                    Defaults to DEFAULT_SYMBOLS (BTCUSDT, ETHUSDT, SOLUSDT).
+                    Binance uses !forceOrder@arr which already gets all symbols.
+    """
+
+    def __init__(self, on_message: Callable[[str], None],
+                 symbols: Optional[List[str]] = None):
         self.btc_price = 0.0
         self.on_message = on_message
+        self.symbols = symbols or list(DEFAULT_SYMBOLS)
 
         self.binance = BinanceConnector(on_message, lambda: self.btc_price)
-        self.okx = OKXConnector(on_message, lambda: self.btc_price)
-        self.bybit = BybitConnector(on_message, lambda: self.btc_price)
+        self.okx = OKXConnector(on_message, lambda: self.btc_price,
+                                symbols=self.symbols)
+        self.bybit = BybitConnector(on_message, lambda: self.btc_price,
+                                    symbols=self.symbols)
 
         self.connectors = {
             "binance": self.binance,
