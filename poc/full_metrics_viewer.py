@@ -46,6 +46,7 @@ from liq_heatmap import LiquidationHeatmap, HeatmapConfig
 from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer, OrderbookReconstructor
 from engine_manager import EngineManager, EngineInstance
 from liq_normalizer import normalize_liquidation
+from oi_poller import OIPollerThread
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -628,16 +629,25 @@ class FullMetricsProcessor:
         # Track if we've applied persisted weights (per-symbol)
         self._applied_persisted_weights: Dict[str, bool] = {}
 
-        # REST poller for OI and trader ratios (direct HTTPS)
+        # REST poller for trader ratios only (OI moved to MultiExchangeOIPoller).
+        # oi_interval set very high to effectively disable the legacy OI loop.
         self.rest_poller = BinanceRESTPollerThread(
             symbols=["BTCUSDT"],
-            oi_interval=10.0,      # Poll OI every 10s
+            oi_interval=999999,    # OI handled by oi_poller now
             ratio_interval=60.0,   # Poll ratios every 60s
             on_update=self._on_rest_poller_update,
             price_getter=self._get_price_for_symbol,
             debug=True
         )
-        self._prev_rest_oi: float = 0.0
+
+        # Multi-exchange OI poller (Binance + Bybit + OKX, per symbol)
+        self.oi_poller = OIPollerThread(
+            symbols=list(SYMBOL_CONFIGS.keys()),  # ["BTC", "ETH", "SOL"]
+            on_oi_update=self._on_oi_update,
+            poll_interval=15.0,
+        )
+        # Per-symbol OI state for API exposure
+        self.oi_by_symbol: Dict[str, Dict] = {}
 
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
@@ -855,21 +865,29 @@ class FullMetricsProcessor:
             engine.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
             engine.heatmap_v2.config.buffer = new_buffer
 
-    def _on_rest_poller_update(self, poller_state: PollerState):
-        """Callback when REST poller has new OI/ratio data."""
+    def _on_oi_update(self, symbol_short: str, aggregated_oi: float,
+                      per_exchange: Dict[str, float]):
+        """Callback from MultiExchangeOIPoller with per-symbol aggregated OI."""
         with self.lock:
-            # Update OI from REST (more reliable than websocket for Binance)
-            if poller_state.total_oi > 0:
-                # Compute OI change
-                if self._prev_rest_oi > 0:
-                    self.state.perp_oi_change = poller_state.total_oi - self._prev_rest_oi
-                self._prev_rest_oi = poller_state.total_oi
-                self.state.perp_total_oi = poller_state.total_oi
+            prev = self.oi_by_symbol.get(symbol_short, {}).get("aggregated_oi", 0.0)
+            self.oi_by_symbol[symbol_short] = {
+                "aggregated_oi": aggregated_oi,
+                "per_exchange": dict(per_exchange),
+                "ts": time.time(),
+            }
 
-                # Update per-instrument OI
-                for symbol, oi_data in poller_state.oi_data.items():
-                    self.state.perp_OIs_per_instrument[f"binance_{symbol}"] = oi_data.oi_value
+            # BTC backwards compat — update legacy state fields
+            if symbol_short == "BTC":
+                if prev > 0:
+                    self.state.perp_oi_change = aggregated_oi - prev
+                self.state.perp_total_oi = aggregated_oi
+                # Update per-instrument breakdown
+                for ex_name, oi_val in per_exchange.items():
+                    self.state.perp_OIs_per_instrument[f"{ex_name}_BTCUSDT"] = oi_val
 
+    def _on_rest_poller_update(self, poller_state: PollerState):
+        """Callback when REST poller has new ratio data."""
+        with self.lock:
             # Update trader ratios (TTA, TTP, GTA)
             if poller_state.weighted_tta > 0:
                 self.state.perp_TTA_ratio = poller_state.weighted_tta
@@ -1990,15 +2008,20 @@ def main():
                     snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
                     liq_heatmap_v1_file=LIQ_HEATMAP_V1_FILE,
                     liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE,
-                    engine_manager=processor.engine_manager
+                    engine_manager=processor.engine_manager,
+                    oi_poller=processor.oi_poller
                 )
                 api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
                 console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")
         except ImportError as e:
             console.print(f"[yellow]WARNING: Could not start embedded API: {e}[/]")
 
-    # Start REST poller for OI and trader ratios
-    console.print("[cyan]Starting REST poller for OI and trader ratios...[/]")
+    # Start multi-exchange OI poller (Binance + Bybit + OKX, per symbol)
+    console.print("[cyan]Starting multi-exchange OI poller (BTC, ETH, SOL)...[/]")
+    processor.oi_poller.start()
+
+    # Start REST poller for trader ratios (OI now handled by oi_poller)
+    console.print("[cyan]Starting REST poller for trader ratios...[/]")
     processor.rest_poller.start()
 
     # Start websocket in background thread
@@ -2013,6 +2036,7 @@ def main():
         console.print("\n[yellow]Shutting down...[/]")
         stop_event.set()
         connector.stop()
+        processor.oi_poller.stop()
         processor.rest_poller.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -2032,6 +2056,7 @@ def main():
     finally:
         stop_event.set()
         connector.stop()
+        processor.oi_poller.stop()
         processor.rest_poller.stop()
 
     if api_thread:

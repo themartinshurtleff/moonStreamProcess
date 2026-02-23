@@ -371,7 +371,8 @@ class EmbeddedAPIState:
         snapshot_v2_file: Optional[str] = None,
         liq_heatmap_v1_file: Optional[str] = None,
         liq_heatmap_v2_file: Optional[str] = None,
-        engine_manager: Optional['EngineManager'] = None
+        engine_manager: Optional['EngineManager'] = None,
+        oi_poller: Optional[Any] = None
     ):
         self.ob_buffer = ob_buffer
         self.snapshot_file = snapshot_file
@@ -379,6 +380,7 @@ class EmbeddedAPIState:
         self.liq_heatmap_v1_file = liq_heatmap_v1_file
         self.liq_heatmap_v2_file = liq_heatmap_v2_file
         self.engine_manager = engine_manager
+        self.oi_poller = oi_poller  # MultiExchangeOIPoller or OIPollerThread
         self.start_time = time.time()
 
         # Cached snapshot data
@@ -454,7 +456,8 @@ def create_embedded_app(
     snapshot_v2_file: Optional[str] = None,
     liq_heatmap_v1_file: Optional[str] = None,
     liq_heatmap_v2_file: Optional[str] = None,
-    engine_manager: Optional['EngineManager'] = None
+    engine_manager: Optional['EngineManager'] = None,
+    oi_poller: Optional[Any] = None
 ) -> 'FastAPI':
     """
     Create FastAPI application with shared buffer references.
@@ -469,7 +472,8 @@ def create_embedded_app(
         snapshot_v2_file=snapshot_v2_file,
         liq_heatmap_v1_file=liq_heatmap_v1_file,
         liq_heatmap_v2_file=liq_heatmap_v2_file,
-        engine_manager=engine_manager
+        engine_manager=engine_manager,
+        oi_poller=oi_poller
     )
 
     # Response cache — shared across all concurrent requests
@@ -536,6 +540,44 @@ def create_embedded_app(
                 "v2_frames": v2_history_frames
             }
         }
+
+    @app.get("/oi")
+    async def open_interest(
+        symbol: str = Query(default="BTC", description="Symbol (BTC, ETH, SOL)")
+    ):
+        """
+        Get aggregated open interest across Binance, Bybit, and OKX.
+
+        Returns per-exchange breakdown and aggregate (in base asset).
+        """
+        symbol_upper = symbol.strip().upper()
+        cache_key = f"oi?symbol={symbol_upper}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
+        if not state.oi_poller:
+            raise HTTPException(
+                status_code=503,
+                detail="OI poller not available"
+            )
+
+        snapshot = state.oi_poller.get_snapshot(symbol_upper)
+        if not snapshot:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No OI data available for {symbol_upper}. Poller may still be initializing."
+            )
+
+        payload = {
+            "symbol": snapshot.symbol,
+            "aggregated_oi": snapshot.aggregated_oi,
+            "per_exchange": snapshot.per_exchange,
+            "ts": snapshot.ts,
+        }
+        response = JSONResponse(content=payload)
+        cache.set(cache_key, response)
+        return response
 
     @app.get("/liq_heatmap")
     @app.get("/v1/liq_heatmap")  # backwards compat alias
