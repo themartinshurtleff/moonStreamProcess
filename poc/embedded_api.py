@@ -13,7 +13,8 @@ Usage:
     app = create_embedded_app(
         ob_buffer=processor.ob_heatmap_buffer,
         snapshot_file=LIQ_API_SNAPSHOT,
-        snapshot_v2_file=LIQ_API_SNAPSHOT_V2
+        snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
+        engine_manager=processor.engine_manager
     )
     api_thread = start_api_thread(app, host="127.0.0.1", port=8899)
 """
@@ -55,12 +56,31 @@ try:
 except ImportError:
     pass
 
+# Try to import engine manager for V3 zone access
+HAS_ENGINE_MANAGER = False
+try:
+    from engine_manager import EngineManager, FULL_TO_SHORT
+    HAS_ENGINE_MANAGER = True
+except ImportError:
+    pass
+
 # API version
-API_VERSION = "2.1.0"  # Bumped for embedded mode
+API_VERSION = "3.0.0"  # V3 with zone lifecycle endpoints
 
 # Default grid parameters
 DEFAULT_STEP = 20.0
 DEFAULT_BAND_PCT = 0.08
+
+
+def _get_fallback_price_range(symbol: str):
+    """Returns (price_min, price_max) fallback range for a symbol when no data exists."""
+    symbol = symbol.upper().replace("USDT", "")
+    ranges = {
+        "BTC": (85000, 115000),
+        "ETH": (1500, 5000),
+        "SOL": (50, 400),
+    }
+    return ranges.get(symbol, (100, 10000))  # wide default for unknown symbols
 
 # History buffer size (12 hours at 1-minute resolution)
 HISTORY_MINUTES = 720
@@ -70,6 +90,54 @@ LIQ_FRAME_RECORD_SIZE = 4096  # Fixed 4KB per frame for fast seek
 LIQ_MAX_BUCKETS = 1000  # Max price buckets per frame
 LIQ_HEADER_FORMAT = '<dddddI'
 LIQ_HEADER_SIZE = struct.calcsize(LIQ_HEADER_FORMAT)  # 48 bytes
+
+
+class ResponseCache:
+    """
+    Thread-safe in-memory response cache for API endpoints.
+
+    Allows hundreds of concurrent users to receive the same cached response
+    instead of each triggering separate data reads. Cache entries expire
+    after a configurable TTL.
+
+    Usage:
+        cache = ResponseCache()
+        cached = cache.get("liq_heatmap?symbol=BTC", ttl=5.0)
+        if cached is not None:
+            return cached
+        # ... generate response ...
+        cache.set("liq_heatmap?symbol=BTC", response)
+        return response
+    """
+
+    def __init__(self):
+        self._cache: Dict[str, Tuple[Any, float]] = {}
+        self._lock = threading.Lock()
+        self._sets_count: int = 0
+
+    def get(self, key: str, ttl: float) -> Optional[JSONResponse]:
+        """Return cached JSONResponse if within TTL, else None."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry and (time.time() - entry[1]) < ttl:
+                return entry[0]
+        return None
+
+    def set(self, key: str, response: JSONResponse) -> None:
+        """Store a JSONResponse in the cache."""
+        with self._lock:
+            self._cache[key] = (response, time.time())
+            self._sets_count += 1
+            if self._sets_count % 100 == 0:
+                self._evict_expired()
+
+    def _evict_expired(self) -> None:
+        """Remove entries older than max_ttl to prevent unbounded growth. Caller must hold _lock."""
+        now = time.time()
+        max_ttl = 60.0  # nothing should be cached longer than this
+        expired = [k for k, (_, ts) in self._cache.items() if (now - ts) > max_ttl]
+        for k in expired:
+            del self._cache[k]
 
 
 @dataclass
@@ -302,13 +370,15 @@ class EmbeddedAPIState:
         snapshot_file: Optional[str] = None,
         snapshot_v2_file: Optional[str] = None,
         liq_heatmap_v1_file: Optional[str] = None,
-        liq_heatmap_v2_file: Optional[str] = None
+        liq_heatmap_v2_file: Optional[str] = None,
+        engine_manager: Optional['EngineManager'] = None
     ):
         self.ob_buffer = ob_buffer
         self.snapshot_file = snapshot_file
         self.snapshot_v2_file = snapshot_v2_file
         self.liq_heatmap_v1_file = liq_heatmap_v1_file
         self.liq_heatmap_v2_file = liq_heatmap_v2_file
+        self.engine_manager = engine_manager
         self.start_time = time.time()
 
         # Cached snapshot data
@@ -316,7 +386,8 @@ class EmbeddedAPIState:
         self._v1_cache_time: float = 0
         self._v2_cache: Optional[Dict] = None
         self._v2_cache_time: float = 0
-        self._cache_ttl: float = 1.0
+        # 5s minimum — CLAUDE.md rule: no disk I/O refresh intervals under 5s
+        self._cache_ttl: float = 5.0
 
         # History buffers for liquidation heatmap
         self.v1_history: Optional[LiquidationHeatmapBuffer] = None
@@ -359,8 +430,8 @@ class EmbeddedAPIState:
             # Add to history buffer
             if self.v1_history:
                 self.v1_history.add_frame(data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Cache refresh error (v1): %s", e)
 
     def _refresh_v2_cache(self):
         if not self.snapshot_v2_file or not os.path.exists(self.snapshot_v2_file):
@@ -373,8 +444,8 @@ class EmbeddedAPIState:
             # Add to history buffer
             if self.v2_history:
                 self.v2_history.add_frame(data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Cache refresh error (v2): %s", e)
 
 
 def create_embedded_app(
@@ -382,7 +453,8 @@ def create_embedded_app(
     snapshot_file: Optional[str] = None,
     snapshot_v2_file: Optional[str] = None,
     liq_heatmap_v1_file: Optional[str] = None,
-    liq_heatmap_v2_file: Optional[str] = None
+    liq_heatmap_v2_file: Optional[str] = None,
+    engine_manager: Optional['EngineManager'] = None
 ) -> 'FastAPI':
     """
     Create FastAPI application with shared buffer references.
@@ -396,8 +468,12 @@ def create_embedded_app(
         snapshot_file=snapshot_file,
         snapshot_v2_file=snapshot_v2_file,
         liq_heatmap_v1_file=liq_heatmap_v1_file,
-        liq_heatmap_v2_file=liq_heatmap_v2_file
+        liq_heatmap_v2_file=liq_heatmap_v2_file,
+        engine_manager=engine_manager
     )
+
+    # Response cache — shared across all concurrent requests
+    cache = ResponseCache()
 
     app = FastAPI(
         title="Liquidation Heatmap API (Embedded)",
@@ -424,7 +500,8 @@ def create_embedded_app(
     async def shutdown():
         state.stop()
 
-    @app.get("/v1/health")
+    @app.get("/health")
+    @app.get("/v1/health")  # backwards compat alias
     async def health():
         """Health check endpoint."""
         ob_stats = {}
@@ -460,11 +537,17 @@ def create_embedded_app(
             }
         }
 
-    @app.get("/v1/liq_heatmap")
+    @app.get("/liq_heatmap")
+    @app.get("/v1/liq_heatmap")  # backwards compat alias
     async def liq_heatmap(
         symbol: str = Query(default="BTC", description="Symbol to query")
     ):
         """Get current V1 liquidation heatmap snapshot."""
+        cache_key = f"liq_heatmap?symbol={symbol}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
         snapshot = state.get_v1_snapshot()
         if not snapshot:
             raise HTTPException(
@@ -484,9 +567,12 @@ def create_embedded_app(
             snapshot = snapshot.copy()
             snapshot["_warning"] = f"Data is {age:.0f}s old, viewer may be stopped"
 
-        return JSONResponse(content=snapshot)
+        response = JSONResponse(content=snapshot)
+        cache.set(cache_key, response)
+        return response
 
-    @app.get("/v1/liq_heatmap_history")
+    @app.get("/liq_heatmap_history")
+    @app.get("/v1/liq_heatmap_history")  # backwards compat alias
     async def liq_heatmap_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
@@ -495,6 +581,11 @@ def create_embedded_app(
         """Get historical V1 liquidation heatmap data."""
         minutes = max(5, min(720, minutes))
         stride = max(1, min(30, stride))
+
+        cache_key = f"liq_heatmap_history?symbol={symbol}&minutes={minutes}&stride={stride}"
+        cached = cache.get(cache_key, ttl=30.0)
+        if cached is not None:
+            return cached
 
         if not state.v1_history:
             raise HTTPException(status_code=503, detail="V1 history not available")
@@ -515,12 +606,15 @@ def create_embedded_app(
                     p += step
             else:
                 step = DEFAULT_STEP
-                prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+                fb_min, fb_max = _get_fallback_price_range(symbol)
+                prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
-            return JSONResponse(content={
+            response = JSONResponse(content={
                 "t": [], "prices": prices, "long": [], "short": [],
                 "step": step, "scale": 255, "_mode": "embedded"
             })
+            cache.set(cache_key, response)
+            return response
 
         if current:
             current_src = current.get('src', 0)
@@ -532,7 +626,8 @@ def create_embedded_app(
         prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
 
         if not prices:
-            prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+            fb_min, fb_max = _get_fallback_price_range(symbol)
+            prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
         t_arr = []
         long_flat = []
@@ -546,17 +641,25 @@ def create_embedded_app(
 
         print(f"[EMBEDDED_API] v1/liq_heatmap_history: frames={len(t_arr)} prices={len(prices)}")
 
-        return JSONResponse(content={
+        response = JSONResponse(content={
             "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
             "step": step, "scale": 255, "_mode": "embedded"
         })
+        cache.set(cache_key, response)
+        return response
 
-    @app.get("/v2/liq_heatmap")
+    @app.get("/liq_heatmap_v2")
+    @app.get("/v2/liq_heatmap")  # backwards compat alias
     async def liq_heatmap_v2(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         min_notional: float = Query(default=0, description="Minimum USD notional to include")
     ):
         """Get current V2 liquidation heatmap (tape + inference)."""
+        cache_key = f"liq_heatmap_v2?symbol={symbol}&min_notional={min_notional}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
         snapshot = state.get_v2_snapshot()
         if not snapshot:
             raise HTTPException(
@@ -587,9 +690,12 @@ def create_embedded_app(
             snapshot = snapshot.copy() if min_notional == 0 else snapshot
             snapshot["_warning"] = f"Data is {age:.0f}s old, viewer may be stopped"
 
-        return JSONResponse(content=snapshot)
+        response = JSONResponse(content=snapshot)
+        cache.set(cache_key, response)
+        return response
 
-    @app.get("/v2/liq_heatmap_history")
+    @app.get("/liq_heatmap_v2_history")
+    @app.get("/v2/liq_heatmap_history")  # backwards compat alias
     async def liq_heatmap_history_v2(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
@@ -598,6 +704,11 @@ def create_embedded_app(
         """Get historical V2 liquidation heatmap data."""
         minutes = max(5, min(720, minutes))
         stride = max(1, min(30, stride))
+
+        cache_key = f"liq_heatmap_v2_history?symbol={symbol}&minutes={minutes}&stride={stride}"
+        cached = cache.get(cache_key, ttl=30.0)
+        if cached is not None:
+            return cached
 
         if not state.v2_history:
             raise HTTPException(status_code=503, detail="V2 history not available")
@@ -618,12 +729,15 @@ def create_embedded_app(
                     p += step
             else:
                 step = DEFAULT_STEP
-                prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+                fb_min, fb_max = _get_fallback_price_range(symbol)
+                prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
-            return JSONResponse(content={
+            response = JSONResponse(content={
                 "t": [], "prices": prices, "long": [], "short": [],
                 "step": step, "scale": 255, "_mode": "embedded"
             })
+            cache.set(cache_key, response)
+            return response
 
         if current:
             current_src = current.get('src', 0)
@@ -635,7 +749,8 @@ def create_embedded_app(
         prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
 
         if not prices:
-            prices = [float(p) for p in range(92000, 108000 + int(DEFAULT_STEP), int(DEFAULT_STEP))]
+            fb_min, fb_max = _get_fallback_price_range(symbol)
+            prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
         t_arr = []
         long_flat = []
@@ -649,16 +764,24 @@ def create_embedded_app(
 
         print(f"[EMBEDDED_API] v2/liq_heatmap_history: frames={len(t_arr)} prices={len(prices)}")
 
-        return JSONResponse(content={
+        response = JSONResponse(content={
             "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
             "step": step, "scale": 255, "_mode": "embedded"
         })
+        cache.set(cache_key, response)
+        return response
 
-    @app.get("/v2/liq_stats")
+    @app.get("/liq_stats")
+    @app.get("/v2/liq_stats")  # backwards compat alias
     async def liq_stats_v2(
         symbol: str = Query(default="BTC", description="Symbol to query")
     ):
         """Get V2 heatmap statistics."""
+        cache_key = f"liq_stats?symbol={symbol}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
         snapshot = state.get_v2_snapshot()
         if not snapshot:
             raise HTTPException(status_code=404, detail="V2 heatmap not available")
@@ -670,13 +793,16 @@ def create_embedded_app(
         if state.v2_history:
             stats['history_frames'] = state.v2_history.frame_count()
 
-        return JSONResponse(content=stats)
+        response = JSONResponse(content=stats)
+        cache.set(cache_key, response)
+        return response
 
     # =========================================================================
     # Orderbook Heatmap Endpoints (30s DoM - uses shared buffer directly)
     # =========================================================================
 
-    @app.get("/v2/orderbook_heatmap_30s")
+    @app.get("/orderbook_heatmap")
+    @app.get("/v2/orderbook_heatmap_30s")  # backwards compat alias
     async def orderbook_heatmap_30s(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
@@ -698,8 +824,6 @@ def create_embedded_app(
 
         Returns the most recently WRITTEN frame (never synthesized/rewritten).
         """
-        server_recv_ts_ms = int(time.time() * 1000)
-
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -723,7 +847,7 @@ def create_embedded_app(
         now_ms = int(time.time() * 1000)
         data_is_stale = (now_ms - frame_ts_ms) > (2 * frame_interval_ms)
 
-        # Binary format response
+        # Binary format response (not cached — different response type)
         if format == "bin":
             binary_data = frame_to_binary(frame, frame_ts_ms)
             return Response(
@@ -736,6 +860,14 @@ def create_embedded_app(
                     "X-Server-Send-Ts-Ms": str(int(time.time() * 1000))
                 }
             )
+
+        # JSON format — check cache
+        cache_key = f"orderbook_heatmap?symbol={symbol}&range_pct={range_pct}&step={step}&price_min={price_min}&price_max={price_max}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
+        server_recv_ts_ms = int(time.time() * 1000)
 
         # JSON format response
         if price_min is not None or price_max is not None:
@@ -791,9 +923,12 @@ def create_embedded_app(
             "_mode": "shared_buffer"
         }
 
-        return JSONResponse(content=response)
+        json_response = JSONResponse(content=response)
+        cache.set(cache_key, json_response)
+        return json_response
 
-    @app.get("/v2/orderbook_heatmap_30s_history")
+    @app.get("/orderbook_heatmap_history")
+    @app.get("/v2/orderbook_heatmap_30s_history")  # backwards compat alias
     async def orderbook_heatmap_30s_history(
         symbol: str = Query(default="BTC", description="Symbol to query"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
@@ -815,8 +950,6 @@ def create_embedded_app(
 
         Binary format (format=bin) returns compact blob for low-latency backfill.
         """
-        server_recv_ts_ms = int(time.time() * 1000)
-
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -845,7 +978,7 @@ def create_embedded_app(
         now_ms = int(time.time() * 1000)
         data_is_stale = (now_ms - last_frame_ts_ms) > (2 * FRAME_INTERVAL_MS)
 
-        # Binary format response
+        # Binary format response (not cached — different response type)
         if format == "bin":
             binary_data = frames_to_binary(frames, prices, step)
             return Response(
@@ -862,6 +995,14 @@ def create_embedded_app(
                 }
             )
 
+        # JSON format — check cache
+        cache_key = f"orderbook_heatmap_history?symbol={symbol}&minutes={minutes}&stride={stride}&step={step}&price_min={price_min}&price_max={price_max}"
+        cached = cache.get(cache_key, ttl=30.0)
+        if cached is not None:
+            return cached
+
+        server_recv_ts_ms = int(time.time() * 1000)
+
         # JSON format response
         t_arr = []
         bid_flat = []
@@ -877,7 +1018,7 @@ def create_embedded_app(
 
         print(f"[EMBEDDED_API] ob_heatmap_30s_history: frames={len(t_arr)} prices={len(prices)}")
 
-        return JSONResponse(content={
+        response = JSONResponse(content={
             # Time metadata
             "frame_interval_ms": FRAME_INTERVAL_MS,
             "first_frame_ts_ms": first_frame_ts_ms,
@@ -897,8 +1038,11 @@ def create_embedded_app(
             "norm_method": "p50_p95",
             "_mode": "shared_buffer"
         })
+        cache.set(cache_key, response)
+        return response
 
-    @app.get("/v2/orderbook_heatmap_30s_stats")
+    @app.get("/orderbook_heatmap_stats")
+    @app.get("/v2/orderbook_heatmap_30s_stats")  # backwards compat alias
     async def orderbook_heatmap_30s_stats():
         """
         Get orderbook heatmap buffer and reconstructor statistics.
@@ -908,6 +1052,11 @@ def create_embedded_app(
         - Reconstructor stats: state, resyncs, gaps, update IDs
         - Timing: last frame age, staleness indicator
         """
+        cache_key = "orderbook_heatmap_stats"
+        cached = cache.get(cache_key, ttl=10.0)
+        if cached is not None:
+            return cached
+
         if not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -952,11 +1101,19 @@ def create_embedded_app(
         else:
             stats["reconstructor"] = {"error": "stats file not found"}
 
-        return JSONResponse(content=stats)
+        response = JSONResponse(content=stats)
+        cache.set(cache_key, response)
+        return response
 
-    @app.get("/v2/orderbook_heatmap_30s_debug")
+    @app.get("/orderbook_heatmap_debug")
+    @app.get("/v2/orderbook_heatmap_30s_debug")  # backwards compat alias
     async def orderbook_heatmap_30s_debug():
         """Debug endpoint for orderbook heatmap system."""
+        cache_key = "orderbook_heatmap_debug"
+        cached = cache.get(cache_key, ttl=10.0)
+        if cached is not None:
+            return cached
+
         debug_info = {
             "has_ob_heatmap_module": HAS_OB_HEATMAP,
             "ob_buffer_shared": state.ob_buffer is not None,
@@ -969,7 +1126,239 @@ def create_embedded_app(
             except Exception as e:
                 debug_info["ob_buffer_stats_error"] = str(e)
 
-        return JSONResponse(content=debug_info)
+        response = JSONResponse(content=debug_info)
+        cache.set(cache_key, response)
+        return response
+
+    # =========================================================================
+    # V3 Zone Lifecycle Endpoints (via EngineManager — live in-memory data)
+    # =========================================================================
+
+    def _resolve_symbol(symbol_full: str) -> Optional[str]:
+        """Convert full symbol (e.g. 'BTCUSDT') or short symbol (e.g. 'BTC') to short form."""
+        if HAS_ENGINE_MANAGER:
+            short = FULL_TO_SHORT.get(symbol_full)
+            if short:
+                return short
+        # Already short form or direct match
+        return symbol_full
+
+    def _get_zone_manager(symbol_short: str):
+        """Get the zone_manager for a symbol from the engine_manager."""
+        if not state.engine_manager:
+            return None
+        engine = state.engine_manager.get_engine(symbol_short)
+        if not engine:
+            return None
+        return getattr(engine.heatmap_v2, 'zone_manager', None)
+
+    @app.get("/liq_zones")
+    @app.get("/v3/liq_zones")  # backwards compat alias
+    async def liq_zones_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        side: str = Query(default=None, description="Filter by side: 'long' or 'short'"),
+        min_leverage: int = Query(default=None, description="Minimum leverage tier to include"),
+        max_leverage: int = Query(default=None, description="Maximum leverage tier to include"),
+        min_weight: float = Query(default=None, description="Minimum zone weight to include")
+    ):
+        """
+        Get V3 active liquidation zones from zone lifecycle manager.
+
+        Returns persistent zones with lifecycle tracking:
+        - CREATED: New zones from inference or tape
+        - REINFORCED: Zones strengthened by repeated predictions
+        - (Zones are removed when SWEPT by price or EXPIRED by time/decay)
+        """
+        cache_key = f"liq_zones?symbol={symbol}&side={side}&min_leverage={min_leverage}&max_leverage={max_leverage}&min_weight={min_weight}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
+        symbol_short = _resolve_symbol(symbol)
+
+        if not state.engine_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Engine manager not available"
+            )
+
+        zone_mgr = _get_zone_manager(symbol_short)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+            )
+
+        # Get active zones with filters
+        zones = zone_mgr.get_active_zones(
+            side=side,
+            min_leverage=min_leverage,
+            max_leverage=max_leverage
+        )
+
+        # Apply min_weight filter if specified
+        if min_weight is not None and min_weight > 0:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+
+        # Get summary stats
+        summary = zone_mgr.get_summary()
+
+        response = JSONResponse(content={
+            "symbol": symbol_short,
+            "ts": time.time(),
+            "zones": zones,
+            "zones_count": len(zones),
+            "summary": summary,
+            "filters": {
+                "side": side,
+                "min_leverage": min_leverage,
+                "max_leverage": max_leverage,
+                "min_weight": min_weight
+            }
+        })
+        cache.set(cache_key, response)
+        return response
+
+    @app.get("/liq_zones_summary")
+    @app.get("/v3/liq_zones_summary")  # backwards compat alias
+    async def liq_zones_summary_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query")
+    ):
+        """
+        Get V3 zone lifecycle summary statistics.
+
+        Returns counts and totals for zone lifecycle tracking.
+        """
+        cache_key = f"liq_zones_summary?symbol={symbol}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
+        symbol_short = _resolve_symbol(symbol)
+
+        if not state.engine_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Engine manager not available"
+            )
+
+        zone_mgr = _get_zone_manager(symbol_short)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+            )
+
+        summary = zone_mgr.get_summary()
+        summary["symbol"] = symbol_short
+        summary["ts"] = time.time()
+
+        response = JSONResponse(content=summary)
+        cache.set(cache_key, response)
+        return response
+
+    @app.get("/liq_zones_heatmap")
+    @app.get("/v3/liq_heatmap")  # backwards compat alias
+    async def liq_heatmap_v3(
+        symbol: str = Query(default="BTC", description="Symbol to query"),
+        min_notional: float = Query(default=0, description="Minimum USD notional to include"),
+        min_leverage: int = Query(default=None, description="Minimum leverage tier to include (5-250)"),
+        max_leverage: int = Query(default=None, description="Maximum leverage tier to include (5-250)"),
+        min_weight: float = Query(default=None, description="Minimum zone weight to include")
+    ):
+        """
+        Get V3 liquidation heatmap with full leverage filtering.
+
+        Uses the zone lifecycle manager for filtering by leverage tier.
+        Unlike V2, this supports filtering zones based on which leverage tiers
+        contributed to them.
+        """
+        cache_key = f"liq_zones_heatmap?symbol={symbol}&min_notional={min_notional}&min_leverage={min_leverage}&max_leverage={max_leverage}&min_weight={min_weight}"
+        cached = cache.get(cache_key, ttl=5.0)
+        if cached is not None:
+            return cached
+
+        symbol_short = _resolve_symbol(symbol)
+
+        if not state.engine_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Engine manager not available. Use /v2/liq_heatmap for snapshot-based data."
+            )
+
+        zone_mgr = _get_zone_manager(symbol_short)
+        if not zone_mgr:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+            )
+
+        # Get zones with leverage filtering
+        zones = zone_mgr.get_active_zones(
+            side=None,  # Get both sides
+            min_leverage=min_leverage,
+            max_leverage=max_leverage
+        )
+
+        # Apply additional filters
+        if min_weight is not None and min_weight > 0:
+            zones = [z for z in zones if z.get('weight', 0) >= min_weight]
+
+        # Separate into long and short levels
+        long_levels = []
+        short_levels = []
+
+        for z in zones:
+            # Estimate notional from weight (inverse of normalization)
+            estimated_notional = z['weight'] * 100000.0
+
+            if min_notional > 0 and estimated_notional < min_notional:
+                continue
+
+            level = {
+                "price": z['price'],
+                "weight": z['weight'],
+                "notional_usd": round(estimated_notional, 2),
+                "tier_contributions": z.get('tier_contributions', {}),
+                "reinforcement_count": z.get('reinforcement_count', 0),
+                "source": z.get('source', 'unknown'),
+                "created_at": z.get('created_at'),
+                "last_reinforced_at": z.get('last_reinforced_at')
+            }
+
+            if z['side'] == 'long':
+                long_levels.append(level)
+            else:
+                short_levels.append(level)
+
+        # Sort by weight descending
+        long_levels.sort(key=lambda x: -x['weight'])
+        short_levels.sort(key=lambda x: -x['weight'])
+
+        # Get summary for meta
+        summary = zone_mgr.get_summary()
+
+        response = JSONResponse(content={
+            "symbol": symbol_short,
+            "ts": time.time(),
+            "long_levels": long_levels,
+            "short_levels": short_levels,
+            "meta": {
+                "min_leverage": min_leverage,
+                "max_leverage": max_leverage,
+                "min_weight": min_weight,
+                "min_notional": min_notional,
+                "filtered": bool(min_leverage or max_leverage or min_weight or min_notional),
+                "long_pools_count": len(long_levels),
+                "short_pools_count": len(short_levels),
+                "total_long_weight": summary.get('total_weight_long', 0),
+                "total_short_weight": summary.get('total_weight_short', 0),
+                "zones_created": summary.get('zones_created_total', 0),
+                "zones_swept": summary.get('zones_swept_total', 0)
+            }
+        })
+        cache.set(cache_key, response)
+        return response
 
     return app
 
@@ -995,13 +1384,19 @@ def start_api_thread(
     thread.start()
 
     print(f"[EMBEDDED_API] Server started on http://{host}:{port}")
-    print(f"[EMBEDDED_API] Endpoints:")
-    print(f"  GET http://{host}:{port}/v1/health")
-    print(f"  GET http://{host}:{port}/v1/liq_heatmap")
-    print(f"  GET http://{host}:{port}/v1/liq_heatmap_history")
-    print(f"  GET http://{host}:{port}/v2/liq_heatmap")
-    print(f"  GET http://{host}:{port}/v2/liq_heatmap_history")
-    print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s")
-    print(f"  GET http://{host}:{port}/v2/orderbook_heatmap_30s_history")
+    print(f"[EMBEDDED_API] Endpoints (clean paths, old /vN/ aliases still work):")
+    print(f"  GET http://{host}:{port}/health")
+    print(f"  GET http://{host}:{port}/liq_heatmap")
+    print(f"  GET http://{host}:{port}/liq_heatmap_history")
+    print(f"  GET http://{host}:{port}/liq_heatmap_v2")
+    print(f"  GET http://{host}:{port}/liq_heatmap_v2_history")
+    print(f"  GET http://{host}:{port}/liq_stats")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap_history")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap_stats")
+    print(f"  GET http://{host}:{port}/orderbook_heatmap_debug")
+    print(f"  GET http://{host}:{port}/liq_zones")
+    print(f"  GET http://{host}:{port}/liq_zones_summary")
+    print(f"  GET http://{host}:{port}/liq_zones_heatmap")
 
     return thread

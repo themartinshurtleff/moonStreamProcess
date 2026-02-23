@@ -40,11 +40,11 @@ except ImportError:
     from rich import box
 
 from ws_connectors import MultiExchangeConnector
-from liq_engine import LiquidationStressEngine
 from liq_calibrator import LiquidationCalibrator
 from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
 from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer, OrderbookReconstructor
+from engine_manager import EngineManager, EngineInstance
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -569,7 +569,7 @@ class FullMetricsState:
     perp_TTP_ratio: float = 0.0
     perp_GTA_ratio: float = 0.0
 
-    # Predicted liquidation stress zones (from LiquidationStressEngine)
+    # Predicted liquidation stress zones (from V2 LiquidationHeatmap)
     pred_liq_longs_top: List[tuple] = field(default_factory=list)   # Top 5 long liq zones (support)
     pred_liq_shorts_top: List[tuple] = field(default_factory=list)  # Top 5 short liq zones (resistance)
     liq_engine_stats: Dict[str, Any] = field(default_factory=dict)  # Debug stats
@@ -590,19 +590,6 @@ class FullMetricsProcessor:
         self.prev_books: Dict[str, float] = {}
         self.current_minute = datetime.now().minute
         self.prices_this_minute: List[float] = []
-
-        # Liquidation stress zone predictor
-        # Set debug_enabled=True and debug_log_file to see detailed output
-        self.liq_engine = LiquidationStressEngine(
-            steps=20.0,        # $20 price buckets for BTC
-            vol_length=50,     # 50-minute SMA for volume normalization
-            buffer=0.002,      # 0.2% buffer
-            fade=0.97,         # Decay factor
-            debug_symbol="BTC",
-            debug_enabled=True,
-            debug_log_file=os.path.join(POC_DIR, "liq_engine_debug.log"),
-            sweep_log_file=os.path.join(POC_DIR, "liq_sweeps.jsonl")  # JSONL sweep log
-        )
 
         # Self-calibrating system for leverage weights
         # Uses real Binance forceOrder liquidations as feedback
@@ -641,7 +628,7 @@ class FullMetricsProcessor:
 
         # ZoneTracker for UI stability (hysteresis + TTL)
         self.zone_tracker = ZoneTracker(
-            steps=20.0,              # Match liq_engine bucket size
+            steps=20.0,              # $20 price buckets for BTC
             max_zones=5,             # Display top 5 zones per side
             enter_margin=0.07,       # New zone must beat weakest by 7%
             exit_margin=0.05,        # Exit if below best non-displayed by 5%
@@ -695,6 +682,31 @@ class FullMetricsProcessor:
         )
         print("[OB_RECON] Initialized with gap_tolerance=1000, will sync on first depth message")
 
+        # Engine Manager — bundles all per-symbol engines for multi-symbol routing.
+        # For now BTC only. Each symbol MUST have independent engines (CLAUDE.md rule).
+        self.engine_manager = EngineManager()
+        btc_engine = EngineInstance(
+            symbol_short="BTC",
+            symbol_full="BTCUSDT",
+            calibrator=self.calibrator,
+            heatmap_v2=self.heatmap_v2,
+            zone_manager=getattr(self.heatmap_v2, 'zone_manager', None),
+            ob_reconstructor=self.ob_reconstructor,
+            ob_accumulator=self.ob_accumulator,
+        )
+        self.engine_manager.register_engine("BTC", "BTCUSDT", btc_engine)
+        print(f"[ENGINE_MGR] Registered engines: {self.engine_manager.get_all_symbols()}")
+
+        # Remove direct attributes — all access now goes through self._btc()
+        del self.calibrator
+        del self.heatmap_v2
+        del self.ob_reconstructor
+        del self.ob_accumulator
+
+    def _btc(self) -> EngineInstance:
+        """Shortcut to BTC engine instance. Will be replaced with symbol-aware routing later."""
+        return self.engine_manager.get_engine("BTC")
+
     def _on_ob_frame_emitted(self, frame):
         """Callback when orderbook accumulator emits a 30s frame."""
         print(f"[OB_DEBUG] Frame emitted! ts={frame.ts} src={frame.src:.2f} n_prices={frame.n_prices}")
@@ -735,9 +747,9 @@ class FullMetricsProcessor:
                 self._last_accum_debug = now
                 slot = int(now // 30)
                 print(f"[OB_DEBUG] Feeding accumulator: mid={mid:.2f} bids={len(bids)} asks={len(asks)} "
-                      f"current_slot={self.ob_accumulator._current_slot} new_slot={slot}")
+                      f"current_slot={self._btc().ob_accumulator._current_slot} new_slot={slot}")
 
-            self.ob_accumulator.on_depth_update(
+            self._btc().ob_accumulator.on_depth_update(
                 bids=bids,
                 asks=asks,
                 src_price=mid,
@@ -778,11 +790,11 @@ class FullMetricsProcessor:
         """Callback when calibrator updates weights."""
         # Push updated weights to V2 inference engine
         # Convert list format to dict format expected by V2
-        v2_ladder = sorted(self.heatmap_v2.inference.leverage_weights.keys())
+        v2_ladder = sorted(self._btc().heatmap_v2.inference.leverage_weights.keys())
         if len(new_weights) == len(v2_ladder):
             new_weights_dict = dict(zip(v2_ladder, new_weights))
-            self.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-            self.heatmap_v2.config.buffer = new_buffer
+            self._btc().heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+            self._btc().heatmap_v2.config.buffer = new_buffer
 
     def _on_rest_poller_update(self, poller_state: PollerState):
         """Callback when REST poller has new OI/ratio data."""
@@ -845,11 +857,11 @@ class FullMetricsProcessor:
         if exchange == "binance":
             # Feed raw diff to reconstructor
             # The reconstructor callback will feed the accumulator with full book
-            self.ob_reconstructor.on_depth_diff(data)
+            self._btc().ob_reconstructor.on_depth_diff(data)
 
             # Update local orderbook from reconstructor for UI display
-            if self.ob_reconstructor.is_synced:
-                bids, asks = self.ob_reconstructor.get_full_book()
+            if self._btc().ob_reconstructor.is_synced:
+                bids, asks = self._btc().ob_reconstructor.get_full_book()
                 book = self.orderbooks[exchange]
                 book["bids"].clear()
                 book["asks"].clear()
@@ -1037,12 +1049,21 @@ class FullMetricsProcessor:
 
     def _process_liquidations(self, exchange: str, data: dict):
         order = data.get("o", {})
-        if not order or "BTC" not in order.get("s", ""):
+        if not order:
             return
+
+        # Match symbol against all registered engines (supports BTC, ETH, SOL, etc.)
+        raw_symbol = order.get("s", "").upper()
+        matched_symbol = None
+        for short_sym, engine in self.engine_manager.engines.items():
+            if engine.symbol_full.upper() == raw_symbol:
+                matched_symbol = short_sym
+                break
+        if matched_symbol is None:
+            return  # no engine registered for this symbol
 
         try:
             # Extract raw values
-            raw_symbol = order.get("s", "")
             raw_side = order.get("S", "")
             side = raw_side.lower()
             price = float(order.get("p", 0))
@@ -1135,20 +1156,21 @@ class FullMetricsProcessor:
                         "src_source": src_source
                     })
 
-            # Send to calibrator
-            self.calibrator.on_liquidation({
-                'timestamp': time.time(),
-                'symbol': 'BTC',
-                'side': calib_side,
-                'price': price,
-                'qty': qty,
-                'mark_price': mark_price,
-                'mid_price': mid_price,
-                'last_price': last_price
-            })
-
-            # Feed V2 heatmap tape (ground truth accumulation)
-            self.heatmap_v2.on_force_order(
+            # Route to calibrator AND heatmap V2 via engine manager.
+            # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
+            # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
+            self.engine_manager.on_force_order(
+                matched_symbol,
+                event_data={
+                    'timestamp': time.time(),
+                    'symbol': matched_symbol,
+                    'side': calib_side,
+                    'price': price,
+                    'qty': qty,
+                    'mark_price': mark_price,
+                    'mid_price': mid_price,
+                    'last_price': last_price
+                },
                 timestamp=time.time(),
                 side=calib_side,
                 price=price,
@@ -1231,19 +1253,7 @@ class FullMetricsProcessor:
     def _check_minute_rollover(self):
         current_minute = datetime.now().minute
         if current_minute != self.current_minute:
-            # Update liquidation stress engine BEFORE resetting minute metrics
             if self.state.perp_close > 0:
-                # V1 engine disabled - using V2 exclusively
-                # minute_metrics = {
-                #     'perp_open': self.state.perp_open,
-                #     'perp_high': self.state.perp_high,
-                #     'perp_low': self.state.perp_low,
-                #     'perp_close': self.state.perp_close,
-                #     'perp_buyVol': self.state.perp_buyVol,
-                #     'perp_sellVol': self.state.perp_sellVol,
-                # }
-                # self.liq_engine.update("BTC", minute_metrics)
-
                 # Update V2 heatmap engine (OI inference layer)
                 # ohlc4 = (open + high + low + close) / 4
                 v2_src = (self.state.perp_open + self.state.perp_high +
@@ -1277,7 +1287,7 @@ class FullMetricsProcessor:
                 total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
                 buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
 
-                self.heatmap_v2.on_minute(
+                self._btc().heatmap_v2.on_minute(
                     minute_key=v2_minute_key,
                     src_price=v2_src,
                     high=self.state.perp_high,
@@ -1310,16 +1320,16 @@ class FullMetricsProcessor:
 
                 # Write V2 API snapshot (clustered pools with notional values)
                 # Use lower min_notional for snapshot so UI can filter
-                v2_snapshot = self.heatmap_v2.get_api_response(
+                v2_snapshot = self._btc().heatmap_v2.get_api_response(
                     price_center=v2_src,
                     price_range_pct=0.10,      # ±10% range for more visibility
                     min_notional_usd=1000.0    # Low threshold, UI can filter
                 )
-                v2_snapshot['stats'] = self.heatmap_v2.get_stats()
+                v2_snapshot['stats'] = self._btc().heatmap_v2.get_stats()
 
                 # Add intensity arrays for history buffer (same format as V1)
                 # Build price grid and map pools to intensity arrays
-                v2_steps = self.heatmap_v2.config.steps
+                v2_steps = self._btc().heatmap_v2.config.steps
                 band_pct = 0.10
                 price_min = round((v2_src * (1 - band_pct)) / v2_steps) * v2_steps
                 price_max = round((v2_src * (1 + band_pct)) / v2_steps) * v2_steps
@@ -1330,7 +1340,7 @@ class FullMetricsProcessor:
                     p += v2_steps
 
                 # Get raw heatmap data for intensity arrays
-                v2_heatmap = self.heatmap_v2.get_heatmap()
+                v2_heatmap = self._btc().heatmap_v2.get_heatmap()
                 v2_all_longs = v2_heatmap.get("long", {})
                 v2_all_shorts = v2_heatmap.get("short", {})
 
@@ -1360,19 +1370,19 @@ class FullMetricsProcessor:
 
                 # Apply persisted weights from calibrator on first update (to V2)
                 if not self._applied_persisted_weights:
-                    persisted = self.calibrator.get_persisted_weights()
+                    persisted = self._btc().calibrator.get_persisted_weights()
                     if persisted:
                         # Convert list format to dict for V2 inference
-                        v2_ladder = sorted(self.heatmap_v2.inference.leverage_weights.keys())
+                        v2_ladder = sorted(self._btc().heatmap_v2.inference.leverage_weights.keys())
                         if len(persisted['weights']) == len(v2_ladder):
                             new_weights_dict = dict(zip(v2_ladder, persisted['weights']))
-                            self.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-                            self.heatmap_v2.config.buffer = persisted['buffer']
+                            self._btc().heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+                            self._btc().heatmap_v2.config.buffer = persisted['buffer']
                             print(f"Loaded persisted weights to V2 (calibration #{persisted['calibration_count']})")
                     self._applied_persisted_weights = True
 
                 # Get top predicted liquidation zones from V2 engine (clustered pools)
-                v2_response = self.heatmap_v2.get_api_response(
+                v2_response = self._btc().heatmap_v2.get_api_response(
                     price_center=v2_src,
                     price_range_pct=0.25,      # ±25% range for more visibility
                     min_notional_usd=0         # No filtering, let UI handle it
@@ -1392,7 +1402,7 @@ class FullMetricsProcessor:
                 raw_shorts.sort(key=lambda x: x[1], reverse=True)
 
                 # Use V2 stats
-                self.state.liq_engine_stats = self.heatmap_v2.get_stats()
+                self.state.liq_engine_stats = self._btc().heatmap_v2.get_stats()
 
                 # Pass through ZoneTracker for UI stability
                 current_minute_ts = int(time.time() // 60)
@@ -1444,18 +1454,19 @@ class FullMetricsProcessor:
                        self.state.perp_low + self.state.perp_close) / 4
 
                 # Get V2 heatmap data for calibrator
-                v2_heatmap = self.heatmap_v2.get_heatmap()
-                v2_config = self.heatmap_v2.config
+                v2_heatmap = self._btc().heatmap_v2.get_heatmap()
+                v2_config = self._btc().heatmap_v2.config
 
                 # Build depth band for stress calculation (using V2 steps)
                 depth_band = self._build_depth_band(src, v2_config.steps)
 
                 # V2 leverage weights for calibrator
-                v2_leverage_weights = self.heatmap_v2.inference.leverage_weights
+                v2_leverage_weights = self._btc().heatmap_v2.inference.leverage_weights
                 v2_ladder = sorted(v2_leverage_weights.keys())
                 v2_weights = [v2_leverage_weights[lev] for lev in v2_ladder]
 
-                self.calibrator.on_minute_snapshot(
+                self.engine_manager.on_minute_snapshot(
+                    "BTC",
                     symbol="BTC",
                     timestamp=time.time(),
                     src=src,
@@ -1515,7 +1526,7 @@ class FullMetricsProcessor:
         if src <= 0:
             return
 
-        steps = self.heatmap_v2.config.steps
+        steps = self._btc().heatmap_v2.config.steps
 
         # Build price range: ±8% around src, bucketed by steps
         band_pct = 0.08
@@ -1530,7 +1541,7 @@ class FullMetricsProcessor:
             p += steps
 
         # Get all zone strengths from V2 engine
-        v2_heatmap = self.heatmap_v2.get_heatmap()
+        v2_heatmap = self._btc().heatmap_v2.get_heatmap()
         all_longs = v2_heatmap.get("long", {})
         all_shorts = v2_heatmap.get("short", {})
 
@@ -1929,7 +1940,8 @@ def main():
                     snapshot_file=LIQ_API_SNAPSHOT,
                     snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
                     liq_heatmap_v1_file=LIQ_HEATMAP_V1_FILE,
-                    liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE
+                    liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE,
+                    engine_manager=processor.engine_manager
                 )
                 api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
                 console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")
