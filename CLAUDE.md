@@ -26,13 +26,15 @@ Single source of truth for how this codebase works. Read this before making any 
 
 ## Architecture Overview
 
-All core code lives in `poc/`. The system collects Binance Futures market data via WebSocket and REST, computes liquidation heatmaps and orderbook snapshots, and serves them via a FastAPI HTTP API.
+All core code lives in `poc/`. The system collects market data from **Binance, Bybit, and OKX** via WebSocket (and Binance REST), computes liquidation heatmaps and orderbook snapshots, and serves them via a FastAPI HTTP API. Liquidation events from all three exchanges are normalized via `liq_normalizer.py` before reaching the per-symbol engines.
 
 | File | Role |
 |------|------|
 | `full_metrics_viewer.py` | **Main entry point.** Launches WebSocket/REST connections, instantiates all sub-engines, runs Rich terminal dashboard at 4 FPS, writes snapshot files, starts embedded API server. |
-| `ws_connectors.py` | `BinanceConnector` and `MultiExchangeConnector` — WebSocket streams for depth, aggTrade, forceOrder, markPrice. |
-| `rest_pollers.py` | Async REST pollers for open interest, top trader account/position ratios, global account ratios. |
+| `ws_connectors.py` | `BinanceConnector`, `BybitConnector`, `OKXConnector`, and `MultiExchangeConnector` — WebSocket streams for depth, aggTrade, forceOrder/liquidations, markPrice. All three exchanges active. |
+| `liq_normalizer.py` | **Liquidation normalizer.** Converts raw exchange-specific liquidation messages into `CommonLiqEvent` before reaching `EngineManager`. Handles Binance/Bybit order-side → position-side inversion (both use same convention), OKX contract-to-base conversion. |
+| `oi_poller.py` | `MultiExchangeOIPoller` + `OIPollerThread` — polls OI from Binance, Bybit, OKX every 15s per symbol (BTC, ETH, SOL). Aggregates across exchanges, delivers per-symbol updates via callback. All OI in base asset. |
+| `rest_pollers.py` | `BinanceRESTPollerThread` — polls trader ratios (TTA, TTP, GTA) from Binance REST. OI polling moved to `oi_poller.py`. |
 | `liq_engine.py` | **ORPHANED (Phase 1).** V1 `LiquidationStressEngine` — volume-based liquidation zone prediction. Superseded by V2 heatmap. Still importable but no longer instantiated by the viewer. |
 | `liq_heatmap.py` | V2 `LiquidationHeatmap` — unified engine combining `LiquidationTape` + `EntryInference` for forward-looking liquidation pools. |
 | `liq_tape.py` | Ground-truth liquidation accumulator from forceOrder events. Tracks actual liquidation volumes by price bucket. |
@@ -50,50 +52,123 @@ All core code lives in `poc/`. The system collects Binance Futures market data v
 | `audit_v2_comprehensive.py` | Code+log verified audit script producing markdown report. |
 | `audit_v2_engine.py` | Runtime audit computing hit-rate metrics from log files. |
 
-### WebSocket Streams (via `BinanceConnector`)
+### WebSocket Streams (via `MultiExchangeConnector`)
 
+All three exchanges are started by `MultiExchangeConnector.connect_all()` in `run_websocket_thread()`. Each sub-connector runs as an independent asyncio task.
+
+#### Binance (`BinanceConnector`)
 Base URL: `wss://fstream.binance.com/ws`
 
 | Stream | Data | Used By |
 |--------|------|---------|
 | `btcusdt@depth@100ms` | Orderbook diffs (100ms throttle) | `OrderbookReconstructor` → `OrderbookAccumulator` → 30s OB heatmap frames |
 | `btcusdt@aggTrade` | Aggregated trades (buyer_is_maker) | `TakerAggressionAccumulator`, price tracking, volume accumulation |
-| `btcusdt@forceOrder` | Liquidation events | `LiquidationTape`, `LiquidationCalibrator.on_liquidation()` |
+| `!forceOrder@arr` | Liquidation events (ALL symbols) | `liq_normalizer` → `EngineManager` → calibrator + heatmap |
 | `btcusdt@markPrice@1s` | Mark price, funding rate, OI | Mark price for event-time src, funding display |
 
-### REST Polling (via `BinanceRESTPollerThread`)
+#### Bybit (`BybitConnector`)
+Base URL: `wss://stream.bybit.com/v5/public/linear`
+
+| Stream | Data | Used By |
+|--------|------|---------|
+| `orderbook.50.BTCUSDT` | Orderbook snapshots | BTC depth (future use) |
+| `publicTrade.BTCUSDT` | Trades | BTC trade tracking (future use) |
+| `tickers.BTCUSDT` | OI + funding | OI/funding display (future use) |
+| `allLiquidation.{SYMBOL}` (×3) | Liquidations (500ms batches) | `liq_normalizer` → `EngineManager` → calibrator + heatmap |
+
+Subscribes to `allLiquidation` for BTCUSDT, ETHUSDT, SOLUSDT.
+
+#### OKX (`OKXConnector`)
+Base URL: `wss://ws.okx.com:8443/ws/v5/public`
+
+| Stream | Data | Used By |
+|--------|------|---------|
+| `books5` (BTC-USDT-SWAP) | Top-5 orderbook | BTC depth (future use) |
+| `trades` (BTC-USDT-SWAP) | Trades | BTC trade tracking (future use) |
+| `funding-rate` (BTC-USDT-SWAP) | Funding rate | Funding display (future use) |
+| `open-interest` (BTC-USDT-SWAP) | Open interest | OI display (future use) |
+| `liquidation-orders` (instType=SWAP) | Liquidations (ALL SWAP symbols) | `liq_normalizer` → `EngineManager` → calibrator + heatmap |
+
+**Note:** Hyperliquid has no public all-liquidations WebSocket stream and is excluded from Phase 2.
+
+### Liquidation Side Conventions (CRITICAL)
+
+Each exchange uses different side semantics. The normalizer (`liq_normalizer.py`) converts all of them to `"long"` or `"short"` (the **position** that was liquidated):
+
+| Exchange | Raw Field | Value | Meaning | Normalized `side` |
+|----------|-----------|-------|---------|-------------------|
+| Binance | `o.S` | `"BUY"` | Shorts bought back | `"short"` |
+| Binance | `o.S` | `"SELL"` | Longs sold | `"long"` |
+| Bybit | `S` | `"Buy"` | Shorts bought back | `"short"` |
+| Bybit | `S` | `"Sell"` | Longs sold | `"long"` |
+| OKX | `posSide` | `"long"` | Direct | `"long"` |
+| OKX | `posSide` | `"short"` | Direct | `"short"` |
+
+**OKX quantities are in contracts**, not base asset. `liq_normalizer.py` converts using `OKX_CONTRACT_SIZES`: BTC=0.01, ETH=0.1, SOL=1.0 per contract.
+
+### REST Polling
+
+#### Open Interest (via `MultiExchangeOIPoller` in `oi_poller.py`)
+
+Polls every 15 seconds for BTC, ETH, SOL. 3 symbols × 3 exchanges = 9 requests per cycle (36 req/min).
+
+| Exchange | Endpoint | Response Field | Unit |
+|----------|----------|---------------|------|
+| Binance | `GET /fapi/v1/openInterest?symbol={SYM}USDT` | `openInterest` | Base asset |
+| Bybit | `GET /v5/market/open-interest?category=linear&symbol={SYM}USDT&intervalTime=5min&limit=1` | `result.list[0].openInterest` | Base asset |
+| OKX | `GET /api/v5/public/open-interest?instId={SYM}-USDT-SWAP` | `data[0].oiCcy` | Base asset |
+
+**CRITICAL:** OKX has both `oi` (contracts) and `oiCcy` (base currency). Always use `oiCcy`.
+
+Per-exchange values are summed to produce `aggregated_oi`. Individual exchange failures are logged and skipped — never crash the loop. Results delivered via `on_oi_update(symbol_short, aggregated_oi, per_exchange_dict)` callback.
+
+#### Trader Ratios (via `BinanceRESTPollerThread` in `rest_pollers.py`)
 
 | Endpoint | Interval | Data |
 |----------|----------|------|
-| `/fapi/v1/openInterest` | 10s | Open interest for OI delta tracking |
 | `/futures/data/topLongShortAccountRatio` | 60s | Top trader account long/short ratio |
 | `/futures/data/topLongShortPositionRatio` | 60s | Top trader position long/short ratio |
 | `/futures/data/globalLongShortAccountRatio` | 60s | Global account long/short ratio |
 
 ## Engine Instantiation Parameters
 
-These are the actual values used in `full_metrics_viewer.py` `FullMetricsProcessor.__init__()`:
+Engine instances are created by `_create_engine_for_symbol()` for each entry in `SYMBOL_CONFIGS`:
 
-### LiquidationCalibrator — line 609
+### SYMBOL_CONFIGS (module-level dict)
 ```python
-symbol="BTC", steps=20.0, window_minutes=15, hit_bucket_tolerance=5,
+"BTC": steps=20.0, ob_step=20.0, ob_range_pct=0.10, ob_gap_tolerance=1000, has_orderbook=True
+"ETH": steps=1.0,  ob_step=1.0,  ob_range_pct=0.10, ob_gap_tolerance=50,   has_orderbook=False
+"SOL": steps=0.10, ob_step=0.10, ob_range_pct=0.10, ob_gap_tolerance=5,    has_orderbook=False
+```
+
+### LiquidationCalibrator (per-symbol)
+```python
+symbol={SYM}, steps={from SYMBOL_CONFIGS}, window_minutes=15, hit_bucket_tolerance=5,
 learning_rate=0.10, closer_level_gamma=0.35,
 enable_buffer_tuning=True, enable_tolerance_tuning=True,
-weights_file="poc/liq_calibrator_weights.json",
-on_weights_updated=self._on_calibrator_weights_updated
+log_file="poc/liq_calibrator_{SYM}.jsonl",
+weights_file="poc/liq_calibrator_weights_{SYM}.json",
+on_weights_updated=lambda → self._on_calibrator_weights_updated({SYM}, w, b)
 ```
-Note: `window_minutes=15` in the viewer override (calibrator default is 30).
+Note: `window_minutes=15` in the viewer override (calibrator default is 30). Each symbol's callback routes to that symbol's heatmap.
 
-### LiquidationHeatmap (V2) — line 658
+### LiquidationHeatmap V2 (per-symbol)
 ```python
-HeatmapConfig(symbol="BTC", steps=20.0, decay=0.995, buffer=0.002,
+HeatmapConfig(symbol={SYM}, steps={from SYMBOL_CONFIGS}, decay=0.995, buffer=0.002,
               tape_weight=0.35, projection_weight=0.65)
 # Also: cluster_radius_pct=0.005, min_notional_usd=10000.0, max_pools_per_side=20
 ```
 
-### BinanceRESTPollerThread — line 628
+### MultiExchangeOIPoller (via `OIPollerThread`)
 ```python
-symbols=["BTCUSDT"], oi_interval=10.0, ratio_interval=60.0
+symbols=["BTC", "ETH", "SOL"], poll_interval=15.0
+# Polls Binance + Bybit + OKX concurrently per symbol
+```
+
+### BinanceRESTPollerThread (ratios only)
+```python
+symbols=["BTCUSDT"], oi_interval=999999, ratio_interval=60.0
+# OI polling disabled here — handled by MultiExchangeOIPoller
 ```
 
 ### OrderbookReconstructor — line 691
@@ -228,28 +303,34 @@ Zone lifecycle: **CREATED** → **REINFORCED** (repeatable) → **SWEPT** (by pr
 
 ## Data Flow — Critical Paths
 
-### Path A: ForceOrder Event → EngineManager → Calibrator → Heatmap Rendering
+### Path A: Liquidation Event (any exchange) → Normalizer → EngineManager → Calibrator
 
 ```
-Binance WS forceOrder
-  → MultiExchangeConnector callback
-    → full_metrics_viewer on_force_order()
-      → self._btc().heatmap_v2.tape.on_liquidation()       (V2 ground truth, via EngineManager)
-      → self._btc().calibrator.on_liquidation()             (calibration feedback, via EngineManager)
-        → event appended to events_window (line 724)
-        → _process_event() called
-          → _get_snapshot_for_event() looks up self.snapshots
-          → IF self.snapshots is empty → RETURNS WITHOUT COUNTING (line 953)
-          → IF snapshot found → soft attribution → stats.total_events += 1 (line 1041)
+Exchange WS (Binance !forceOrder@arr | Bybit allLiquidation.* | OKX liquidation-orders)
+  → sub-connector _wrap_message(data, exchange, instrument, "perpetual", "liquidations")
+    → MultiExchangeConnector callback → process_message()
+      → obj_type == "liquidations" → _process_liquidations(exchange, data)
+        → normalize_liquidation(exchange, data)            (liq_normalizer.py)
+          → returns List[CommonLiqEvent]                   (exchange-agnostic)
+        → for each CommonLiqEvent:
+          → engine_manager.get_engine(event.symbol_short)  (skip if no engine)
+          → engine_manager.on_force_order(symbol, ...)
+            → calibrator.on_liquidation()                  (calibration feedback)
+            → heatmap_v2.on_force_order()                  (V2 ground truth)
+              → _process_event() → soft attribution → stats.total_events += 1
 ```
 
 ### Path B: OI Data → Engine
 
 ```
-BinanceRESTPollerThread polls /fapi/v1/openInterest every ~5s
-  → PollerState.oi updated
-    → full_metrics_viewer reads poller_state.oi each cycle
-      → EntryInference.on_oi_update()  (via self._btc().heatmap_v2)
+MultiExchangeOIPoller (oi_poller.py) polls every 15s:
+  → Binance + Bybit + OKX fetched concurrently per symbol (BTC, ETH, SOL)
+  → aggregated_oi = sum of non-None exchange values
+  → on_oi_update(symbol_short, aggregated_oi, per_exchange_dict)
+    → full_metrics_viewer._on_oi_update()
+      → self.oi_by_symbol[sym] updated (for /oi API endpoint)
+      → BTC: self.state.perp_total_oi + perp_oi_change updated (backwards compat)
+      → EntryInference.on_oi_update() (via heatmap_v2, on next minute rollover)
         → detects OI delta → infers new position entries
         → projects liquidation prices per leverage tier
 ```
@@ -324,6 +405,7 @@ Clean paths are primary. Old `/vN/` paths are backwards-compatible aliases via s
 | Method | Primary Path | Alias | Params | Data Source | Cache TTL |
 |--------|-------------|-------|--------|-------------|-----------|
 | GET | `/health` | `/v1/health` | — | In-memory state | none |
+| GET | `/oi` | — | `symbol` (BTC/ETH/SOL) | `OIPollerThread` → `OISnapshot` (in-memory) | 5s |
 | GET | `/liq_heatmap` | `/v1/liq_heatmap` | `symbol` | `liq_api_snapshot.json` (5s refresh) | 5s |
 | GET | `/liq_heatmap_history` | `/v1/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v1.bin` | 30s |
 | GET | `/liq_heatmap_v2` | `/v2/liq_heatmap` | `symbol`, `min_notional` | `liq_api_snapshot_v2.json` (5s refresh) | 5s |
@@ -349,7 +431,7 @@ Defined in `embedded_api.py` via the `ResponseCache` class. Thread-safe `Dict[st
 
 | Endpoint Group | TTL | Rationale |
 |----------------|-----|-----------|
-| Live data (`/liq_heatmap`, `/liq_heatmap_v2`, `/liq_stats`, `/liq_zones`, `/liq_zones_summary`, `/liq_zones_heatmap`, `/orderbook_heatmap`) | **5 seconds** | Snapshot data updates every 60s (liq) or 30s (OB); 5s is the minimum allowed by CLAUDE.md rules |
+| Live data (`/oi`, `/liq_heatmap`, `/liq_heatmap_v2`, `/liq_stats`, `/liq_zones`, `/liq_zones_summary`, `/liq_zones_heatmap`, `/orderbook_heatmap`) | **5 seconds** | Snapshot data updates every 60s (liq), 30s (OB), or 15s (OI); 5s is the minimum allowed by CLAUDE.md rules |
 | History (`/liq_heatmap_history`, `/liq_heatmap_v2_history`, `/orderbook_heatmap_history`) | **30 seconds** | Historical data changes slowly; 30s avoids redundant recomputation |
 | Stats/debug (`/orderbook_heatmap_stats`, `/orderbook_heatmap_debug`) | **10 seconds** | Diagnostic data, moderate refresh |
 | Health (`/health`) | **none** | Always computed fresh for monitoring accuracy |
@@ -403,6 +485,7 @@ Frontend (consumer)
 11. **NEVER access engine objects (calibrator, heatmap_v2, ob_reconstructor, ob_accumulator) as direct attributes of `FullMetricsProcessor`** — always go through `self._btc()` (or `self.engine_manager.get_engine(symbol)` for multi-symbol). Direct attributes are `del`'d after `EngineInstance` registration.
 12. **NEVER instantiate standalone `ActiveZoneManager` instances in API endpoints** — always resolve zones through `EngineManager → EngineInstance → heatmap_v2.zone_manager`. Creating standalone instances produces zones with no data.
 13. **NEVER pass `min_weight` to `ActiveZoneManager.get_active_zones()`** — it doesn't accept it (signature: `side`, `min_leverage`, `max_leverage` only). Filter `min_weight` in Python after the call returns.
+14. **NEVER parse raw exchange liquidation messages in `_process_liquidations()`** — always use `normalize_liquidation(exchange, data)` from `liq_normalizer.py`. All exchange-specific format handling, side convention mapping, and OKX contract conversion belongs in the normalizer, not the viewer.
 
 ## Known Bugs and Past Issues
 
@@ -418,11 +501,17 @@ Frontend (consumer)
 
 ### RESOLVED: BTC-only liquidation filter silently dropped non-BTC events
 - **Root cause:** `_process_liquidations()` in `full_metrics_viewer.py` had a hardcoded `"BTC" not in order.get("s", "")` check that silently dropped all non-BTC forceOrder events. Any new symbol registered in `EngineManager` would never receive liquidation data.
-- **Fix:** Replaced with dynamic lookup that iterates `engine_manager.engines` and matches `engine.symbol_full` against the incoming symbol. Adding a new symbol now only requires registering it in the `EngineManager`.
+- **Fix (Phase 1):** Replaced with dynamic lookup that iterates `engine_manager.engines`.
+- **Fix (Phase 2):** Entire method replaced to use `liq_normalizer.normalize_liquidation()`. No exchange-specific parsing remains in the viewer — all exchange format handling, side inversion, and symbol extraction is delegated to the normalizer. Events from Binance, Bybit, and OKX all flow through the same path.
 
 ### RESOLVED: Hardcoded BTC fallback prices in embedded_api.py
 - **Root cause:** Four locations in `embedded_api.py` used `range(92000, 108000)` as fallback price ranges when no data exists. These BTC-specific values would produce nonsensical axes for ETH (~$3000) or SOL (~$150).
 - **Fix:** Added `_get_fallback_price_range(symbol)` helper returning per-symbol ranges: BTC (85000, 115000), ETH (1500, 5000), SOL (50, 400), with a generic default of (100, 10000).
+
+### RESOLVED: Bybit side convention was inverted in normalizer
+- **Root cause:** `normalize_bybit()` in `liq_normalizer.py` mapped `"Buy"` → `"long"` and `"Sell"` → `"short"`. This was incorrect. Bybit's `allLiquidation` `S` field is the **order side** (same convention as Binance), not the position side: `"Buy"` = exchange buys to close a short position (shorts liquidated), `"Sell"` = exchange sells to close a long position (longs liquidated).
+- **Impact:** All Bybit liquidation events had longs/shorts swapped, corrupting calibrator learning, heatmap directionality, and zone predictions for Bybit data. The inline tests also encoded the wrong expected values, masking the bug.
+- **Fix (Phase 2):** Corrected mapping to `"Buy"` → `"short"`, `"Sell"` → `"long"` — matching Binance convention exactly. Updated all inline test assertions. All 36 tests pass.
 
 ### DESIGN NOTE: Snapshot JSON writes are NOT atomic
 - `_write_api_snapshot()` and `_write_api_snapshot_v2()` use plain `json.dump()` — no tmp+rename. The API reader could see partial JSON on slow I/O. Only the calibrator weight file uses atomic writes (tmp + flush + fsync + rename).
@@ -459,24 +548,33 @@ Frontend (consumer)
 
 ## Multi-Exchange Implementation Notes
 
-When implementing multi-exchange support:
+### Completed (Phase 2)
 
-- Each symbol (BTC, ETH, SOL) needs its own independent engine instance
-- Each engine needs its own calibrator with its own weight file
-- ForceOrder events from all exchanges feed into the same symbol's calibrator
-- OI data from all exchanges gets aggregated per-symbol before feeding the engine
-- The API must route requests by `symbol` parameter to the correct engine instance
-- Frame buffer snapshots must be per-symbol (not shared)
-- The frontend requests data with a `symbol` parameter — the API must route accordingly
+- **Three exchanges active:** Binance, Bybit, OKX — all started by `MultiExchangeConnector.connect_all()` in `run_websocket_thread()`
+- **Normalizer layer:** `liq_normalizer.py` converts all raw exchange messages into `CommonLiqEvent` before reaching engines. Handles Binance/Bybit order-side inversion (both use same convention: Buy=shorts liquidated, Sell=longs liquidated), OKX contract-to-base conversion, multi-symbol extraction
+- **Per-symbol engines:** BTC, ETH, SOL each have independent `EngineInstance` (calibrator + heatmap). BTC additionally has orderbook engines. Created via `SYMBOL_CONFIGS` dict and `_create_engine_for_symbol()` factory
+- **Per-symbol log/weight files:** `liq_calibrator_{SYM}.jsonl`, `liq_calibrator_weights_{SYM}.json`
+- **Dynamic liquidation routing:** `_process_liquidations()` uses `normalize_liquidation(exchange, data)` → iterates `CommonLiqEvent` list → routes each to correct engine via `engine_manager.on_force_order(event.symbol_short, ...)`
 - ~~Current hardcoded BTC fallback prices (92000–108000) in API must become symbol-aware~~ **DONE** — `_get_fallback_price_range(symbol)` provides per-symbol fallback ranges
-- The liquidation handler (`_process_liquidations`) now dynamically matches incoming forceOrder symbols against all registered engines. No hardcoded symbol filters remain — adding a new symbol only requires registering it in the `EngineManager`
+- ~~BTC-only liquidation filter~~ **DONE** — no exchange-specific parsing remains in the viewer
+
+- **Multi-exchange OI aggregation:** `oi_poller.py` polls Binance + Bybit + OKX every 15s for BTC, ETH, SOL. Aggregated per-symbol OI delivered via callback. Exposed via `/oi` API endpoint with per-exchange breakdown
+- ~~OI data from all exchanges gets aggregated per-symbol before feeding the engine~~ **DONE**
+
+### Remaining TODO
+
+- **Per-symbol price feeds:** ETH/SOL `mark_price`, `mid_price`, `last_price` are passed as 0 to the calibrator because only BTC has a markPrice stream. Need per-symbol price tracking for calibrator attribution accuracy
+- **Per-symbol OHLC:** Minute snapshots for ETH/SOL use `src=0` — need per-symbol price accumulation for proper calibrator learning
 - Snapshot files need per-symbol naming: `liq_api_snapshot_{symbol}.json`
 - Binary history files need per-symbol naming: `liq_heatmap_v1_{symbol}.bin`
+- Frame buffer snapshots must be per-symbol (not shared)
+- Hyperliquid excluded — no public liquidation WebSocket stream available
 
 ## Testing Checklist Before Deployment
 
-- [ ] All WebSocket streams connecting (depth, aggTrade, forceOrder, markPrice)
-- [ ] REST pollers returning data (OI, ratios)
+- [ ] All WebSocket streams connecting — Binance (depth, aggTrade, forceOrder, markPrice), Bybit (allLiquidation ×3), OKX (liquidation-orders)
+- [ ] Multi-exchange OI poller returning data for BTC, ETH, SOL (check `/oi?symbol=BTC`)
+- [ ] REST pollers returning data (ratios)
 - [ ] V2 heatmap snapshots being written to disk (`liq_api_snapshot_v2.json`)
 - [ ] EngineManager has registered engine (`engine_manager.get_engine("BTC")` is not None)
 - [ ] Calibrator `total_events` incrementing after forceOrder events arrive (via `self._btc().calibrator`)

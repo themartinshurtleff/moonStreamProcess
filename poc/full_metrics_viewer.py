@@ -45,6 +45,8 @@ from rest_pollers import BinanceRESTPollerThread, PollerState
 from liq_heatmap import LiquidationHeatmap, HeatmapConfig
 from ob_heatmap import OrderbookAccumulator, OrderbookHeatmapBuffer, OrderbookReconstructor
 from engine_manager import EngineManager, EngineInstance
+from liq_normalizer import normalize_liquidation
+from oi_poller import OIPollerThread
 
 # Directory where this script lives - use for log file paths
 POC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +76,39 @@ LIQ_HEATMAP_V2_FILE = os.path.join(POC_DIR, "liq_heatmap_v2.bin")
 # Log rotation thresholds
 LOG_ROTATION_MAX_MB = 200
 LOG_ROTATION_MAX_AGE_HOURS = 24
+
+# Per-symbol engine configuration.
+# BTC gets full engines (calibrator + heatmap + orderbook).
+# ETH and SOL get liquidation engines only (calibrator + heatmap) for MVP.
+SYMBOL_CONFIGS = {
+    "BTC": {
+        "symbol_short": "BTC",
+        "symbol_full": "BTCUSDT",
+        "steps": 20.0,
+        "ob_step": 20.0,
+        "ob_range_pct": 0.10,
+        "ob_gap_tolerance": 1000,
+        "has_orderbook": True,
+    },
+    "ETH": {
+        "symbol_short": "ETH",
+        "symbol_full": "ETHUSDT",
+        "steps": 1.0,
+        "ob_step": 1.0,
+        "ob_range_pct": 0.10,
+        "ob_gap_tolerance": 50,
+        "has_orderbook": False,
+    },
+    "SOL": {
+        "symbol_short": "SOL",
+        "symbol_full": "SOLUSDT",
+        "steps": 0.10,
+        "ob_step": 0.10,
+        "ob_range_pct": 0.10,
+        "ob_gap_tolerance": 5,
+        "has_orderbook": False,
+    },
+}
 
 
 def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: float = 24) -> bool:
@@ -591,36 +626,28 @@ class FullMetricsProcessor:
         self.current_minute = datetime.now().minute
         self.prices_this_minute: List[float] = []
 
-        # Self-calibrating system for leverage weights
-        # Uses real Binance forceOrder liquidations as feedback
-        self.calibrator = LiquidationCalibrator(
-            symbol="BTC",
-            steps=20.0,
-            window_minutes=15,          # Calibrate every 15 minutes
-            hit_bucket_tolerance=5,     # Initial tolerance (will auto-calibrate)
-            learning_rate=0.10,         # Weight adjustment rate
-            closer_level_gamma=0.35,    # Prior for higher leverage
-            enable_buffer_tuning=True,  # Auto-tune buffer based on misses
-            enable_tolerance_tuning=True,  # Auto-tune hit tolerance
-            log_file=os.path.join(POC_DIR, "liq_calibrator.jsonl"),
-            weights_file=os.path.join(POC_DIR, "liq_calibrator_weights.json"),
-            log_events=True,            # Log individual liquidation events
-            on_weights_updated=self._on_calibrator_weights_updated
-        )
+        # Track if we've applied persisted weights (per-symbol)
+        self._applied_persisted_weights: Dict[str, bool] = {}
 
-        # Track if we've applied persisted weights
-        self._applied_persisted_weights = False
-
-        # REST poller for OI and trader ratios (direct HTTPS)
+        # REST poller for trader ratios only (OI moved to MultiExchangeOIPoller).
+        # oi_interval set very high to effectively disable the legacy OI loop.
         self.rest_poller = BinanceRESTPollerThread(
             symbols=["BTCUSDT"],
-            oi_interval=10.0,      # Poll OI every 10s
+            oi_interval=999999,    # OI handled by oi_poller now
             ratio_interval=60.0,   # Poll ratios every 60s
             on_update=self._on_rest_poller_update,
             price_getter=self._get_price_for_symbol,
             debug=True
         )
-        self._prev_rest_oi: float = 0.0
+
+        # Multi-exchange OI poller (Binance + Bybit + OKX, per symbol)
+        self.oi_poller = OIPollerThread(
+            symbols=list(SYMBOL_CONFIGS.keys()),  # ["BTC", "ETH", "SOL"]
+            on_oi_update=self._on_oi_update,
+            poll_interval=15.0,
+        )
+        # Per-symbol OI state for API exposure
+        self.oi_by_symbol: Dict[str, Dict] = {}
 
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
@@ -638,73 +665,114 @@ class FullMetricsProcessor:
             debug_log=True           # Log displayed zones per minute
         )
 
-        # V2 Liquidation Heatmap Engine (tape + OI inference)
-        # This replaces volume-based heuristics with:
-        # 1. LiquidationTape: Ground truth from forceOrder stream
-        # 2. EntryInference: OI + aggression based forward projections
-        self.heatmap_v2 = LiquidationHeatmap(
-            config=HeatmapConfig(
-                symbol="BTC",
-                steps=20.0,
-                decay=0.995,
-                buffer=0.002,
-                tape_weight=0.35,       # 35% weight for historical tape
-                projection_weight=0.65   # 65% weight for forward projections
-            ),
-            log_dir=POC_DIR
-        )
-
         # Taker aggression accumulator (real-time aggTrade tracking)
         # Tracks per-minute taker buy/sell notional from buyer_is_maker field
         self.taker_aggression = TakerAggressionAccumulator(history_minutes=10)
 
-        # Orderbook heatmap (30s DoM screenshots)
-        # Accumulates depth updates, emits frames every 30s
+        # Orderbook heatmap (30s DoM screenshots) — BTC only for now
         self.ob_heatmap_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
-        self.ob_accumulator = OrderbookAccumulator(
-            step=20.0,
-            range_pct=0.10,
-            on_frame_callback=self._on_ob_frame_emitted
-        )
         ob_stats = self.ob_heatmap_buffer.get_stats()
         print(f"[OB_HEATMAP] Loaded {ob_stats['frames_in_memory']} frames from {OB_HEATMAP_FILE}")
 
-        # Orderbook Reconstructor for Binance Futures (snapshot + diff reconciliation)
-        # Maintains correct full orderbook from btcusdt@depth@100ms stream
-        # gap_tolerance=1000 allows gaps to be tolerated for heatmap visualization
-        # (orderbook may be slightly off during gaps, but better than constant resyncs)
-        # Note: pu (previous update ID) is the authoritative check for Futures;
-        # the U gap check is only used as fallback for spot API
-        self.ob_reconstructor = OrderbookReconstructor(
-            symbol="BTCUSDT",
-            on_book_update=self._on_reconstructor_update,
-            gap_tolerance=1000  # Tolerate pu gaps up to 1000 update IDs
-        )
-        print("[OB_RECON] Initialized with gap_tolerance=1000, will sync on first depth message")
-
         # Engine Manager — bundles all per-symbol engines for multi-symbol routing.
-        # For now BTC only. Each symbol MUST have independent engines (CLAUDE.md rule).
+        # Each symbol MUST have independent engines (CLAUDE.md rule).
         self.engine_manager = EngineManager()
-        btc_engine = EngineInstance(
-            symbol_short="BTC",
-            symbol_full="BTCUSDT",
-            calibrator=self.calibrator,
-            heatmap_v2=self.heatmap_v2,
-            zone_manager=getattr(self.heatmap_v2, 'zone_manager', None),
-            ob_reconstructor=self.ob_reconstructor,
-            ob_accumulator=self.ob_accumulator,
-        )
-        self.engine_manager.register_engine("BTC", "BTCUSDT", btc_engine)
+
+        # Create engines for all configured symbols
+        for sym_short, cfg in SYMBOL_CONFIGS.items():
+            engine = self._create_engine_for_symbol(cfg)
+            self.engine_manager.register_engine(
+                sym_short, cfg["symbol_full"], engine
+            )
+            self._applied_persisted_weights[sym_short] = False
+
         print(f"[ENGINE_MGR] Registered engines: {self.engine_manager.get_all_symbols()}")
 
-        # Remove direct attributes — all access now goes through self._btc()
-        del self.calibrator
-        del self.heatmap_v2
-        del self.ob_reconstructor
-        del self.ob_accumulator
+    def _create_engine_for_symbol(self, cfg: dict) -> EngineInstance:
+        """
+        Factory: create a fully independent EngineInstance for one symbol.
+
+        BTC gets full engines (calibrator + heatmap + orderbook).
+        Other symbols get liquidation engines only (calibrator + heatmap).
+        """
+        sym_short = cfg["symbol_short"]
+        sym_full = cfg["symbol_full"]
+        steps = cfg["steps"]
+        has_ob = cfg.get("has_orderbook", False)
+
+        # Per-symbol log and weight files
+        log_file = os.path.join(POC_DIR, f"liq_calibrator_{sym_short}.jsonl")
+        weights_file = os.path.join(
+            POC_DIR, f"liq_calibrator_weights_{sym_short}.json"
+        )
+
+        # Calibrator — per-symbol weight learning
+        calibrator = LiquidationCalibrator(
+            symbol=sym_short,
+            steps=steps,
+            window_minutes=15,
+            hit_bucket_tolerance=5,
+            learning_rate=0.10,
+            closer_level_gamma=0.35,
+            enable_buffer_tuning=True,
+            enable_tolerance_tuning=True,
+            log_file=log_file,
+            weights_file=weights_file,
+            log_events=True,
+            on_weights_updated=lambda s, w, b, _sym=sym_short: (
+                self._on_calibrator_weights_updated(_sym, w, b)
+            ),
+        )
+
+        # V2 Heatmap — per-symbol tape + OI inference
+        heatmap_v2 = LiquidationHeatmap(
+            config=HeatmapConfig(
+                symbol=sym_short,
+                steps=steps,
+                decay=0.995,
+                buffer=0.002,
+                tape_weight=0.35,
+                projection_weight=0.65,
+            ),
+            log_dir=POC_DIR,
+        )
+
+        # Orderbook engines — BTC only for MVP
+        ob_reconstructor = None
+        ob_accumulator = None
+        if has_ob:
+            ob_accumulator = OrderbookAccumulator(
+                step=cfg["ob_step"],
+                range_pct=cfg["ob_range_pct"],
+                on_frame_callback=self._on_ob_frame_emitted,
+            )
+            ob_reconstructor = OrderbookReconstructor(
+                symbol=sym_full,
+                on_book_update=self._on_reconstructor_update,
+                gap_tolerance=cfg["ob_gap_tolerance"],
+            )
+            print(
+                f"[OB_RECON] {sym_short}: initialized with "
+                f"gap_tolerance={cfg['ob_gap_tolerance']}"
+            )
+
+        engine = EngineInstance(
+            symbol_short=sym_short,
+            symbol_full=sym_full,
+            calibrator=calibrator,
+            heatmap_v2=heatmap_v2,
+            zone_manager=getattr(heatmap_v2, "zone_manager", None),
+            ob_reconstructor=ob_reconstructor,
+            ob_accumulator=ob_accumulator,
+        )
+        print(
+            f"[ENGINE_MGR] Created {sym_short} engine: "
+            f"steps={steps}, ob={'yes' if has_ob else 'no'}"
+        )
+        return engine
 
     def _btc(self) -> EngineInstance:
-        """Shortcut to BTC engine instance. Will be replaced with symbol-aware routing later."""
+        """Shortcut to BTC engine instance (kept for backward-compat in BTC-specific UI code)."""
         return self.engine_manager.get_engine("BTC")
 
     def _on_ob_frame_emitted(self, frame):
@@ -787,30 +855,39 @@ class FullMetricsProcessor:
         return 0.0
 
     def _on_calibrator_weights_updated(self, symbol: str, new_weights: list, new_buffer: float):
-        """Callback when calibrator updates weights."""
-        # Push updated weights to V2 inference engine
-        # Convert list format to dict format expected by V2
-        v2_ladder = sorted(self._btc().heatmap_v2.inference.leverage_weights.keys())
+        """Callback when calibrator updates weights — routes to correct symbol's heatmap."""
+        engine = self.engine_manager.get_engine(symbol)
+        if engine is None:
+            return
+        v2_ladder = sorted(engine.heatmap_v2.inference.leverage_weights.keys())
         if len(new_weights) == len(v2_ladder):
             new_weights_dict = dict(zip(v2_ladder, new_weights))
-            self._btc().heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-            self._btc().heatmap_v2.config.buffer = new_buffer
+            engine.heatmap_v2.inference.update_leverage_weights(new_weights_dict)
+            engine.heatmap_v2.config.buffer = new_buffer
+
+    def _on_oi_update(self, symbol_short: str, aggregated_oi: float,
+                      per_exchange: Dict[str, float]):
+        """Callback from MultiExchangeOIPoller with per-symbol aggregated OI."""
+        with self.lock:
+            prev = self.oi_by_symbol.get(symbol_short, {}).get("aggregated_oi", 0.0)
+            self.oi_by_symbol[symbol_short] = {
+                "aggregated_oi": aggregated_oi,
+                "per_exchange": dict(per_exchange),
+                "ts": time.time(),
+            }
+
+            # BTC backwards compat — update legacy state fields
+            if symbol_short == "BTC":
+                if prev > 0:
+                    self.state.perp_oi_change = aggregated_oi - prev
+                self.state.perp_total_oi = aggregated_oi
+                # Update per-instrument breakdown
+                for ex_name, oi_val in per_exchange.items():
+                    self.state.perp_OIs_per_instrument[f"{ex_name}_BTCUSDT"] = oi_val
 
     def _on_rest_poller_update(self, poller_state: PollerState):
-        """Callback when REST poller has new OI/ratio data."""
+        """Callback when REST poller has new ratio data."""
         with self.lock:
-            # Update OI from REST (more reliable than websocket for Binance)
-            if poller_state.total_oi > 0:
-                # Compute OI change
-                if self._prev_rest_oi > 0:
-                    self.state.perp_oi_change = poller_state.total_oi - self._prev_rest_oi
-                self._prev_rest_oi = poller_state.total_oi
-                self.state.perp_total_oi = poller_state.total_oi
-
-                # Update per-instrument OI
-                for symbol, oi_data in poller_state.oi_data.items():
-                    self.state.perp_OIs_per_instrument[f"binance_{symbol}"] = oi_data.oi_value
-
             # Update trader ratios (TTA, TTP, GTA)
             if poller_state.weighted_tta > 0:
                 self.state.perp_TTA_ratio = poller_state.weighted_tta
@@ -1048,141 +1125,96 @@ class FullMetricsProcessor:
         self.taker_aggression.on_trade(price, qty, is_buyer_maker)
 
     def _process_liquidations(self, exchange: str, data: dict):
-        order = data.get("o", {})
-        if not order:
-            return
+        """Process liquidation events from any exchange via the normalizer layer.
 
-        # Match symbol against all registered engines (supports BTC, ETH, SOL, etc.)
-        raw_symbol = order.get("s", "").upper()
-        matched_symbol = None
-        for short_sym, engine in self.engine_manager.engines.items():
-            if engine.symbol_full.upper() == raw_symbol:
-                matched_symbol = short_sym
-                break
-        if matched_symbol is None:
-            return  # no engine registered for this symbol
+        The normalizer (liq_normalizer.py) handles all exchange-specific parsing,
+        side convention inversion, OKX contract-to-base conversion, and symbol
+        extraction.  This method only works with CommonLiqEvent fields.
+        """
+        events = normalize_liquidation(exchange, data)
 
-        try:
-            # Extract raw values
-            raw_side = order.get("S", "")
-            side = raw_side.lower()
-            price = float(order.get("p", 0))
-            qty = float(order.get("q", 0))
-            notional = price * qty
+        for event in events:
+            # Check if we have an engine for this symbol
+            engine = self.engine_manager.get_engine(event.symbol_short)
+            if engine is None:
+                continue  # skip symbols we don't track
 
-            level = str(int(price / self.level_size) * self.level_size)
+            try:
+                # Update BTC UI liquidation counters (BTC only — other symbols
+                # don't have per-level dashboard tracking yet)
+                if event.symbol_short == "BTC":
+                    level = str(int(event.price / self.level_size) * self.level_size)
+                    if event.side == "long":
+                        self.state.perp_liquidations_longsTotal += event.qty
+                        self.state.perp_liquidations_longs[level] = (
+                            self.state.perp_liquidations_longs.get(level, 0) + event.qty
+                        )
+                    else:
+                        self.state.perp_liquidations_shortsTotal += event.qty
+                        self.state.perp_liquidations_shorts[level] = (
+                            self.state.perp_liquidations_shorts.get(level, 0) + event.qty
+                        )
 
-            if side == "buy":
-                self.state.perp_liquidations_longsTotal += qty
-                self.state.perp_liquidations_longs[level] = self.state.perp_liquidations_longs.get(level, 0) + qty
-            else:
-                self.state.perp_liquidations_shortsTotal += qty
-                self.state.perp_liquidations_shorts[level] = self.state.perp_liquidations_shorts.get(level, 0) + qty
-
-            # Binance forceOrder: "S": "BUY" means shorts got liquidated (they had to buy back)
-            # "S": "SELL" means longs got liquidated (they had to sell)
-            calib_side = "short" if side == "buy" else "long"
-
-            # Phase 1: Compute event-time src prices for better attribution
-            # Priority: markPrice > mid > last > fallback
-            mark_price = self.state.perp_markPrice if hasattr(self.state, 'perp_markPrice') else 0.0
-            mid_price = 0.0
-            if self.state.best_bid > 0 and self.state.best_ask > 0:
-                mid_price = (self.state.best_bid + self.state.best_ask) / 2
-            last_price = self.state.btc_price
-
-            # Determine event_src_price and src_source (same logic as calibrator)
-            if mark_price > 0:
-                event_src_price = mark_price
-                src_source = "mark"
-            elif mid_price > 0:
-                event_src_price = mid_price
-                src_source = "mid"
-            elif last_price > 0:
-                event_src_price = last_price
-                src_source = "last"
-            else:
-                event_src_price = 0.0
-                src_source = "none"
-
-            # Event sanity validator - log first N events for verification
-            if self._sanity_check_count < self._sanity_check_limit:
-                self._sanity_check_count += 1
-                sanity_failures = []
-
-                # Run assertions
-                if not (price > 0):
-                    sanity_failures.append(f"price<=0: {price}")
-                if not (qty > 0):
-                    sanity_failures.append(f"qty<=0: {qty}")
-                if not (event_src_price > 0):
-                    sanity_failures.append(f"event_src_price<=0: {event_src_price} (src_source={src_source})")
-                if calib_side not in {"long", "short"}:
-                    sanity_failures.append(f"invalid calib_side: {calib_side}")
-
-                if sanity_failures:
-                    # Log failure
-                    _write_debug_log({
-                        "type": "event_sanity_fail",
-                        "event_num": self._sanity_check_count,
-                        "failures": sanity_failures,
-                        "raw_symbol": raw_symbol,
-                        "raw_side": raw_side,
-                        "calib_side": calib_side,
-                        "price": price,
-                        "qty": qty,
-                        "notional": notional,
-                        "mark_price": mark_price,
-                        "mid_price": mid_price,
-                        "last_price": last_price,
-                        "event_src_price": event_src_price,
-                        "src_source": src_source
-                    })
+                # Event-time src prices for calibrator attribution.
+                # TODO: Per-symbol price feeds needed for ETH/SOL.  Currently
+                #       only BTC has mark/mid/last from Binance markPrice stream.
+                if event.symbol_short == "BTC":
+                    mark_price = getattr(self.state, 'perp_markPrice', 0.0)
+                    mid_price = 0.0
+                    if self.state.best_bid > 0 and self.state.best_ask > 0:
+                        mid_price = (self.state.best_bid + self.state.best_ask) / 2
+                    last_price = self.state.btc_price
                 else:
-                    # Log successful sanity check
+                    mark_price = 0.0
+                    mid_price = 0.0
+                    last_price = 0.0
+
+                # Sanity log for first N events (across all exchanges/symbols)
+                if self._sanity_check_count < self._sanity_check_limit:
+                    self._sanity_check_count += 1
                     _write_debug_log({
                         "type": "event_sanity_ok",
                         "event_num": self._sanity_check_count,
-                        "raw_symbol": raw_symbol,
-                        "raw_side": raw_side,
-                        "calib_side": calib_side,
-                        "price": price,
-                        "qty": qty,
-                        "notional": notional,
+                        "exchange": event.exchange,
+                        "symbol": event.symbol_short,
+                        "side": event.side,
+                        "price": event.price,
+                        "qty": event.qty,
+                        "notional": event.notional,
                         "mark_price": mark_price,
                         "mid_price": mid_price,
                         "last_price": last_price,
-                        "event_src_price": event_src_price,
-                        "src_source": src_source
                     })
 
-            # Route to calibrator AND heatmap V2 via engine manager.
-            # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
-            # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
-            self.engine_manager.on_force_order(
-                matched_symbol,
-                event_data={
-                    'timestamp': time.time(),
-                    'symbol': matched_symbol,
-                    'side': calib_side,
-                    'price': price,
-                    'qty': qty,
-                    'mark_price': mark_price,
-                    'mid_price': mid_price,
-                    'last_price': last_price
-                },
-                timestamp=time.time(),
-                side=calib_side,
-                price=price,
-                qty=qty,
-                notional=notional
-            )
-        except Exception as e:
-            _write_debug_log({
-                "type": "liq_processing_error",
-                "error": str(e),
-                "error_type": type(e).__name__
-            })
+                # Route to calibrator AND heatmap V2 via engine manager.
+                # engine_manager.on_force_order calls BOTH calibrator.on_liquidation()
+                # and heatmap_v2.on_force_order() — both are required (CLAUDE.md rule).
+                self.engine_manager.on_force_order(
+                    event.symbol_short,
+                    event_data={
+                        'timestamp': event.timestamp,
+                        'symbol': event.symbol_short,
+                        'side': event.side,
+                        'price': event.price,
+                        'qty': event.qty,
+                        'mark_price': mark_price,
+                        'mid_price': mid_price,
+                        'last_price': last_price,
+                    },
+                    timestamp=event.timestamp,
+                    side=event.side,
+                    price=event.price,
+                    qty=event.qty,
+                    notional=event.notional,
+                )
+            except Exception as e:
+                _write_debug_log({
+                    "type": "liq_processing_error",
+                    "exchange": event.exchange,
+                    "symbol": event.symbol_short,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                })
 
     def _process_funding(self, exchange: str, data: dict):
         if "r" in data:
@@ -1368,18 +1400,22 @@ class FullMetricsProcessor:
 
                 _write_api_snapshot_v2(v2_snapshot)
 
-                # Apply persisted weights from calibrator on first update (to V2)
-                if not self._applied_persisted_weights:
-                    persisted = self._btc().calibrator.get_persisted_weights()
+                # Apply persisted weights from calibrator on first update (all symbols)
+                for sym_short in self.engine_manager.get_all_symbols():
+                    if self._applied_persisted_weights.get(sym_short, False):
+                        continue
+                    eng = self.engine_manager.get_engine(sym_short)
+                    if eng is None:
+                        continue
+                    persisted = eng.calibrator.get_persisted_weights()
                     if persisted:
-                        # Convert list format to dict for V2 inference
-                        v2_ladder = sorted(self._btc().heatmap_v2.inference.leverage_weights.keys())
-                        if len(persisted['weights']) == len(v2_ladder):
-                            new_weights_dict = dict(zip(v2_ladder, persisted['weights']))
-                            self._btc().heatmap_v2.inference.update_leverage_weights(new_weights_dict)
-                            self._btc().heatmap_v2.config.buffer = persisted['buffer']
-                            print(f"Loaded persisted weights to V2 (calibration #{persisted['calibration_count']})")
-                    self._applied_persisted_weights = True
+                        v2_lad = sorted(eng.heatmap_v2.inference.leverage_weights.keys())
+                        if len(persisted['weights']) == len(v2_lad):
+                            wd = dict(zip(v2_lad, persisted['weights']))
+                            eng.heatmap_v2.inference.update_leverage_weights(wd)
+                            eng.heatmap_v2.config.buffer = persisted['buffer']
+                            print(f"Loaded persisted weights for {sym_short} (calibration #{persisted['calibration_count']})")
+                    self._applied_persisted_weights[sym_short] = True
 
                 # Get top predicted liquidation zones from V2 engine (clustered pools)
                 v2_response = self._btc().heatmap_v2.get_api_response(
@@ -1448,43 +1484,69 @@ class FullMetricsProcessor:
                     short_zones_with_age
                 )
 
-                # Send snapshot to calibrator for learning (using V2 data)
-                # ohlc4 = (open + high + low + close) / 4
-                src = (self.state.perp_open + self.state.perp_high +
-                       self.state.perp_low + self.state.perp_close) / 4
+                # Send snapshot to ALL symbol calibrators for learning.
+                # Each symbol's calibrator MUST receive on_minute_snapshot() every
+                # 60 seconds, otherwise on_liquidation() silently drops all events
+                # (CLAUDE.md: Calibrator Integration Rules).
+                #
+                # For MVP, BTC OHLC comes from the viewer's own price tracking.
+                # ETH/SOL don't have per-symbol OHLC yet — we use a minimal
+                # snapshot with src=0 so the calibrator's snapshot deque is
+                # non-empty (enabling event processing) but approach/stress
+                # calculations will be skipped when src=0.
+                btc_src = (self.state.perp_open + self.state.perp_high +
+                           self.state.perp_low + self.state.perp_close) / 4
 
-                # Get V2 heatmap data for calibrator
-                v2_heatmap = self._btc().heatmap_v2.get_heatmap()
-                v2_config = self._btc().heatmap_v2.config
+                for sym_short in self.engine_manager.get_all_symbols():
+                    eng = self.engine_manager.get_engine(sym_short)
+                    if eng is None:
+                        continue
 
-                # Build depth band for stress calculation (using V2 steps)
-                depth_band = self._build_depth_band(src, v2_config.steps)
+                    v2_hm = eng.heatmap_v2.get_heatmap()
+                    v2_cfg = eng.heatmap_v2.config
+                    lw = eng.heatmap_v2.inference.leverage_weights
+                    ladder = sorted(lw.keys())
+                    weights = [lw[lev] for lev in ladder]
 
-                # V2 leverage weights for calibrator
-                v2_leverage_weights = self._btc().heatmap_v2.inference.leverage_weights
-                v2_ladder = sorted(v2_leverage_weights.keys())
-                v2_weights = [v2_leverage_weights[lev] for lev in v2_ladder]
+                    if sym_short == "BTC":
+                        sym_src = btc_src
+                        sym_high = self.state.perp_high
+                        sym_low = self.state.perp_low
+                        sym_close = self.state.perp_close
+                        sym_buy_vol = self.state.perp_buyVol
+                        sym_sell_vol = self.state.perp_sellVol
+                        sym_oi_change = self.state.perp_oi_change
+                        sym_depth = self._build_depth_band(btc_src, v2_cfg.steps)
+                    else:
+                        # ETH/SOL: no per-symbol OHLC yet — minimal snapshot
+                        sym_src = 0.0
+                        sym_high = 0.0
+                        sym_low = 0.0
+                        sym_close = 0.0
+                        sym_buy_vol = 0.0
+                        sym_sell_vol = 0.0
+                        sym_oi_change = 0.0
+                        sym_depth = {}
 
-                self.engine_manager.on_minute_snapshot(
-                    "BTC",
-                    symbol="BTC",
-                    timestamp=time.time(),
-                    src=src,
-                    pred_longs=v2_heatmap.get("long", {}),
-                    pred_shorts=v2_heatmap.get("short", {}),
-                    ladder=v2_ladder,
-                    weights=v2_weights,
-                    buffer=v2_config.buffer,
-                    steps=v2_config.steps,
-                    # Market data for approach stress calculation
-                    high=self.state.perp_high,
-                    low=self.state.perp_low,
-                    close=self.state.perp_close,
-                    perp_buy_vol=self.state.perp_buyVol,
-                    perp_sell_vol=self.state.perp_sellVol,
-                    perp_oi_change=self.state.perp_oi_change,
-                    depth_band=depth_band
-                )
+                    self.engine_manager.on_minute_snapshot(
+                        sym_short,
+                        symbol=sym_short,
+                        timestamp=time.time(),
+                        src=sym_src,
+                        pred_longs=v2_hm.get("long", {}),
+                        pred_shorts=v2_hm.get("short", {}),
+                        ladder=ladder,
+                        weights=weights,
+                        buffer=v2_cfg.buffer,
+                        steps=v2_cfg.steps,
+                        high=sym_high,
+                        low=sym_low,
+                        close=sym_close,
+                        perp_buy_vol=sym_buy_vol,
+                        perp_sell_vol=sym_sell_vol,
+                        perp_oi_change=sym_oi_change,
+                        depth_band=sym_depth,
+                    )
 
                 # Per-minute OI/funding/ratio log line
                 oi_str = f"OI={self.state.perp_total_oi:,.0f}"
@@ -1877,13 +1939,18 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
 
 
 def run_websocket_thread(connector, processor, stop_event):
-    """Run websocket connections in a separate thread with its own event loop."""
+    """Run websocket connections in a separate thread with its own event loop.
+
+    Starts all exchange connectors (Binance, Bybit, OKX) via
+    MultiExchangeConnector.connect_all().  Each sub-connector runs as an
+    independent asyncio task so a failure in one exchange does not block
+    the others.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     async def run():
-        connector.binance.running = True
-        await connector.binance.connect_all()
+        await connector.connect_all()  # starts Binance + Bybit + OKX
 
     try:
         while not stop_event.is_set():
@@ -1941,15 +2008,20 @@ def main():
                     snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
                     liq_heatmap_v1_file=LIQ_HEATMAP_V1_FILE,
                     liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE,
-                    engine_manager=processor.engine_manager
+                    engine_manager=processor.engine_manager,
+                    oi_poller=processor.oi_poller
                 )
                 api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
                 console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")
         except ImportError as e:
             console.print(f"[yellow]WARNING: Could not start embedded API: {e}[/]")
 
-    # Start REST poller for OI and trader ratios
-    console.print("[cyan]Starting REST poller for OI and trader ratios...[/]")
+    # Start multi-exchange OI poller (Binance + Bybit + OKX, per symbol)
+    console.print("[cyan]Starting multi-exchange OI poller (BTC, ETH, SOL)...[/]")
+    processor.oi_poller.start()
+
+    # Start REST poller for trader ratios (OI now handled by oi_poller)
+    console.print("[cyan]Starting REST poller for trader ratios...[/]")
     processor.rest_poller.start()
 
     # Start websocket in background thread
@@ -1964,6 +2036,7 @@ def main():
         console.print("\n[yellow]Shutting down...[/]")
         stop_event.set()
         connector.stop()
+        processor.oi_poller.stop()
         processor.rest_poller.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -1983,6 +2056,7 @@ def main():
     finally:
         stop_event.set()
         connector.stop()
+        processor.oi_poller.stop()
         processor.rest_poller.stop()
 
     if api_thread:
