@@ -695,9 +695,20 @@ class FullMetricsProcessor:
             debug_log=True           # Log displayed zones per minute
         )
 
-        # Taker aggression accumulator (real-time aggTrade tracking)
-        # Tracks per-minute taker buy/sell notional from buyer_is_maker field
-        self.taker_aggression = TakerAggressionAccumulator(history_minutes=10)
+        # Per-symbol taker aggression accumulators (real-time aggTrade tracking).
+        # Each symbol gets its own accumulator — NEVER share state between
+        # per-symbol engines (CLAUDE.md Rule #8).
+        self.taker_aggression: Dict[str, TakerAggressionAccumulator] = {
+            sym: TakerAggressionAccumulator(history_minutes=10)
+            for sym in SYMBOL_CONFIGS
+        }
+
+        # Per-symbol volume tracking for minute snapshots.
+        # Accumulated from aggTrade stream, reset every minute.
+        self.symbol_volumes: Dict[str, Dict[str, float]] = {
+            sym: {"buy_vol": 0.0, "sell_vol": 0.0, "buy_count": 0, "sell_count": 0}
+            for sym in SYMBOL_CONFIGS
+        }
 
         # Orderbook heatmap (30s DoM screenshots) — BTC only for now
         self.ob_heatmap_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
@@ -955,7 +966,7 @@ class FullMetricsProcessor:
             if obj_type == "depth":
                 self._process_depth(exchange, data)
             elif obj_type == "trades":
-                self._process_trades(exchange, data)
+                self._process_trades(exchange, instrument, data)
             elif obj_type == "liquidations":
                 self._process_liquidations(exchange, data)
             elif obj_type == "markprice":
@@ -1134,35 +1145,59 @@ class FullMetricsProcessor:
 
         return depth_band
 
-    def _process_trades(self, exchange: str, data: dict):
+    def _process_trades(self, exchange: str, instrument: str, data: dict):
+        """Process aggTrade data with per-symbol routing.
+
+        Routes trades to the correct symbol using INSTRUMENT_TO_SHORT (same
+        mapping used by _process_markprice).  Updates per-symbol volume
+        tracking and taker aggression accumulators.  BTC also updates legacy
+        self.state.perp_* fields for backwards-compatible dashboard panels.
+        """
         if "p" not in data:
             return
+
+        # Resolve symbol from instrument (e.g. "btcusdt" → "BTC")
+        sym = INSTRUMENT_TO_SHORT.get(instrument)
+        if sym is None:
+            return  # unknown instrument, skip
 
         price = float(data["p"])
         qty = float(data["q"])
         is_buyer_maker = data.get("m", False)
         side = "sell" if is_buyer_maker else "buy"
 
-        level = str(int(price / self.level_size) * self.level_size)
-
+        # Per-symbol volume accumulation
+        vols = self.symbol_volumes[sym]
         if side == "buy":
-            self.state.perp_buyVol += qty
-            self.state.perp_numberBuyTrades += 1
-            self.state.perp_buyVolProfile[level] = self.state.perp_buyVolProfile.get(level, 0) + qty
-            if len(self.state.perp_orderedBuyTrades) < 100:
-                self.state.perp_orderedBuyTrades.append(qty)
+            vols["buy_vol"] += qty
+            vols["buy_count"] += 1
         else:
-            self.state.perp_sellVol += qty
-            self.state.perp_numberSellTrades += 1
-            self.state.perp_sellVolProfile[level] = self.state.perp_sellVolProfile.get(level, 0) + qty
-            if len(self.state.perp_orderedSellTrades) < 100:
-                self.state.perp_orderedSellTrades.append(qty)
+            vols["sell_vol"] += qty
+            vols["sell_count"] += 1
 
-        self.state.perp_VolProfile[level] = self.state.perp_VolProfile.get(level, 0) + qty
+        # BTC backwards compat: update legacy self.state.perp_* fields
+        # used by BTC-specific dashboard panels (TRADES section)
+        if sym == "BTC":
+            level = str(int(price / self.level_size) * self.level_size)
 
-        # Feed taker aggression accumulator (real-time aggTrade tracking)
+            if side == "buy":
+                self.state.perp_buyVol += qty
+                self.state.perp_numberBuyTrades += 1
+                self.state.perp_buyVolProfile[level] = self.state.perp_buyVolProfile.get(level, 0) + qty
+                if len(self.state.perp_orderedBuyTrades) < 100:
+                    self.state.perp_orderedBuyTrades.append(qty)
+            else:
+                self.state.perp_sellVol += qty
+                self.state.perp_numberSellTrades += 1
+                self.state.perp_sellVolProfile[level] = self.state.perp_sellVolProfile.get(level, 0) + qty
+                if len(self.state.perp_orderedSellTrades) < 100:
+                    self.state.perp_orderedSellTrades.append(qty)
+
+            self.state.perp_VolProfile[level] = self.state.perp_VolProfile.get(level, 0) + qty
+
+        # Feed per-symbol taker aggression accumulator (real-time aggTrade tracking)
         # This tracks notional USD per taker direction for V2 inference
-        self.taker_aggression.on_trade(price, qty, is_buyer_maker)
+        self.taker_aggression[sym].on_trade(price, qty, is_buyer_maker)
 
     def _process_liquidations(self, exchange: str, data: dict):
         """Process liquidation events from any exchange via the normalizer layer.
@@ -1362,9 +1397,9 @@ class FullMetricsProcessor:
                           self.state.perp_low + self.state.perp_close) / 4
                 v2_minute_key = int(time.time() // 60)
 
-                # Get aggTrade-derived taker aggression (previous completed minute)
+                # Get BTC aggTrade-derived taker aggression (previous completed minute)
                 # Fallback to perp_buyVol/perp_sellVol if aggTrade data missing
-                prev_aggression = self.taker_aggression.get_previous_minute_data()
+                prev_aggression = self.taker_aggression["BTC"].get_previous_minute_data()
                 fallback_used = False
                 perp_buyVol_btc = None
                 perp_sellVol_btc = None
@@ -1400,7 +1435,7 @@ class FullMetricsProcessor:
                 )
 
                 # Log aggression diagnostics with full unit verification
-                agg_history = self.taker_aggression.get_last_n_minutes(5)
+                agg_history = self.taker_aggression["BTC"].get_last_n_minutes(5)
                 debug_entry = {
                     "type": "aggression_minute",
                     "minute_key": agg_minute_key,
@@ -1577,6 +1612,9 @@ class FullMetricsProcessor:
                         ladder = sorted(lw.keys())
                         weights = [lw[lev] for lev in ladder]
 
+                        # Per-symbol volume from aggTrade stream
+                        sym_vols = self.symbol_volumes.get(sym_short, {})
+
                         if sym_short == "BTC":
                             # BTC: primary price from orderbook mid (perp_*),
                             # backed by markPrice stream in symbol_prices
@@ -1584,12 +1622,13 @@ class FullMetricsProcessor:
                             sym_high = self.state.perp_high
                             sym_low = self.state.perp_low
                             sym_close = self.state.perp_close
-                            sym_buy_vol = self.state.perp_buyVol
-                            sym_sell_vol = self.state.perp_sellVol
+                            sym_buy_vol = sym_vols.get("buy_vol", 0.0)
+                            sym_sell_vol = sym_vols.get("sell_vol", 0.0)
                             sym_oi_change = self.state.perp_oi_change
                             sym_depth = self._build_depth_band(btc_src, v2_cfg.steps)
                         else:
-                            # ETH/SOL: OHLC from Binance markPrice@1s stream
+                            # ETH/SOL: OHLC from Binance markPrice@1s stream,
+                            # volume from per-symbol aggTrade streams
                             prices = self.symbol_prices.get(sym_short, {})
                             o = prices.get("open", 0.0)
                             h = prices.get("high", 0.0)
@@ -1599,8 +1638,8 @@ class FullMetricsProcessor:
                             sym_high = h
                             sym_low = l
                             sym_close = c
-                            sym_buy_vol = 0.0
-                            sym_sell_vol = 0.0
+                            sym_buy_vol = sym_vols.get("buy_vol", 0.0)
+                            sym_sell_vol = sym_vols.get("sell_vol", 0.0)
                             sym_oi_change = 0.0
                             sym_depth = {}
 
@@ -1661,6 +1700,13 @@ class FullMetricsProcessor:
                 self.symbol_prices[sym]["open"] = last_close if last_close > 0 else 0.0
                 self.symbol_prices[sym]["high"] = last_close if last_close > 0 else 0.0
                 self.symbol_prices[sym]["low"] = last_close if last_close > 0 else 0.0
+
+            # Reset per-symbol volume accumulators for new minute.
+            for sym in self.symbol_volumes:
+                self.symbol_volumes[sym]["buy_vol"] = 0.0
+                self.symbol_volumes[sym]["sell_vol"] = 0.0
+                self.symbol_volumes[sym]["buy_count"] = 0
+                self.symbol_volumes[sym]["sell_count"] = 0
 
             self.current_minute = current_minute
 
