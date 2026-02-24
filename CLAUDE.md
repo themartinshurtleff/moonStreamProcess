@@ -603,3 +603,80 @@ Frontend (consumer)
 4. **Confirm API response JSON format matches** what the frontend Rust structs expect
 5. **Confirm no silent exceptions in logs**
 6. **If multi-symbol:** confirm each symbol's calibrator is independently receiving and counting events
+
+## Phase 2b Diagnostic Audit
+
+This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipeline (WebSocket ingest → normalization → engine routing → minute snapshots/calibration → API output).
+
+### Audit Scope and Method
+- Read `CLAUDE.md` as intended architecture baseline.
+- Audited implementation in:
+  - `poc/ws_connectors.py`
+  - `poc/full_metrics_viewer.py`
+  - `poc/embedded_api.py`
+  - `poc/engine_manager.py`
+  - `poc/liq_normalizer.py`
+  - `poc/liq_calibrator.py`
+  - `poc/liq_heatmap.py`
+  - `poc/active_zone_manager.py`
+  - `poc/oi_poller.py`
+- Followed codepaths through imports and call chains where needed.
+
+### Complete Gap Summary (BTC vs ETH vs SOL)
+
+| Component | BTC | ETH | SOL | File + Lines | What differs / why | What needs to change |
+|---|---|---|---|---|---|---|
+| Engine instantiation / registration | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L84-L112, L711-L717, L721-L804 | All 3 symbols get independent `EngineInstance`, per-symbol calibrator + heatmap + zone manager wiring. | No change for core registration. |
+| Orderbook engine creation | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L82-L84, L101-L110, L772-L790 | ETH/SOL are explicitly `has_orderbook=False`; only BTC gets reconstructor/accumulator. This is intentional MVP but not parity with BTC reference pipeline. | Add ETH/SOL orderbook engines if parity target includes OB pipeline. |
+| WS subscriptions: Binance | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L107-L135 | Binance subscribes BTC depth+trades, global forceOrder, and markPrice for BTC/ETH/SOL. ETH/SOL lack depth/trades subscriptions. | Add ETH/SOL depth+aggTrade streams if full parity required. |
+| WS subscriptions: Bybit | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L338-L345 | Bybit subscribes BTC orderbook/publicTrade/tickers; ETH/SOL only get liquidation streams (`allLiquidation.*`). | Add ETH/SOL Bybit orderbook/trade/ticker subs if parity required. |
+| WS subscriptions: OKX | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L222-L230 | OKX subscribes BTC books5/trades/funding/OI, plus global liquidation-orders for all swaps. ETH/SOL lack non-liquidation streams. | Add ETH/SOL OKX books/trades/funding/OI if parity required. |
+| Depth processing model | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L971-L1009 | Depth path is BTC-centric (`self._btc().ob_reconstructor`); storage keyed by exchange only (`self.orderbooks[exchange]`), not symbol. Multi-symbol depth would collide/overwrite. | Key orderbooks/reconstructors per symbol, and route depth by instrument+symbol. |
+| Trade/taker aggression ingestion | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L1137-L1166 | `_process_trades` updates BTC-global state; no symbol parameter/route. ETH/SOL trades cannot feed symbol-specific aggression. | Route trades by symbol and maintain per-symbol vol/aggression state. |
+| Liquidation normalization | WORKING | WORKING | WORKING | `poc/liq_normalizer.py` L224-L229, L269-L356, L363-L390 | Symbol extraction and side conventions work for all three exchanges/symbols; Bybit inversion fix is present (`Buy→short`, `Sell→long`). | No change for core normalization. |
+| Engine routing on liquidations | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1174-L1248; `poc/engine_manager.py` L170-L220 | Normalized events route by `event.symbol_short` into per-symbol calibrator+heatmap; liq_counts increment per symbol/exchange. | No change for routing core. |
+| Minute inference (`heatmap_v2.on_minute`) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L1392-L1400 | Only BTC heatmap receives per-minute inference updates (`self._btc().heatmap_v2.on_minute(...)`). ETH/SOL heatmaps never run minute inference from OI/aggression. | Call `heatmap_v2.on_minute` per symbol with per-symbol OHLC, OI, aggression. |
+| Snapshot feed to calibrator (`on_minute_snapshot`) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1557-L1627 | All symbols now receive minute snapshots (stall fix), but ETH/SOL snapshots are low-fidelity placeholders (`buy/sell vol=0`, `oi_change=0`, `depth_band={}`). | Build real per-symbol `perp_buy_vol`, `perp_sell_vol`, `perp_oi_change`, and `depth_band` before snapshoting ETH/SOL. |
+| Calibration stall fix | WORKING | WORKING | WORKING | `poc/liq_calibrator.py` L952-L954, L2796-L2807 | `_get_snapshot_for_event` returns exact minute or closest prior snapshot; avoids hard drop when exact minute missing. | No change (fix present). |
+| Callback isolation (weights update) | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L752-L754, L889-L901 | Lambda captures `_sym=sym_short`, so callback updates correct symbol heatmap. | No change (fix present). |
+| Per-symbol zone persistence files | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L120-L124, L758-L770 | `ZONE_PERSIST_FILES` wired into each heatmap's `zone_persist_file`. | No change (fix present). |
+| API snapshots (V1/V2 JSON) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L170-L183, L1425-L1471, L1667-L1792; `poc/embedded_api.py` L593-L605, L705-L716 | Writer produces single BTC snapshot files; readers enforce snapshot `symbol` match and return 404 for ETH/SOL. | Write per-symbol snapshot files and load by requested symbol in API state. |
+| API history buffers (V1/V2 bin) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L74-L75, L2220-L2221; `poc/embedded_api.py` L398-L401, L632-L637, L755-L760 | One shared V1/V2 history buffer/file; requests for ETH/SOL return BTC-backed history because frames are not symbol-partitioned. | Use per-symbol binary history files/buffers and endpoint symbol routing. |
+| API `/liq_stats` symbol handling | WORKING | BROKEN | BROKEN | `poc/embedded_api.py` L816-L839 | `symbol` query param exists, but endpoint always returns the single cached V2 snapshot stats without symbol validation/filtering. | Validate symbol and load per-symbol stats source. |
+| API orderbook endpoints | WORKING | BROKEN | BROKEN | `poc/embedded_api.py` L875-L880, L929-L966, L1004-L1015 | Endpoint accepts `symbol` but always serves shared BTC buffer/frames; ETH/SOL are synthetic labels only. | Either reject non-BTC explicitly or implement per-symbol OB buffers. |
+| OI ingestion + `/oi` endpoint | WORKING | WORKING | WORKING | `poc/oi_poller.py` L164-L205; `poc/full_metrics_viewer.py` L667-L674, L903-L922; `poc/embedded_api.py` L546-L580 | OI is truly per-symbol aggregated across Binance+Bybit+OKX and exposed correctly via symbol query. | No change for core OI path. |
+| Dashboard multi-symbol rendering | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1876-L1957 | Multi-symbol overview, exchange liquidation breakdown, and exchange connection health all render per symbol. | No change (fix present). |
+| `liq_counts` tracking | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L676-L677, L1247, L1927-L1935 | Per-symbol, per-exchange liquidation counters are updated and displayed. | No change (fix present). |
+| `exchange_last_seen` tracking | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L679-L680, L946, L1943-L1953 | Last-seen heartbeat updated on every message and surfaced in dashboard status. | No change (fix present). |
+| Symbol normalization in V3 zone API | PARTIAL | PARTIAL | PARTIAL | `poc/embedded_api.py` L1179-L1186 | `_resolve_symbol` only maps exact `FULL_TO_SHORT` keys; no uppercase normalization, so lowercase/full variants can miss engines unexpectedly. | Normalize input (`upper()`) before map/lookup. |
+| Shared log resources in heatmap stack | PARTIAL | PARTIAL | PARTIAL | `poc/liq_heatmap.py` L84-L90 | Tape/inference/sweep/debug logs default to shared files regardless of symbol; operationally mixed streams. | Consider per-symbol log filenames for diagnosability/parity. |
+
+### Verification of Previously Claimed Fixes
+
+| Claimed Fix | Status | Evidence |
+|---|---|---|
+| Calibration stall fix | PRESENT | Snapshot fallback lookup in calibrator `_get_snapshot_for_event` (`exact or closest prior`). |
+| Callback isolation | PRESENT | Captured symbol in lambda default arg (`_sym=sym_short`) and symbol-routed callback update. |
+| Per-symbol zone files | PRESENT | `ZONE_PERSIST_FILES` and `zone_persist_file` per symbol. |
+| Bybit side convention fix | PRESENT | Bybit normalizer maps `Buy→short`, `Sell→long`. |
+| markPrice streams (BTC/ETH/SOL) | PRESENT | Binance connector subscribes all 3 markPrice streams. |
+| Dashboard multi-symbol rendering | PRESENT | Overview + exchange breakdown + connections iterate all symbols. |
+| `liq_counts` tracking | PRESENT | Per-symbol/exchange counter dict increment on routed events. |
+| `exchange_last_seen` tracking | PRESENT | Updated in `process_message` and used in connection panel. |
+
+### CLAUDE.md vs Code Mismatches
+
+1. CLAUDE says per-symbol engines must have independent frame buffer/state; code still uses shared V1/V2 snapshot files and shared V1/V2 history files, so ETH/SOL API paths are not independent.
+2. CLAUDE notes remaining TODO for per-symbol snapshots/history buffers; this is still true in implementation and is currently the largest parity blocker.
+3. CLAUDE describes broad multi-symbol flow, but actual minute inference is BTC-only (`heatmap_v2.on_minute` only called for BTC), leaving ETH/SOL prediction updates incomplete.
+4. CLAUDE describes all three symbols being tracked with per-symbol price feeds/OHLC; code does that, but ETH/SOL calibrator inputs still miss key market fields (OI delta, aggression, depth).
+
+### Net Assessment
+
+- **BTC** remains the only fully wired end-to-end reference pipeline (WS depth/trades/liquidations + minute inference + snapshots/history + API consistency).
+- **ETH/SOL** are **partially wired** for liquidations and OI, but **not at parity** in:
+  - per-minute inference updates,
+  - market microstructure inputs (trades/depth/OI delta) into calibration context,
+  - snapshot/history persistence partitioning,
+  - API response partitioning for V1/V2 and orderbook paths.
+
