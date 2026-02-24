@@ -20,6 +20,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from liq_tape import LiquidationTape
@@ -191,7 +192,8 @@ class LiquidationHeatmap:
         # Look for matching projection within ±2 buckets
         buckets = self.inference.projected_long_liqs if side == "long" else self.inference.projected_short_liqs
 
-        liq_bucket = round(liq_price / self.config.steps) * self.config.steps
+        _ndigits = max(0, -Decimal(str(self.config.steps)).as_tuple().exponent)
+        liq_bucket = round(round(liq_price / self.config.steps) * self.config.steps, _ndigits)
 
         for delta in [0, -self.config.steps, self.config.steps, -2*self.config.steps, 2*self.config.steps]:
             check_bucket = liq_bucket + delta

@@ -23,6 +23,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Dict, List, Tuple, Optional
 
 from leverage_config import is_tier_disabled, get_tier_weight, log_disabled_tiers, DISABLED_TIERS
@@ -113,6 +114,7 @@ class EntryInference:
     ):
         self.symbol = symbol
         self.steps = steps
+        self._ndigits = max(0, -Decimal(str(steps)).as_tuple().exponent)
         self.buffer = buffer
         self.decay = decay
         self.leverage_weights = leverage_weights or self.DEFAULT_LEVERAGE_WEIGHTS.copy()
@@ -172,8 +174,8 @@ class EntryInference:
         log_disabled_tiers()
 
     def _bucket_price(self, price: float) -> float:
-        """Round price to nearest bucket."""
-        return round(price / self.steps) * self.steps
+        """Round price to nearest bucket with precision matching step size."""
+        return round(round(price / self.steps) * self.steps, self._ndigits)
 
     def _calculate_liq_price(self, entry: float, leverage: int, side: str) -> float:
         """
@@ -254,7 +256,8 @@ class EntryInference:
         sell_weight = 1.0 - buy_weight
 
         # Debug log for diagnostics
-        oi_threshold = self.last_oi * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
+        # OI is in base-asset units (e.g. BTC count); convert threshold to USD
+        oi_threshold = self.last_oi * src_price * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
 
         # Track projected additions for debug logging
         projected_added_long_usd = 0.0
@@ -262,8 +265,8 @@ class EntryInference:
 
         if oi_delta > 0:
             # New positions opening - compute BOTH sides
-            # Assuming OI is in USD (Binance reports it that way for perpetuals)
-            oi_delta_usd = abs(oi_delta)
+            # OI is in base-asset units (BTC/ETH/SOL count) — convert to USD
+            oi_delta_usd = abs(oi_delta) * src_price
 
             # Distribute OI to both sides based on aggression weight
             long_open_usd = oi_delta_usd * buy_weight
@@ -307,7 +310,8 @@ class EntryInference:
                               sum(b.size_usd for b in self.projected_short_liqs.values())
 
             if total_projected > 0:
-                close_factor = min(0.5, abs(oi_delta) / total_projected)  # Cap at 50% per minute
+                # Convert base-unit OI delta to USD for consistent ratio with total_projected (USD)
+                close_factor = min(0.5, abs(oi_delta) * src_price / total_projected)  # Cap at 50% per minute
 
                 # Reduce both sides proportionally
                 self._reduce_projections(self.projected_long_liqs, close_factor)
@@ -330,7 +334,7 @@ class EntryInference:
                 "ts": time.time(),
                 "minute_key": minute_key,
                 "src_price": src_price,
-                "oi_delta_usd": oi_delta,
+                "oi_delta_usd": round(oi_delta * src_price, 2),
                 "buy_pct": round(buy_pct, 4),
                 "buy_weight": round(buy_weight, 4),
                 "long_open_usd": round(projected_added_long_usd, 2),

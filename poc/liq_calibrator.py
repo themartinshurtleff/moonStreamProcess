@@ -28,6 +28,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Dict, List, Tuple, Optional, Callable
 import logging
 
@@ -349,6 +350,7 @@ class LiquidationCalibrator:
     ):
         self.symbol = symbol
         self.steps = steps
+        self._ndigits = max(0, -Decimal(str(steps)).as_tuple().exponent)
         self.window_minutes = window_minutes
         self.hit_bucket_tolerance = hit_bucket_tolerance
         self.learning_rate = learning_rate
@@ -1476,10 +1478,10 @@ class LiquidationCalibrator:
         }
 
     def _bucket_price(self, price: float, steps: float = None) -> float:
-        """Bucket a price to the nearest step."""
+        """Bucket a price to the nearest step with precision matching step size."""
         if steps is None:
             steps = self.steps
-        return round(price / steps) * steps
+        return round(round(price / steps) * steps, self._ndigits)
 
     def _zone_bucket_int(self, zone_price: float, steps: float = None) -> int:
         """

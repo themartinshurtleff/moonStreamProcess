@@ -20,6 +20,7 @@ import os
 import time
 import threading
 from dataclasses import dataclass, field, asdict
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime
 from collections import defaultdict
@@ -88,6 +89,7 @@ class ActiveZoneManager:
     ):
         self.symbol = symbol
         self.steps = steps
+        self._ndigits = max(0, -Decimal(str(steps)).as_tuple().exponent)
         self.persist_file = persist_file or DEFAULT_PERSIST_FILE
         self.zone_log_file = zone_log_file
 
@@ -132,8 +134,8 @@ class ActiveZoneManager:
             logger.info(f"  Zone log: {zone_log_file}")
 
     def _bucket_price(self, price: float) -> float:
-        """Round price to nearest bucket."""
-        return round(price / self.steps) * self.steps
+        """Round price to nearest bucket with precision matching step size."""
+        return round(round(price / self.steps) * self.steps, self._ndigits)
 
     def _zone_key(self, side: str, price: float) -> Tuple[str, float]:
         """Create zone key from side and bucketed price."""

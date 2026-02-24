@@ -12,6 +12,7 @@ import time
 import sys
 import os
 from datetime import datetime
+from decimal import Decimal
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
@@ -71,6 +72,29 @@ OB_RECON_STATS_FILE = os.path.join(POC_DIR, "ob_recon_stats.json")
 # Log rotation thresholds
 LOG_ROTATION_MAX_MB = 200
 LOG_ROTATION_MAX_AGE_HOURS = 24
+
+
+def _step_ndigits(step: float) -> int:
+    """Compute decimal precision digits from a step size.
+
+    Uses Decimal to derive the number of fractional digits needed for
+    exact rounding.  Required for sub-integer steps (e.g. 0.1 for SOL)
+    to avoid floating-point drift in price grids and bucket lookups.
+    """
+    return max(0, -Decimal(str(step)).as_tuple().exponent)
+
+
+def _build_price_grid(price_min: float, price_max: float, step: float) -> List[float]:
+    """Build an index-based price grid with exact rounding.
+
+    Avoids incremental ``p += step`` which causes floating-point drift
+    for sub-integer steps (e.g. step=0.1).
+    """
+    ndigits = _step_ndigits(step)
+    price_min = round(price_min, ndigits)
+    price_max = round(price_max, ndigits)
+    n_buckets = int(round((price_max - price_min) / step)) + 1
+    return [round(price_min + i * step, ndigits) for i in range(n_buckets)]
 
 # Per-symbol engine configuration.
 # BTC gets full engines (calibrator + heatmap + orderbook).
@@ -1133,16 +1157,17 @@ class FullMetricsProcessor:
         depth_band = {}
 
         # Process bids - notional = price * size
+        db_ndigits = _step_ndigits(steps)
         for price, size in all_bids:
             if low_bound <= price <= high_bound:
-                bucket = round(price / steps) * steps
+                bucket = round(round(price / steps) * steps, db_ndigits)
                 notional = price * size
                 depth_band[bucket] = depth_band.get(bucket, 0.0) + notional
 
         # Process asks - notional = price * size
         for price, size in all_asks:
             if low_bound <= price <= high_bound:
-                bucket = round(price / steps) * steps
+                bucket = round(round(price / steps) * steps, db_ndigits)
                 notional = price * size
                 depth_band[bucket] = depth_band.get(bucket, 0.0) + notional
 
@@ -1532,13 +1557,10 @@ class FullMetricsProcessor:
                         # Build intensity arrays for history buffer
                         sym_v2_steps = eng_v2.heatmap_v2.config.steps
                         band_pct = 0.10
-                        sym_price_min = round((sym_v2_src * (1 - band_pct)) / sym_v2_steps) * sym_v2_steps
-                        sym_price_max = round((sym_v2_src * (1 + band_pct)) / sym_v2_steps) * sym_v2_steps
-                        sym_v2_prices = []
-                        pr = sym_price_min
-                        while pr <= sym_price_max:
-                            sym_v2_prices.append(pr)
-                            pr += sym_v2_steps
+                        sym_v2_ndigits = _step_ndigits(sym_v2_steps)
+                        sym_price_min = round(round((sym_v2_src * (1 - band_pct)) / sym_v2_steps) * sym_v2_steps, sym_v2_ndigits)
+                        sym_price_max = round(round((sym_v2_src * (1 + band_pct)) / sym_v2_steps) * sym_v2_steps, sym_v2_ndigits)
+                        sym_v2_prices = _build_price_grid(sym_price_min, sym_price_max, sym_v2_steps)
 
                         sym_v2_hm = eng_v2.heatmap_v2.get_heatmap()
                         sym_v2_longs = sym_v2_hm.get("long", {})
@@ -1866,14 +1888,11 @@ class FullMetricsProcessor:
 
         # Build price range: ±8% around src, bucketed by steps
         band_pct = 0.08
-        price_min = round((src * (1 - band_pct)) / steps) * steps
-        price_max = round((src * (1 + band_pct)) / steps) * steps
+        v1_ndigits = _step_ndigits(steps)
+        price_min = round(round((src * (1 - band_pct)) / steps) * steps, v1_ndigits)
+        price_max = round(round((src * (1 + band_pct)) / steps) * steps, v1_ndigits)
 
-        prices = []
-        p = price_min
-        while p <= price_max:
-            prices.append(p)
-            p += steps
+        prices = _build_price_grid(price_min, price_max, steps)
 
         v1_heatmap = eng.heatmap_v2.get_heatmap()
         all_longs = v1_heatmap.get("long", {})

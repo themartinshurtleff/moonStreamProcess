@@ -499,6 +499,8 @@ Frontend (consumer)
 13. **NEVER pass `min_weight` to `ActiveZoneManager.get_active_zones()`** — it doesn't accept it (signature: `side`, `min_leverage`, `max_leverage` only). Filter `min_weight` in Python after the call returns.
 14. **NEVER parse raw exchange liquidation messages in `_process_liquidations()`** — always use `normalize_liquidation(exchange, data)` from `liq_normalizer.py`. All exchange-specific format handling, side convention mapping, and OKX contract conversion belongs in the normalizer, not the viewer.
 15. **NEVER add code to the per-symbol minute snapshot loop without exception isolation — one symbol failure must not block others**
+16. **NEVER build price grids with incremental `p += step` loops** — floating-point drift corrupts grids for non-integer steps (e.g. SOL step=0.1). Always use index-based construction: `round(price_min + i * step, ndigits)` with `ndigits = max(0, -Decimal(str(step)).as_tuple().exponent)`
+17. **NEVER assume OI values from `oi_poller` are in USD** — they are in **base asset units** (BTC count, ETH count, SOL count). Multiply by `src_price` to convert to USD before threshold comparisons or USD-denominated computations
 
 ## Known Bugs and Past Issues
 
@@ -533,6 +535,19 @@ Frontend (consumer)
 
 ### RESOLVED: Snapshot JSON writes are now atomic
 - `write_json_atomic()` helper uses tmp + flush + fsync + `os.replace()`. All V1/V2 snapshot files and calibrator weights now use atomic writes. Temp file is in the same directory as target to avoid cross-filesystem rename failures.
+
+### RESOLVED: SOL heatmap intensity arrays all zeros — floating-point grid precision loss
+- **Root cause:** Grid construction used incremental `p += step` loops. For SOL with `step=0.1`, floating-point drift after ~57 iterations produced values like `75.19999999999968` instead of `75.2`. Heatmap dict keys (from `round(price/step)*step`) were exact (e.g. `75.2`), but grid values drifted, causing `dict.get(grid_price, 0.0)` to miss every key → all zeros in the intensity arrays.
+- **Impact:** SOL liquidation heatmap returned all-zero intensity arrays on both V1 and V2 endpoints, rendering nothing on the frontend. BTC (step=20.0) and ETH (step=1.0) were unaffected because integer-representable steps don't accumulate drift.
+- **Fix (2026-02-24):** Replaced all incremental grid construction (`while p += step`) with index-based grids: `round(price_min + i * step, ndigits)` where `ndigits = max(0, -Decimal(str(step)).as_tuple().exponent)`. Applied consistently across 8 files: `full_metrics_viewer.py`, `embedded_api.py`, `liq_tape.py`, `entry_inference.py`, `liq_calibrator.py`, `liq_heatmap.py`, `active_zone_manager.py`, `ob_heatmap.py`. All `_bucket_price()` functions also use the same `ndigits` rounding to ensure grid/dict-key consistency.
+
+### RESOLVED: BTC entry inference completely dead — OI unit mismatch
+- **Root cause:** `entry_inference.py` assumed OI was in USD (comment: "Assuming OI is in USD"), but `oi_poller.py` delivers OI in **base asset units** (e.g. BTC count). A typical BTC OI delta of ~118 BTC was treated as $118, which after buy_weight split became ~$77 — below the `$100` minimum threshold in `_project_side()`. Every inference was silently dropped.
+- **Impact:** BTC produced 0 inferences despite 191 minutes of positive OI deltas. ETH and SOL were also affected but had larger base-unit OI counts that sometimes exceeded thresholds by accident.
+- **Fix (2026-02-24):** In `entry_inference.py`, convert OI delta from base units to USD by multiplying by `src_price`: `oi_delta_usd = abs(oi_delta) * src_price`. Also converted: (a) `oi_threshold` to USD (`last_oi * src_price * MIN_OI_CHANGE_PCT`), (b) closing branch `close_factor` ratio (`abs(oi_delta) * src_price / total_projected`), (c) debug log field to actual USD value.
+
+### NOTE: Weight file saving gated by calibration_enabled
+- `_save_weights()` is only called inside `_run_calibration()` and is conditional on `self.calibration_enabled == True`. When a safety trip (e.g. entropy collapse) sets `calibration_enabled = False`, weight saving is intentionally suspended. The return value of `_save_weights()` is not checked at the call site (line 2418), but the method logs errors internally. This is intentional design — weights freeze when safety guardrails trip.
 
 ---
 

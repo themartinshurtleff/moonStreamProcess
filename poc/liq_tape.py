@@ -22,6 +22,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Dict, List, Tuple, Optional
 
 # V3: Import zone manager for persistent zones
@@ -79,6 +80,7 @@ class LiquidationTape:
     ):
         self.symbol = symbol
         self.steps = steps
+        self._ndigits = max(0, -Decimal(str(steps)).as_tuple().exponent)
         self.decay = decay
         self.retention_minutes = retention_minutes
 
@@ -123,8 +125,8 @@ class LiquidationTape:
             logger.info(f"[{symbol}] LiquidationTape using ActiveZoneManager for persistent zones")
 
     def _bucket_price(self, price: float) -> float:
-        """Round price to nearest bucket."""
-        return round(price / self.steps) * self.steps
+        """Round price to nearest bucket with precision matching step size."""
+        return round(round(price / self.steps) * self.steps, self._ndigits)
 
     def on_force_order(
         self,

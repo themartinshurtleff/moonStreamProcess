@@ -19,6 +19,7 @@ import threading
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, Callable
 from enum import Enum
 import logging
@@ -599,6 +600,7 @@ class OrderbookAccumulator:
         on_frame_callback=None
     ):
         self.step = step
+        self._ndigits = max(0, -Decimal(str(step)).as_tuple().exponent)
         self.range_pct = range_pct
         self.on_frame_callback = on_frame_callback
 
@@ -614,8 +616,8 @@ class OrderbookAccumulator:
         self._last_update_ts: float = 0.0
 
     def _bucket_price(self, price: float) -> float:
-        """Round price to nearest bucket."""
-        return round(price / self.step) * self.step
+        """Round price to nearest bucket with precision matching step size."""
+        return round(round(price / self.step) * self.step, self._ndigits)
 
     def _get_slot(self, ts: float) -> int:
         """Get 30s slot for timestamp."""
@@ -1110,14 +1112,12 @@ def build_unified_grid(
         price_max = max(f.price_max for f in frames)
 
     # Round to step
-    price_min = round(price_min / step) * step
-    price_max = round(price_max / step) * step
+    ndigits = max(0, -Decimal(str(step)).as_tuple().exponent)
+    price_min = round(round(price_min / step) * step, ndigits)
+    price_max = round(round(price_max / step) * step, ndigits)
 
-    prices = []
-    p = price_min
-    while p <= price_max + 0.01:
-        prices.append(p)
-        p += step
+    n_buckets = int(round((price_max - price_min) / step)) + 1
+    prices = [round(price_min + i * step, ndigits) for i in range(n_buckets)]
 
     return prices, price_min, price_max
 

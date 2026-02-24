@@ -33,6 +33,7 @@ import time
 import threading
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Dict, List, Optional, Any, Tuple
 import logging
 
@@ -80,6 +81,24 @@ VALID_SYMBOLS = {"BTC", "ETH", "SOL"}
 # Default grid parameters
 DEFAULT_STEP = 20.0
 DEFAULT_BAND_PCT = 0.08
+
+
+def _step_ndigits(step: float) -> int:
+    """Compute decimal precision digits from a step size."""
+    return max(0, -Decimal(str(step)).as_tuple().exponent)
+
+
+def _build_price_grid(price_min: float, price_max: float, step: float) -> List[float]:
+    """Build an index-based price grid with exact rounding.
+
+    Avoids incremental ``p += step`` which causes floating-point drift
+    for sub-integer steps (e.g. step=0.1).
+    """
+    ndigits = _step_ndigits(step)
+    price_min = round(price_min, ndigits)
+    price_max = round(price_max, ndigits)
+    n_buckets = int(round((price_max - price_min) / step)) + 1
+    return [round(price_min + i * step, ndigits) for i in range(n_buckets)]
 
 
 def _get_fallback_price_range(symbol: str):
@@ -225,11 +244,10 @@ class LiquidationHeatmapBuffer:
         long_intensity = data[long_start:long_start + n_buckets]
         short_intensity = data[short_start:short_start + n_buckets]
 
-        prices = []
-        p = price_min
-        while p <= price_max + 0.01 and len(prices) < n_buckets:
-            prices.append(p)
-            p += step
+        prices = _build_price_grid(price_min, price_max, step)
+        # Trim to match binary record bucket count
+        if len(prices) > n_buckets:
+            prices = prices[:n_buckets]
 
         return HistoryFrame(
             ts=ts,
@@ -330,14 +348,11 @@ def build_unified_grid(
         else:
             return ([], 0, 0)
 
-    price_min = round((current_src * (1 - band_pct)) / step) * step
-    price_max = round((current_src * (1 + band_pct)) / step) * step
+    ndigits = _step_ndigits(step)
+    price_min = round(round((current_src * (1 - band_pct)) / step) * step, ndigits)
+    price_max = round(round((current_src * (1 + band_pct)) / step) * step, ndigits)
 
-    prices = []
-    p = price_min
-    while p <= price_max:
-        prices.append(p)
-        p += step
+    prices = _build_price_grid(price_min, price_max, step)
 
     return (prices, price_min, price_max)
 
@@ -671,13 +686,10 @@ def create_embedded_app(
             if current:
                 step = current.get('step', DEFAULT_STEP)
                 src = current.get('src', 100000)
-                price_min = round((src * (1 - DEFAULT_BAND_PCT)) / step) * step
-                price_max = round((src * (1 + DEFAULT_BAND_PCT)) / step) * step
-                prices = []
-                p = price_min
-                while p <= price_max:
-                    prices.append(p)
-                    p += step
+                fb_ndigits = _step_ndigits(step)
+                price_min = round(round((src * (1 - DEFAULT_BAND_PCT)) / step) * step, fb_ndigits)
+                price_max = round(round((src * (1 + DEFAULT_BAND_PCT)) / step) * step, fb_ndigits)
+                prices = _build_price_grid(price_min, price_max, step)
             else:
                 step = DEFAULT_STEP
                 fb_min, fb_max = _get_fallback_price_range(sym)
@@ -792,13 +804,10 @@ def create_embedded_app(
             if current:
                 step = current.get('step', DEFAULT_STEP)
                 src = current.get('src', 100000)
-                price_min = round((src * (1 - DEFAULT_BAND_PCT)) / step) * step
-                price_max = round((src * (1 + DEFAULT_BAND_PCT)) / step) * step
-                prices = []
-                p = price_min
-                while p <= price_max:
-                    prices.append(p)
-                    p += step
+                fb_ndigits = _step_ndigits(step)
+                price_min = round(round((src * (1 - DEFAULT_BAND_PCT)) / step) * step, fb_ndigits)
+                price_max = round(round((src * (1 + DEFAULT_BAND_PCT)) / step) * step, fb_ndigits)
+                prices = _build_price_grid(price_min, price_max, step)
             else:
                 step = DEFAULT_STEP
                 fb_min, fb_max = _get_fallback_price_range(sym)
