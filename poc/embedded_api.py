@@ -6,14 +6,21 @@ This module provides FastAPI endpoints that share buffers directly with the
 collector (full_metrics_viewer.py), eliminating the disk sync issue where
 the standalone API would load frames once at startup and never refresh.
 
+Per-symbol snapshot files are read from disk every 5 seconds:
+  liq_api_snapshot_{SYM}.json   (V1, per symbol)
+  liq_api_snapshot_v2_{SYM}.json (V2, per symbol)
+
+Per-symbol binary history files store frame history:
+  liq_heatmap_v1_{SYM}.bin  (V1 history, per symbol)
+  liq_heatmap_v2_{SYM}.bin  (V2 history, per symbol)
+
 Usage:
     # In full_metrics_viewer.py:
     from embedded_api import create_embedded_app, start_api_thread
 
     app = create_embedded_app(
         ob_buffer=processor.ob_heatmap_buffer,
-        snapshot_file=LIQ_API_SNAPSHOT,
-        snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
+        snapshot_dir=POC_DIR,
         engine_manager=processor.engine_manager
     )
     api_thread = start_api_thread(app, host="127.0.0.1", port=8899)
@@ -66,6 +73,9 @@ except ImportError:
 
 # API version
 API_VERSION = "3.0.0"  # V3 with zone lifecycle endpoints
+
+# Valid symbols for all endpoints
+VALID_SYMBOLS = {"BTC", "ETH", "SOL"}
 
 # Default grid parameters
 DEFAULT_STEP = 20.0
@@ -362,105 +372,122 @@ def map_frame_to_grid(
 class EmbeddedAPIState:
     """
     Holds shared references to buffers and files.
+
+    Per-symbol snapshot caches and history buffers (CLAUDE.md Rule #8:
+    per-symbol buffers must be independent, never shared).
     """
 
     def __init__(
         self,
         ob_buffer: Optional['OrderbookHeatmapBuffer'] = None,
+        snapshot_dir: Optional[str] = None,
+        engine_manager: Optional['EngineManager'] = None,
+        oi_poller: Optional[Any] = None,
+        # Legacy params — accepted but ignored (kept for caller compat during transition)
         snapshot_file: Optional[str] = None,
         snapshot_v2_file: Optional[str] = None,
         liq_heatmap_v1_file: Optional[str] = None,
         liq_heatmap_v2_file: Optional[str] = None,
-        engine_manager: Optional['EngineManager'] = None,
-        oi_poller: Optional[Any] = None
     ):
         self.ob_buffer = ob_buffer
-        self.snapshot_file = snapshot_file
-        self.snapshot_v2_file = snapshot_v2_file
-        self.liq_heatmap_v1_file = liq_heatmap_v1_file
-        self.liq_heatmap_v2_file = liq_heatmap_v2_file
         self.engine_manager = engine_manager
         self.oi_poller = oi_poller  # MultiExchangeOIPoller or OIPollerThread
         self.start_time = time.time()
 
-        # Cached snapshot data
-        self._v1_cache: Optional[Dict] = None
-        self._v1_cache_time: float = 0
-        self._v2_cache: Optional[Dict] = None
-        self._v2_cache_time: float = 0
+        # Resolve snapshot directory: explicit param > inferred from legacy path > cwd
+        if snapshot_dir:
+            self._snapshot_dir = snapshot_dir
+        elif snapshot_file:
+            self._snapshot_dir = os.path.dirname(snapshot_file)
+        else:
+            self._snapshot_dir = os.path.dirname(__file__)
+
         # 5s minimum — CLAUDE.md rule: no disk I/O refresh intervals under 5s
         self._cache_ttl: float = 5.0
 
-        # History buffers for liquidation heatmap
-        self.v1_history: Optional[LiquidationHeatmapBuffer] = None
-        self.v2_history: Optional[LiquidationHeatmapBuffer] = None
+        # Per-symbol snapshot caches (CLAUDE.md Rule #8: independent per symbol)
+        self._v1_caches: Dict[str, Optional[Dict]] = {sym: None for sym in VALID_SYMBOLS}
+        self._v2_caches: Dict[str, Optional[Dict]] = {sym: None for sym in VALID_SYMBOLS}
 
-        if liq_heatmap_v1_file:
-            self.v1_history = LiquidationHeatmapBuffer(liq_heatmap_v1_file)
-        if liq_heatmap_v2_file:
-            self.v2_history = LiquidationHeatmapBuffer(liq_heatmap_v2_file)
+        # Per-symbol history buffers with per-symbol binary files
+        self.v1_histories: Dict[str, LiquidationHeatmapBuffer] = {}
+        self.v2_histories: Dict[str, LiquidationHeatmapBuffer] = {}
+        for sym in VALID_SYMBOLS:
+            v1_bin = os.path.join(self._snapshot_dir, f"liq_heatmap_v1_{sym}.bin")
+            v2_bin = os.path.join(self._snapshot_dir, f"liq_heatmap_v2_{sym}.bin")
+            self.v1_histories[sym] = LiquidationHeatmapBuffer(v1_bin)
+            self.v2_histories[sym] = LiquidationHeatmapBuffer(v2_bin)
 
         # Start background refresh thread
         self._running = True
         self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self._refresh_thread.start()
 
+    def _snapshot_path(self, version: str, symbol: str) -> str:
+        """Build per-symbol snapshot file path."""
+        if version == "v1":
+            return os.path.join(self._snapshot_dir, f"liq_api_snapshot_{symbol}.json")
+        return os.path.join(self._snapshot_dir, f"liq_api_snapshot_v2_{symbol}.json")
+
     def _refresh_loop(self):
-        """Background loop to refresh caches and add to history."""
+        """Background loop to refresh per-symbol caches and add to history."""
         while self._running:
-            self._refresh_v1_cache()
-            self._refresh_v2_cache()
+            for sym in VALID_SYMBOLS:
+                self._refresh_symbol_cache(sym, "v1")
+                self._refresh_symbol_cache(sym, "v2")
             time.sleep(self._cache_ttl)
+
+    def _refresh_symbol_cache(self, symbol: str, version: str):
+        """Refresh cache for one symbol+version. Never crashes the thread."""
+        path = self._snapshot_path(version, symbol)
+        if not os.path.exists(path):
+            return  # File may not exist during warmup — normal
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if version == "v1":
+                self._v1_caches[symbol] = data
+                self.v1_histories[symbol].add_frame(data)
+            else:
+                self._v2_caches[symbol] = data
+                self.v2_histories[symbol].add_frame(data)
+        except Exception as e:
+            # Keep last good cached snapshot — never crash the refresh thread
+            logger.warning("Cache refresh error (%s/%s): %s", version, symbol, e)
 
     def stop(self):
         self._running = False
 
-    def get_v1_snapshot(self) -> Optional[Dict]:
-        return self._v1_cache
+    def get_v1_snapshot(self, symbol: str = "BTC") -> Optional[Dict]:
+        return self._v1_caches.get(symbol)
 
-    def get_v2_snapshot(self) -> Optional[Dict]:
-        return self._v2_cache
+    def get_v2_snapshot(self, symbol: str = "BTC") -> Optional[Dict]:
+        return self._v2_caches.get(symbol)
 
-    def _refresh_v1_cache(self):
-        if not self.snapshot_file or not os.path.exists(self.snapshot_file):
-            return
-        try:
-            with open(self.snapshot_file, 'r') as f:
-                data = json.load(f)
-            self._v1_cache = data
-            self._v1_cache_time = time.time()
-            # Add to history buffer
-            if self.v1_history:
-                self.v1_history.add_frame(data)
-        except Exception as e:
-            logger.warning("Cache refresh error (v1): %s", e)
+    def get_v1_history(self, symbol: str = "BTC") -> Optional[LiquidationHeatmapBuffer]:
+        return self.v1_histories.get(symbol)
 
-    def _refresh_v2_cache(self):
-        if not self.snapshot_v2_file or not os.path.exists(self.snapshot_v2_file):
-            return
-        try:
-            with open(self.snapshot_v2_file, 'r') as f:
-                data = json.load(f)
-            self._v2_cache = data
-            self._v2_cache_time = time.time()
-            # Add to history buffer
-            if self.v2_history:
-                self.v2_history.add_frame(data)
-        except Exception as e:
-            logger.warning("Cache refresh error (v2): %s", e)
+    def get_v2_history(self, symbol: str = "BTC") -> Optional[LiquidationHeatmapBuffer]:
+        return self.v2_histories.get(symbol)
 
 
 def create_embedded_app(
     ob_buffer: Optional['OrderbookHeatmapBuffer'] = None,
+    snapshot_dir: Optional[str] = None,
+    engine_manager: Optional['EngineManager'] = None,
+    oi_poller: Optional[Any] = None,
+    # Legacy params — accepted for caller compat during transition, passed through
     snapshot_file: Optional[str] = None,
     snapshot_v2_file: Optional[str] = None,
     liq_heatmap_v1_file: Optional[str] = None,
     liq_heatmap_v2_file: Optional[str] = None,
-    engine_manager: Optional['EngineManager'] = None,
-    oi_poller: Optional[Any] = None
 ) -> 'FastAPI':
     """
     Create FastAPI application with shared buffer references.
+
+    Args:
+        snapshot_dir: Directory containing per-symbol snapshot JSON and binary history files.
+                      If not provided, inferred from legacy snapshot_file path or __file__.
     """
     if not HAS_FASTAPI:
         raise ImportError("FastAPI not installed. Install with: pip install fastapi uvicorn")
@@ -468,12 +495,13 @@ def create_embedded_app(
     # Create shared state
     state = EmbeddedAPIState(
         ob_buffer=ob_buffer,
+        snapshot_dir=snapshot_dir,
+        engine_manager=engine_manager,
+        oi_poller=oi_poller,
         snapshot_file=snapshot_file,
         snapshot_v2_file=snapshot_v2_file,
         liq_heatmap_v1_file=liq_heatmap_v1_file,
         liq_heatmap_v2_file=liq_heatmap_v2_file,
-        engine_manager=engine_manager,
-        oi_poller=oi_poller
     )
 
     # Response cache — shared across all concurrent requests
@@ -485,6 +513,16 @@ def create_embedded_app(
         version=API_VERSION
     )
 
+    def _validate_symbol(symbol: str) -> str:
+        """Validate and normalize symbol. Returns uppercase short symbol or raises 400."""
+        sym = symbol.strip().upper().replace("USDT", "")
+        if sym not in VALID_SYMBOLS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid symbol '{symbol}'. Valid symbols: {', '.join(sorted(VALID_SYMBOLS))}"
+            )
+        return sym
+
     @app.on_event("startup")
     async def startup():
         ob_frames = 0
@@ -492,13 +530,12 @@ def create_embedded_app(
             ob_stats = state.ob_buffer.get_stats()
             ob_frames = ob_stats.get('frames_in_memory', 0)
 
-        v1_frames = state.v1_history.frame_count() if state.v1_history else 0
-        v2_frames = state.v2_history.frame_count() if state.v2_history else 0
-
         print(f"[EMBEDDED_API] Started with shared buffer: {ob_frames} OB frames")
-        print(f"[EMBEDDED_API] V1 history: {v1_frames} frames, V2 history: {v2_frames} frames")
-        print(f"[EMBEDDED_API] V1 snapshot: {state.snapshot_file}")
-        print(f"[EMBEDDED_API] V2 snapshot: {state.snapshot_v2_file}")
+        print(f"[EMBEDDED_API] Snapshot dir: {state._snapshot_dir}")
+        for sym in sorted(VALID_SYMBOLS):
+            v1_frames = state.v1_histories[sym].frame_count()
+            v2_frames = state.v2_histories[sym].frame_count()
+            print(f"[EMBEDDED_API] {sym}: V1 history={v1_frames} frames, V2 history={v2_frames} frames")
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -512,10 +549,18 @@ def create_embedded_app(
         if state.ob_buffer:
             ob_stats = state.ob_buffer.get_stats()
 
-        v1_snapshot = state.get_v1_snapshot()
-        v2_snapshot = state.get_v2_snapshot()
-        v1_history_frames = state.v1_history.frame_count() if state.v1_history else 0
-        v2_history_frames = state.v2_history.frame_count() if state.v2_history else 0
+        symbols_status = {}
+        for sym in sorted(VALID_SYMBOLS):
+            v1_snap = state.get_v1_snapshot(sym)
+            v2_snap = state.get_v2_snapshot(sym)
+            symbols_status[sym] = {
+                "v1_available": v1_snap is not None,
+                "v1_ts": v1_snap.get('ts', 0) if v1_snap else 0,
+                "v2_available": v2_snap is not None,
+                "v2_ts": v2_snap.get('ts', 0) if v2_snap else 0,
+                "v1_history_frames": state.v1_histories[sym].frame_count(),
+                "v2_history_frames": state.v2_histories[sym].frame_count(),
+            }
 
         return {
             "ok": True,
@@ -527,18 +572,7 @@ def create_embedded_app(
                 "last_ts": ob_stats.get('last_ts', 0),
                 "shared": state.ob_buffer is not None
             },
-            "v1_snapshot": {
-                "available": v1_snapshot is not None,
-                "ts": v1_snapshot.get('ts', 0) if v1_snapshot else 0
-            },
-            "v2_snapshot": {
-                "available": v2_snapshot is not None,
-                "ts": v2_snapshot.get('ts', 0) if v2_snapshot else 0
-            },
-            "history": {
-                "v1_frames": v1_history_frames,
-                "v2_frames": v2_history_frames
-            }
+            "symbols": symbols_status,
         }
 
     @app.get("/oi")
@@ -550,7 +584,7 @@ def create_embedded_app(
 
         Returns per-exchange breakdown and aggregate (in base asset).
         """
-        symbol_short = _resolve_symbol(symbol.strip().upper())
+        symbol_short = _validate_symbol(symbol)
         cache_key = f"oi?symbol={symbol_short}"
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
@@ -582,25 +616,21 @@ def create_embedded_app(
     @app.get("/liq_heatmap")
     @app.get("/v1/liq_heatmap")  # backwards compat alias
     async def liq_heatmap(
-        symbol: str = Query(default="BTC", description="Symbol to query")
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)")
     ):
         """Get current V1 liquidation heatmap snapshot."""
-        cache_key = f"liq_heatmap?symbol={symbol}"
+        sym = _validate_symbol(symbol)
+
+        cache_key = f"liq_heatmap?symbol={sym}"
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
 
-        snapshot = state.get_v1_snapshot()
+        snapshot = state.get_v1_snapshot(sym)
         if not snapshot:
             raise HTTPException(
-                status_code=404,
-                detail=f"No V1 snapshot available for {symbol}. Is the viewer running?"
-            )
-
-        if snapshot.get('symbol') != symbol:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Snapshot is for {snapshot.get('symbol')}, not {symbol}"
+                status_code=503,
+                detail=f"Data for {sym} is warming up, try again shortly"
             )
 
         ts = snapshot.get('ts', 0)
@@ -616,24 +646,26 @@ def create_embedded_app(
     @app.get("/liq_heatmap_history")
     @app.get("/v1/liq_heatmap_history")  # backwards compat alias
     async def liq_heatmap_history(
-        symbol: str = Query(default="BTC", description="Symbol to query"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
     ):
         """Get historical V1 liquidation heatmap data."""
+        sym = _validate_symbol(symbol)
         minutes = max(5, min(720, minutes))
         stride = max(1, min(30, stride))
 
-        cache_key = f"liq_heatmap_history?symbol={symbol}&minutes={minutes}&stride={stride}"
+        cache_key = f"liq_heatmap_history?symbol={sym}&minutes={minutes}&stride={stride}"
         cached = cache.get(cache_key, ttl=30.0)
         if cached is not None:
             return cached
 
-        if not state.v1_history:
-            raise HTTPException(status_code=503, detail="V1 history not available")
+        v1_hist = state.get_v1_history(sym)
+        if not v1_hist:
+            raise HTTPException(status_code=503, detail=f"V1 history not available for {sym}")
 
-        current = state.get_v1_snapshot()
-        frames = state.v1_history.get_frames(minutes=minutes, stride=stride)
+        current = state.get_v1_snapshot(sym)
+        frames = v1_hist.get_frames(minutes=minutes, stride=stride)
 
         if not frames:
             if current:
@@ -648,7 +680,7 @@ def create_embedded_app(
                     p += step
             else:
                 step = DEFAULT_STEP
-                fb_min, fb_max = _get_fallback_price_range(symbol)
+                fb_min, fb_max = _get_fallback_price_range(sym)
                 prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
             response = JSONResponse(content={
@@ -668,7 +700,7 @@ def create_embedded_app(
         prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
 
         if not prices:
-            fb_min, fb_max = _get_fallback_price_range(symbol)
+            fb_min, fb_max = _get_fallback_price_range(sym)
             prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
         t_arr = []
@@ -681,7 +713,7 @@ def create_embedded_app(
             long_flat.extend(long_row)
             short_flat.extend(short_row)
 
-        print(f"[EMBEDDED_API] v1/liq_heatmap_history: frames={len(t_arr)} prices={len(prices)}")
+        print(f"[EMBEDDED_API] v1/liq_heatmap_history ({sym}): frames={len(t_arr)} prices={len(prices)}")
 
         response = JSONResponse(content={
             "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
@@ -693,26 +725,22 @@ def create_embedded_app(
     @app.get("/liq_heatmap_v2")
     @app.get("/v2/liq_heatmap")  # backwards compat alias
     async def liq_heatmap_v2(
-        symbol: str = Query(default="BTC", description="Symbol to query"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         min_notional: float = Query(default=0, description="Minimum USD notional to include")
     ):
         """Get current V2 liquidation heatmap (tape + inference)."""
-        cache_key = f"liq_heatmap_v2?symbol={symbol}&min_notional={min_notional}"
+        sym = _validate_symbol(symbol)
+
+        cache_key = f"liq_heatmap_v2?symbol={sym}&min_notional={min_notional}"
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
 
-        snapshot = state.get_v2_snapshot()
+        snapshot = state.get_v2_snapshot(sym)
         if not snapshot:
             raise HTTPException(
-                status_code=404,
-                detail=f"No V2 snapshot available for {symbol}. Is the viewer running?"
-            )
-
-        if snapshot.get('symbol') != symbol:
-            raise HTTPException(
-                status_code=404,
-                detail=f"V2 snapshot is for {snapshot.get('symbol')}, not {symbol}"
+                status_code=503,
+                detail=f"Data for {sym} is warming up, try again shortly"
             )
 
         if min_notional > 0:
@@ -739,24 +767,26 @@ def create_embedded_app(
     @app.get("/liq_heatmap_v2_history")
     @app.get("/v2/liq_heatmap_history")  # backwards compat alias
     async def liq_heatmap_history_v2(
-        symbol: str = Query(default="BTC", description="Symbol to query"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..30)")
     ):
         """Get historical V2 liquidation heatmap data."""
+        sym = _validate_symbol(symbol)
         minutes = max(5, min(720, minutes))
         stride = max(1, min(30, stride))
 
-        cache_key = f"liq_heatmap_v2_history?symbol={symbol}&minutes={minutes}&stride={stride}"
+        cache_key = f"liq_heatmap_v2_history?symbol={sym}&minutes={minutes}&stride={stride}"
         cached = cache.get(cache_key, ttl=30.0)
         if cached is not None:
             return cached
 
-        if not state.v2_history:
-            raise HTTPException(status_code=503, detail="V2 history not available")
+        v2_hist = state.get_v2_history(sym)
+        if not v2_hist:
+            raise HTTPException(status_code=503, detail=f"V2 history not available for {sym}")
 
-        current = state.get_v2_snapshot()
-        frames = state.v2_history.get_frames(minutes=minutes, stride=stride)
+        current = state.get_v2_snapshot(sym)
+        frames = v2_hist.get_frames(minutes=minutes, stride=stride)
 
         if not frames:
             if current:
@@ -771,7 +801,7 @@ def create_embedded_app(
                     p += step
             else:
                 step = DEFAULT_STEP
-                fb_min, fb_max = _get_fallback_price_range(symbol)
+                fb_min, fb_max = _get_fallback_price_range(sym)
                 prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
             response = JSONResponse(content={
@@ -791,7 +821,7 @@ def create_embedded_app(
         prices, price_min, price_max = build_unified_grid(frames, current_src, step, DEFAULT_BAND_PCT)
 
         if not prices:
-            fb_min, fb_max = _get_fallback_price_range(symbol)
+            fb_min, fb_max = _get_fallback_price_range(sym)
             prices = [float(p) for p in range(int(fb_min), int(fb_max) + int(DEFAULT_STEP), int(DEFAULT_STEP))]
 
         t_arr = []
@@ -804,7 +834,7 @@ def create_embedded_app(
             long_flat.extend(long_row)
             short_flat.extend(short_row)
 
-        print(f"[EMBEDDED_API] v2/liq_heatmap_history: frames={len(t_arr)} prices={len(prices)}")
+        print(f"[EMBEDDED_API] v2/liq_heatmap_history ({sym}): frames={len(t_arr)} prices={len(prices)}")
 
         response = JSONResponse(content={
             "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
@@ -816,24 +846,31 @@ def create_embedded_app(
     @app.get("/liq_stats")
     @app.get("/v2/liq_stats")  # backwards compat alias
     async def liq_stats_v2(
-        symbol: str = Query(default="BTC", description="Symbol to query")
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)")
     ):
         """Get V2 heatmap statistics."""
-        cache_key = f"liq_stats?symbol={symbol}"
+        sym = _validate_symbol(symbol)
+
+        cache_key = f"liq_stats?symbol={sym}"
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
 
-        snapshot = state.get_v2_snapshot()
+        snapshot = state.get_v2_snapshot(sym)
         if not snapshot:
-            raise HTTPException(status_code=404, detail="V2 heatmap not available")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Data for {sym} is warming up, try again shortly"
+            )
 
         stats = snapshot.get('stats', {})
+        stats['symbol'] = sym
         stats['snapshot_ts'] = snapshot.get('ts', 0)
         stats['snapshot_age_s'] = round(time.time() - snapshot.get('ts', 0), 1)
 
-        if state.v2_history:
-            stats['history_frames'] = state.v2_history.frame_count()
+        v2_hist = state.get_v2_history(sym)
+        if v2_hist:
+            stats['history_frames'] = v2_hist.frame_count()
 
         response = JSONResponse(content=stats)
         cache.set(cache_key, response)

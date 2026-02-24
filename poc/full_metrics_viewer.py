@@ -2413,10 +2413,7 @@ def main():
                 console.print(f"[cyan]Starting embedded API server on {args.api_host}:{args.api_port}...[/]")
                 app = create_embedded_app(
                     ob_buffer=processor.ob_heatmap_buffer,
-                    snapshot_file=LIQ_API_SNAPSHOT,
-                    snapshot_v2_file=LIQ_API_SNAPSHOT_V2,
-                    liq_heatmap_v1_file=LIQ_HEATMAP_V1_FILE,
-                    liq_heatmap_v2_file=LIQ_HEATMAP_V2_FILE,
+                    snapshot_dir=POC_DIR,
                     engine_manager=processor.engine_manager,
                     oi_poller=processor.oi_poller
                 )
