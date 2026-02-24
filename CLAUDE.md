@@ -609,7 +609,10 @@ Frontend (consumer)
 - [ ] All WebSocket streams connecting — Binance (depth, aggTrade ×3, forceOrder, markPrice ×3), Bybit (allLiquidation ×3), OKX (liquidation-orders)
 - [ ] Multi-exchange OI poller returning data for BTC, ETH, SOL (check `/oi?symbol=BTC`)
 - [ ] REST pollers returning data (ratios)
-- [ ] V2 heatmap snapshots being written to disk for all 3 symbols (`liq_api_snapshot_v2_BTC.json`, `liq_api_snapshot_v2_ETH.json`, `liq_api_snapshot_v2_SOL.json`)
+- [x] Per-symbol V2 snapshot files written for all 3 symbols (verified Feb 23 — BTC 27KB, ETH 16KB, SOL 10KB)
+- [x] ETH snapshot contains real heatmap data with non-zero intensity arrays (verified Feb 23 — 243 force orders, 51 inferences)
+- [x] Legacy BTC snapshot files still written for backwards compat (verified Feb 23)
+- [x] Per-symbol V1 snapshot files written for all 3 symbols (verified Feb 23)
 - [ ] EngineManager has registered engine (`engine_manager.get_engine("BTC")` is not None)
 - [ ] Calibrator `total_events` incrementing after forceOrder events arrive (via `self._btc().calibrator`)
 - [ ] Calibrator `self.snapshots` dict is non-empty (proves `on_minute_snapshot()` is wired)
@@ -663,7 +666,7 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 | Calibration stall fix | WORKING | WORKING | WORKING | `poc/liq_calibrator.py` L952-L954, L2796-L2807 | `_get_snapshot_for_event` returns exact minute or closest prior snapshot; avoids hard drop when exact minute missing. | No change (fix present). |
 | Callback isolation (weights update) | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L752-L754, L889-L901 | Lambda captures `_sym=sym_short`, so callback updates correct symbol heatmap. | No change (fix present). |
 | Per-symbol zone persistence files | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L120-L124, L758-L770 | `ZONE_PERSIST_FILES` wired into each heatmap's `zone_persist_file`. | No change (fix present). |
-| API snapshots (V1/V2 JSON) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1512-L1595, L1675-L1711, L1850-L1990 | ~~Writer produced single BTC snapshot files.~~ **FIXED**: Writer now produces per-symbol files (`liq_api_snapshot_{SYM}.json`, `liq_api_snapshot_v2_{SYM}.json`) via atomic writes. BTC legacy filenames still written. Readers in `embedded_api.py` still need updating to load per-symbol files (separate task). | ~~Write per-symbol snapshot files~~ **DONE**. Still need embedded_api.py to read per-symbol files. |
+| API snapshots (V1/V2 JSON) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1512-L1595, L1675-L1711, L1850-L1990 | ~~Writer produced single BTC snapshot files.~~ **FIXED** (Task 17, verified in production Feb 23): Writer produces per-symbol files with real data — BTC V2 27KB, ETH V2 16KB (243 force orders, 51 inferences, non-zero intensity arrays), SOL V2 10KB. BTC legacy filenames still written. Readers in `embedded_api.py` still need updating to load per-symbol files (Task 18). | ~~Write per-symbol snapshot files~~ **DONE** (verified). Still need embedded_api.py to read per-symbol files (Task 18). |
 | API history buffers (V1/V2 bin) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L74-L75, L2220-L2221; `poc/embedded_api.py` L398-L401, L632-L637, L755-L760 | One shared V1/V2 history buffer/file; requests for ETH/SOL return BTC-backed history because frames are not symbol-partitioned. | Use per-symbol binary history files/buffers and endpoint symbol routing. |
 | API `/liq_stats` symbol handling | WORKING | BROKEN | BROKEN | `poc/embedded_api.py` L816-L839 | `symbol` query param exists, but endpoint always returns the single cached V2 snapshot stats without symbol validation/filtering. | Validate symbol and load per-symbol stats source. |
 | API orderbook endpoints | WORKING | BROKEN | BROKEN | `poc/embedded_api.py` L875-L880, L929-L966, L1004-L1015 | Endpoint accepts `symbol` but always serves shared BTC buffer/frames; ETH/SOL are synthetic labels only. | Either reject non-BTC explicitly or implement per-symbol OB buffers. |
@@ -686,6 +689,7 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 | Dashboard multi-symbol rendering | PRESENT | Overview + exchange breakdown + connections iterate all symbols. |
 | `liq_counts` tracking | PRESENT | Per-symbol/exchange counter dict increment on routed events. |
 | `exchange_last_seen` tracking | PRESENT | Updated in `process_message` and used in connection panel. |
+| Per-symbol snapshot writes (Task 17) | VERIFIED IN PRODUCTION | Feb 23: BTC V2 27KB, ETH V2 16KB (243 force orders, 51 inferences), SOL V2 10KB. V1 + legacy files also written. |
 
 ### CLAUDE.md vs Code Mismatches
 
@@ -697,9 +701,13 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 ### Net Assessment
 
 - **BTC** remains the fully wired end-to-end reference pipeline (WS depth/trades/liquidations + minute inference + snapshots/history + API consistency).
-- **ETH/SOL** are now **substantially wired** for liquidations, OI, trades/aggression, minute inference, OI delta, and per-symbol snapshot files. Remaining gaps:
-  - `depth_band` inputs (needs per-symbol orderbook engines),
-  - binary history buffer partitioning (`liq_heatmap_v1.bin` / `liq_heatmap_v2.bin` still shared),
-  - embedded_api.py reading per-symbol snapshot files (separate task),
-  - API response partitioning for orderbook endpoints.
+- **ETH/SOL** now produce **real heatmap snapshots with meaningful data** — zones, inferences, and non-zero intensity arrays (verified in production Feb 23). The full writer pipeline is working: liquidation ingestion → calibrator → heatmap → per-symbol V1/V2 JSON snapshots.
+- **Remaining Phase 2b gaps** (with task assignments):
+  - `embedded_api.py` reading per-symbol snapshot files instead of legacy BTC files (Task 18)
+  - Binary history buffer partitioning — `liq_heatmap_v1.bin` / `liq_heatmap_v2.bin` still shared (Task 18)
+  - `/liq_stats` symbol validation — always returns BTC stats regardless of `symbol` param (Task 18)
+  - OB endpoint rejection for non-BTC symbols (Task 19)
+  - `_resolve_symbol` normalization — no `upper()` before lookup (Task 19)
+  - Per-symbol heatmap log files — tape/inference/sweep logs still shared (Task 19)
+  - `depth_band` inputs for ETH/SOL (needs per-symbol orderbook engines, deferred)
 
