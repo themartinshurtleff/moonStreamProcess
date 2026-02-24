@@ -303,7 +303,7 @@ Defined in `active_zone_manager.py`. Governs the V3 persistent zone lifecycle.
 | `CLUSTER_DISTANCE_PCT` | 0.0005 (0.05%) | Merge zones within this price distance |
 | `EXPIRATION_PRICE_DIST_PCT` | 0.02 (2%) | Only expire if price has moved 2% away |
 | `PERSIST_INTERVAL_SECONDS` | 60 | Write zones to disk every minute |
-| `DEFAULT_PERSIST_FILE` | `liq_active_zones.json` | Zone state persistence file |
+| `DEFAULT_PERSIST_FILE` | `liq_active_zones.json` | Zone state persistence file (default only — runtime uses per-symbol paths: `liq_active_zones_BTC.json`, `liq_active_zones_ETH.json`, `liq_active_zones_SOL.json` via `ZONE_PERSIST_FILES` in viewer) |
 
 Zone lifecycle: **CREATED** → **REINFORCED** (repeatable) → **SWEPT** (by price) or **EXPIRED** (by time/decay)
 
@@ -381,7 +381,7 @@ on_minute_snapshot() → stores MinuteSnapshot in self.snapshots
         - Normalized after clamping
       → adaptive percent-based bias correction
       → _save_weights() → atomic write (tmp + flush + fsync + rename)
-        → old_logs/old_log/liq_calibrator_weights.json
+        → liq_calibrator_weights_{SYM}.json (per-symbol)
       → on_weights_updated callback → engine re-reads weights
       → resets stats for next window
 ```
@@ -421,11 +421,11 @@ Clean paths are primary. Old `/vN/` paths are backwards-compatible aliases via s
 |--------|-------------|-------|--------|-------------|-----------|
 | GET | `/health` | `/v1/health` | — | In-memory state | none |
 | GET | `/oi` | — | `symbol` (BTC/ETH/SOL) | `OIPollerThread` → `OISnapshot` (in-memory) | 5s |
-| GET | `/liq_heatmap` | `/v1/liq_heatmap` | `symbol` | `liq_api_snapshot.json` (5s refresh) | 5s |
-| GET | `/liq_heatmap_history` | `/v1/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v1.bin` | 30s |
-| GET | `/liq_heatmap_v2` | `/v2/liq_heatmap` | `symbol`, `min_notional` | `liq_api_snapshot_v2.json` (5s refresh) | 5s |
-| GET | `/liq_heatmap_v2_history` | `/v2/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v2.bin` | 30s |
-| GET | `/liq_stats` | `/v2/liq_stats` | `symbol` | `liq_api_snapshot_v2.json` | 5s |
+| GET | `/liq_heatmap` | `/v1/liq_heatmap` | `symbol` | `liq_api_snapshot.json` (5s refresh). **Note:** Currently reads legacy BTC file; Task 18 will switch to per-symbol `liq_api_snapshot_{SYM}.json` | 5s |
+| GET | `/liq_heatmap_history` | `/v1/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v1.bin`. **Note:** Shared BTC-only buffer; ETH/SOL return BTC data until per-symbol binary files implemented | 30s |
+| GET | `/liq_heatmap_v2` | `/v2/liq_heatmap` | `symbol`, `min_notional` | `liq_api_snapshot_v2.json` (5s refresh). **Note:** Currently reads legacy BTC file; Task 18 will switch to per-symbol `liq_api_snapshot_v2_{SYM}.json` | 5s |
+| GET | `/liq_heatmap_v2_history` | `/v2/liq_heatmap_history` | `symbol`, `minutes` (5-720), `stride` (1-30) | `LiquidationHeatmapBuffer` ← `liq_heatmap_v2.bin`. **Note:** Shared BTC-only buffer; ETH/SOL return BTC data until per-symbol binary files implemented | 30s |
+| GET | `/liq_stats` | `/v2/liq_stats` | `symbol` | `liq_api_snapshot_v2.json`. **Note:** Currently reads legacy BTC file; Task 18 will switch to per-symbol `liq_api_snapshot_v2_{SYM}.json` | 5s |
 | GET | `/liq_zones` | `/v3/liq_zones` | `symbol`, `side`, `min_leverage`, `max_leverage`, `min_weight` | `EngineManager` → `ActiveZoneManager` (in-memory) | 5s |
 | GET | `/liq_zones_summary` | `/v3/liq_zones_summary` | `symbol` | `EngineManager` → `ActiveZoneManager` (in-memory) | 5s |
 | GET | `/liq_zones_heatmap` | `/v3/liq_heatmap` | `symbol`, `min_notional`, `min_leverage`, `max_leverage`, `min_weight` | `EngineManager` → `ActiveZoneManager` (in-memory) | 5s |
@@ -475,6 +475,7 @@ Embedded API Server (reader — daemon thread in viewer)
   │
   ├─ Shares ob_buffer by direct Python reference (no disk I/O for OB)
   ├─ Reads liq JSON snapshots every 5s (EmbeddedAPIState._cache_ttl)
+  │   NOTE: Still reads legacy BTC files only (Task 18 will add per-symbol routing)
   ├─ Receives EngineManager for V3 zone access (in-memory, no disk)
   └─ ResponseCache serves concurrent users from TTL-based cache
 
@@ -547,8 +548,8 @@ Frontend (consumer)
 - **Exchange APIs use full symbols:** `"BTCUSDT"`, `"ETHUSDT"`, `"SOLUSDT"`
 - `SYMBOL_SHORT_MAP` (ws_connectors) and `FULL_TO_SHORT` (engine_manager) must be used for conversion
 - The calibrator's `on_liquidation()` checks `event.symbol` against `self.symbol` — these MUST match or the event is silently dropped (line 720)
-- The viewer creates the calibrator with `symbol="BTC"` (line 609 of `full_metrics_viewer.py`)
-- ForceOrder events pass `'symbol': 'BTC'` (short form) — this matches correctly
+- The viewer creates per-symbol calibrators via `_create_engine_for_symbol()` with `symbol="BTC"`, `"ETH"`, `"SOL"` (short form)
+- ForceOrder events pass short-form symbol (e.g. `'BTC'`) — this matches correctly
 
 ## File and State Inventory
 
@@ -562,12 +563,13 @@ Frontend (consumer)
 | `poc/ob_recon_stats.json` | `full_metrics_viewer.py` (periodically) | Embedded API `/orderbook_heatmap_stats` | Stats show "file not found" — non-fatal |
 | `poc/liq_heatmap_v1.bin` | Embedded API `LiquidationHeatmapBuffer` | Embedded API (loaded at startup for history) | No history available — empty response, non-fatal |
 | `poc/liq_heatmap_v2.bin` | Embedded API `LiquidationHeatmapBuffer` | Embedded API (loaded at startup for history) | No history available — empty response, non-fatal |
-| `poc/old_logs/old_log/liq_calibrator_weights.json` | `LiquidationCalibrator._save_weights()` (atomic write) | `LiquidationCalibrator._load_weights()` at startup | Uses default uniform weights — non-fatal |
-| `poc/liq_calibrator_weights.json` | Calibrator (may also write here) | Calibrator | Falls back to default weights |
+| `poc/liq_calibrator_weights_{SYM}.json` | `LiquidationCalibrator._save_weights()` (atomic write, per-symbol) | `LiquidationCalibrator._load_weights()` at startup | Uses default uniform weights — non-fatal |
 | `poc/plot_feed.jsonl` | `full_metrics_viewer.py` (every minute) | `liq_plotter.py` (tail) | Plotter waits for data — non-fatal |
 | `poc/liq_debug.jsonl` | `full_metrics_viewer.py` (debug logging) | Manual inspection | No debug log — non-fatal |
-| `poc/liq_active_zones.json` | `ActiveZoneManager` (every 60s) | `ActiveZoneManager` at startup | Starts with empty zone set — non-fatal |
-| `poc/liq_calibrator.jsonl` | `LiquidationCalibrator` (event + calibration logs) | Manual inspection / audit scripts | No log — non-fatal |
+| `poc/liq_active_zones_BTC.json` | `ActiveZoneManager` (every 60s, BTC engine) | `ActiveZoneManager` at startup | Starts with empty zone set — non-fatal |
+| `poc/liq_active_zones_ETH.json` | `ActiveZoneManager` (every 60s, ETH engine) | `ActiveZoneManager` at startup | Starts with empty zone set — non-fatal |
+| `poc/liq_active_zones_SOL.json` | `ActiveZoneManager` (every 60s, SOL engine) | `ActiveZoneManager` at startup | Starts with empty zone set — non-fatal |
+| `poc/liq_calibrator_{SYM}.jsonl` | `LiquidationCalibrator` (event + calibration logs, per-symbol) | Manual inspection / audit scripts | No log — non-fatal |
 | `poc/liq_engine_debug.log` | `LiquidationStressEngine` (V1 debug output) | Manual inspection | No log — non-fatal |
 | `poc/liq_sweeps.jsonl` | `LiquidationStressEngine` (sweep events) | Manual inspection / audit scripts | No log — non-fatal |
 
@@ -597,7 +599,7 @@ Frontend (consumer)
 
 ### Remaining TODO
 
-- Snapshot files need per-symbol naming: `liq_api_snapshot_{symbol}.json`
+- ~~Snapshot files need per-symbol naming~~ **DONE** (Task 17) — writer produces `liq_api_snapshot_{SYM}.json` and `liq_api_snapshot_v2_{SYM}.json` per symbol. `embedded_api.py` still reads legacy BTC filenames (`liq_api_snapshot.json`, `liq_api_snapshot_v2.json`) — needs per-symbol file routing (Task 18)
 - Binary history files need per-symbol naming: `liq_heatmap_v1_{symbol}.bin`
 - Frame buffer snapshots must be per-symbol (not shared)
 - Hyperliquid excluded — no public liquidation WebSocket stream available
@@ -607,7 +609,7 @@ Frontend (consumer)
 - [ ] All WebSocket streams connecting — Binance (depth, aggTrade ×3, forceOrder, markPrice ×3), Bybit (allLiquidation ×3), OKX (liquidation-orders)
 - [ ] Multi-exchange OI poller returning data for BTC, ETH, SOL (check `/oi?symbol=BTC`)
 - [ ] REST pollers returning data (ratios)
-- [ ] V2 heatmap snapshots being written to disk (`liq_api_snapshot_v2.json`)
+- [ ] V2 heatmap snapshots being written to disk for all 3 symbols (`liq_api_snapshot_v2_BTC.json`, `liq_api_snapshot_v2_ETH.json`, `liq_api_snapshot_v2_SOL.json`)
 - [ ] EngineManager has registered engine (`engine_manager.get_engine("BTC")` is not None)
 - [ ] Calibrator `total_events` incrementing after forceOrder events arrive (via `self._btc().calibrator`)
 - [ ] Calibrator `self.snapshots` dict is non-empty (proves `on_minute_snapshot()` is wired)
@@ -687,8 +689,8 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 
 ### CLAUDE.md vs Code Mismatches
 
-1. CLAUDE says per-symbol engines must have independent frame buffer/state; code still uses shared V1/V2 snapshot files and shared V1/V2 history files, so ETH/SOL API paths are not independent.
-2. CLAUDE notes remaining TODO for per-symbol snapshots/history buffers; this is still true in implementation and is currently the largest parity blocker.
+1. CLAUDE says per-symbol engines must have independent frame buffer/state; the writer now produces per-symbol V1/V2 snapshot JSON files, but `embedded_api.py` still reads only the legacy BTC filenames. V1/V2 binary history files remain shared, so ETH/SOL API history paths are not independent.
+2. CLAUDE notes remaining TODO for per-symbol history buffers and embedded_api per-symbol routing; this is still true and is currently the largest parity blocker.
 3. ~~CLAUDE describes broad multi-symbol flow, but actual minute inference is BTC-only (`heatmap_v2.on_minute` only called for BTC), leaving ETH/SOL prediction updates incomplete.~~ **FIXED**: `heatmap_v2.on_minute()` now called for all 3 symbols with per-symbol OHLC, OI, and taker aggression.
 4. ~~CLAUDE describes all three symbols being tracked with per-symbol price feeds/OHLC; code does that, but ETH/SOL calibrator inputs still miss key market fields (OI delta, aggression, depth).~~ **MOSTLY FIXED**: ETH/SOL now receive real trade volume, taker aggression, and OI delta via `prev_oi_by_symbol` tracking. Still missing: `depth_band` (needs per-symbol OB).
 
