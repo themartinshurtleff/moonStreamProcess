@@ -555,9 +555,9 @@ Frontend (consumer)
 
 | File | Created By | Read By | Missing at Startup |
 |------|-----------|---------|-------------------|
-| `poc/liq_api_snapshot_{SYM}.json` | `full_metrics_viewer.py` (atomic, every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot_{SYM}.json` | `full_metrics_viewer.py` (atomic, every minute) | Embedded API after Task 18 (not yet read) | API returns 404 — normal on first run |
 | `poc/liq_api_snapshot.json` | `full_metrics_viewer.py` (BTC legacy alias, atomic) | Embedded API (every 5s) | API returns 404 — normal on first run |
-| `poc/liq_api_snapshot_v2_{SYM}.json` | `full_metrics_viewer.py` (atomic, every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot_v2_{SYM}.json` | `full_metrics_viewer.py` (atomic, every minute) | Embedded API after Task 18 (not yet read) | API returns 404 — normal on first run |
 | `poc/liq_api_snapshot_v2.json` | `full_metrics_viewer.py` (BTC legacy alias, atomic) | Embedded API (every 5s) | API returns 404 — normal on first run |
 | `poc/ob_heatmap_30s.bin` | `OrderbookAccumulator` (every 30s) | Embedded API (shared buffer, no disk read) | API returns 404 for OB endpoints — normal on first run |
 | `poc/ob_recon_stats.json` | `full_metrics_viewer.py` (periodically) | Embedded API `/orderbook_heatmap_stats` | Stats show "file not found" — non-fatal |
