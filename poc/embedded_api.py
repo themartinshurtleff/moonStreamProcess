@@ -878,12 +878,22 @@ def create_embedded_app(
 
     # =========================================================================
     # Orderbook Heatmap Endpoints (30s DoM - uses shared buffer directly)
+    # BTC-only: orderbook data is only available for BTC (other symbols lack depth streams)
     # =========================================================================
+
+    def _require_btc_orderbook(symbol: str) -> None:
+        """Reject non-BTC symbols for orderbook endpoints (BTC-only data)."""
+        sym = symbol.strip().upper().replace("USDT", "")
+        if sym != "BTC":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Orderbook data is only available for BTC. Got: '{symbol}'"
+            )
 
     @app.get("/orderbook_heatmap")
     @app.get("/v2/orderbook_heatmap_30s")  # backwards compat alias
     async def orderbook_heatmap_30s(
-        symbol: str = Query(default="BTC", description="Symbol to query"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC only)"),
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),
@@ -903,6 +913,8 @@ def create_embedded_app(
 
         Returns the most recently WRITTEN frame (never synthesized/rewritten).
         """
+        _require_btc_orderbook(symbol)
+
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -1009,7 +1021,7 @@ def create_embedded_app(
     @app.get("/orderbook_heatmap_history")
     @app.get("/v2/orderbook_heatmap_30s_history")  # backwards compat alias
     async def orderbook_heatmap_30s_history(
-        symbol: str = Query(default="BTC", description="Symbol to query"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC only)"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..60)"),
         step: float = Query(default=20.0, description="Price bucket size"),
@@ -1029,6 +1041,8 @@ def create_embedded_app(
 
         Binary format (format=bin) returns compact blob for low-latency backfill.
         """
+        _require_btc_orderbook(symbol)
+
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
                 status_code=503,
@@ -1213,14 +1227,8 @@ def create_embedded_app(
     # V3 Zone Lifecycle Endpoints (via EngineManager — live in-memory data)
     # =========================================================================
 
-    def _resolve_symbol(symbol_full: str) -> Optional[str]:
-        """Convert full symbol (e.g. 'BTCUSDT') or short symbol (e.g. 'BTC') to short form."""
-        if HAS_ENGINE_MANAGER:
-            short = FULL_TO_SHORT.get(symbol_full)
-            if short:
-                return short
-        # Already short form or direct match
-        return symbol_full
+    # _resolve_symbol removed — V3 zone endpoints now use _validate_symbol() for
+    # consistent normalization (upper-case, USDT-strip, VALID_SYMBOLS check).
 
     def _get_zone_manager(symbol_short: str):
         """Get the zone_manager for a symbol from the engine_manager."""
@@ -1253,7 +1261,7 @@ def create_embedded_app(
         if cached is not None:
             return cached
 
-        symbol_short = _resolve_symbol(symbol)
+        symbol_short = _validate_symbol(symbol)
 
         if not state.engine_manager:
             raise HTTPException(
@@ -1313,7 +1321,7 @@ def create_embedded_app(
         if cached is not None:
             return cached
 
-        symbol_short = _resolve_symbol(symbol)
+        symbol_short = _validate_symbol(symbol)
 
         if not state.engine_manager:
             raise HTTPException(
@@ -1357,7 +1365,7 @@ def create_embedded_app(
         if cached is not None:
             return cached
 
-        symbol_short = _resolve_symbol(symbol)
+        symbol_short = _validate_symbol(symbol)
 
         if not state.engine_manager:
             raise HTTPException(

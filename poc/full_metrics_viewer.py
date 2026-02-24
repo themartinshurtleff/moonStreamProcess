@@ -65,15 +65,8 @@ OB_HEATMAP_FILE = os.path.join(POC_DIR, "ob_heatmap_30s.bin")
 # Orderbook reconstructor stats file (for API diagnostics)
 OB_RECON_STATS_FILE = os.path.join(POC_DIR, "ob_recon_stats.json")
 
-# API snapshot file for terminal integration
-LIQ_API_SNAPSHOT = os.path.join(POC_DIR, "liq_api_snapshot.json")
-
-# V2 API snapshot file (tape + inference architecture)
-LIQ_API_SNAPSHOT_V2 = os.path.join(POC_DIR, "liq_api_snapshot_v2.json")
-
-# Liquidation heatmap persistence files (binary history)
-LIQ_HEATMAP_V1_FILE = os.path.join(POC_DIR, "liq_heatmap_v1.bin")
-LIQ_HEATMAP_V2_FILE = os.path.join(POC_DIR, "liq_heatmap_v2.bin")
+# Legacy snapshot constants removed (Task 19) — per-symbol files built at runtime.
+# Legacy binary history constants removed — per-symbol buffers managed by embedded_api.py.
 
 # Log rotation thresholds
 LOG_ROTATION_MAX_MB = 200
@@ -1510,9 +1503,7 @@ class FullMetricsProcessor:
                 _write_debug_log(debug_entry)
 
                 # === Per-symbol V2 snapshot compute + atomic write ===
-                # Each symbol gets its own snapshot file. BTC also keeps
-                # legacy filename for backwards compat.
-                btc_v2_snapshot = None  # saved for BTC legacy write
+                # Each symbol gets its own snapshot file.
                 v2_reference_keys = None  # for cross-symbol key validation
                 for sym_v2 in self.engine_manager.get_all_symbols():
                     try:
@@ -1576,10 +1567,8 @@ class FullMetricsProcessor:
                         sym_v2_file = os.path.join(POC_DIR, f"liq_api_snapshot_v2_{sym_v2}.json")
                         write_json_atomic(sym_v2_file, sym_v2_snap)
 
-                        # BTC backwards compat: also write legacy filename
-                        if sym_v2 == "BTC":
-                            btc_v2_snapshot = sym_v2_snap
-                            write_json_atomic(LIQ_API_SNAPSHOT_V2, sym_v2_snap)
+                        # Legacy BTC backwards-compat write removed (Task 19) —
+                        # embedded_api.py reads per-symbol files only.
 
                         # Cross-symbol key-set validation (log once on drift)
                         snap_keys = set(sym_v2_snap.keys())
@@ -1976,9 +1965,8 @@ class FullMetricsProcessor:
         sym_v1_file = os.path.join(POC_DIR, f"liq_api_snapshot_{sym_short}.json")
         write_json_atomic(sym_v1_file, snapshot)
 
-        # BTC backwards compat: also write to legacy filename
-        if sym_short == "BTC":
-            write_json_atomic(LIQ_API_SNAPSHOT, snapshot)
+        # Legacy BTC backwards-compat write removed (Task 19) —
+        # embedded_api.py reads per-symbol files only.
 
         # Cross-symbol key-set validation
         snap_keys = set(snapshot.keys())

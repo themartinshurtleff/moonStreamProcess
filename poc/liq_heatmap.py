@@ -80,12 +80,13 @@ class LiquidationHeatmap:
     ):
         self.config = config or HeatmapConfig()
 
-        # Initialize sub-engines with full logging
-        tape_log = os.path.join(log_dir, "liq_tape.jsonl") if log_dir else None
-        inference_log = os.path.join(log_dir, "liq_inference.jsonl") if log_dir else None
-        sweep_log = os.path.join(log_dir, "liq_sweeps.jsonl") if log_dir else None
-        debug_log = os.path.join(log_dir, "liq_debug.jsonl") if log_dir else None
-        zone_log = os.path.join(log_dir, "liq_zones.jsonl") if log_dir else None
+        # Initialize sub-engines with per-symbol logging
+        sym = self.config.symbol  # e.g. "BTC", "ETH", "SOL"
+        tape_log = os.path.join(log_dir, f"liq_tape_{sym}.jsonl") if log_dir else None
+        inference_log = os.path.join(log_dir, f"liq_inference_{sym}.jsonl") if log_dir else None
+        sweep_log = os.path.join(log_dir, f"liq_sweeps_{sym}.jsonl") if log_dir else None
+        debug_log = os.path.join(log_dir, f"liq_debug_{sym}.jsonl") if log_dir else None
+        zone_log = os.path.join(log_dir, f"liq_zones_{sym}.jsonl") if log_dir else None
         zone_persist = zone_persist_file or (
             os.path.join(log_dir, "liq_active_zones.json") if log_dir else None
         )
@@ -135,8 +136,8 @@ class LiquidationHeatmap:
         self.total_force_orders: int = 0
         self.total_inferences: int = 0
 
-        # V3: Cycle summary logging
-        self.cycle_log_file = os.path.join(log_dir, "liq_cycles.jsonl") if log_dir else None
+        # V3: Cycle summary logging (per-symbol)
+        self.cycle_log_file = os.path.join(log_dir, f"liq_cycles_{sym}.jsonl") if log_dir else None
         self._cycle_log_fh = None
         if self.cycle_log_file:
             try:
