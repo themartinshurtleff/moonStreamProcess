@@ -1,0 +1,86 @@
+{
+  "symbol": "SOL",
+  "saved_at": 1771913616.8137403,
+  "zone_count": 7,
+  "zones": [
+    {
+      "price": 75.9,
+      "side": "long",
+      "weight": 0.0633717340037809,
+      "created_at": 1771906413.7477524,
+      "last_reinforced_at": 1771910680.3406525,
+      "reinforcement_count": 23,
+      "source": "combined",
+      "tier_contributions": {
+        "100": 0.0044684688651002195,
+        "75": 0.002935083173996909
+      }
+    },
+    {
+      "price": 76.2,
+      "side": "long",
+      "weight": 0.05567275426514501,
+      "created_at": 1771913048.6657767,
+      "last_reinforced_at": 1771913066.8978631,
+      "reinforcement_count": 4,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 76.10000000000001,
+      "side": "long",
+      "weight": 0.06880088604860506,
+      "created_at": 1771913052.7821748,
+      "last_reinforced_at": 1771913069.3120923,
+      "reinforcement_count": 8,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 76.3,
+      "side": "long",
+      "weight": 0.061002528589651425,
+      "created_at": 1771913064.803866,
+      "last_reinforced_at": 1771913064.803866,
+      "reinforcement_count": 0,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 74.9,
+      "side": "long",
+      "weight": 0.0003715164855095884,
+      "created_at": 1771913580.0243695,
+      "last_reinforced_at": 1771913580.0243695,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.0003715164855095884
+      }
+    },
+    {
+      "price": 79.80000000000001,
+      "side": "short",
+      "weight": 0.0003370371292068526,
+      "created_at": 1771913580.0243695,
+      "last_reinforced_at": 1771913580.0243695,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.0003370371292068526
+      }
+    },
+    {
+      "price": 78.30000000000001,
+      "side": "short",
+      "weight": 0.0005991757472469378,
+      "created_at": 1771913580.0243695,
+      "last_reinforced_at": 1771913580.0243695,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.0005991757472469378
+      }
+    }
+  ]
+}
