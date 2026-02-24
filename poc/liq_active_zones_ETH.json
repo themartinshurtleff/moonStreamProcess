@@ -1,0 +1,74 @@
+{
+  "symbol": "ETH",
+  "saved_at": 1771943236.3073914,
+  "zone_count": 6,
+  "zones": [
+    {
+      "price": 1747.0,
+      "side": "long",
+      "weight": 0.05898326406958861,
+      "created_at": 1771926120.0269687,
+      "last_reinforced_at": 1771938240.01745,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.3931145935141765
+      }
+    },
+    {
+      "price": 1784.0,
+      "side": "long",
+      "weight": 0.10490334925483971,
+      "created_at": 1771926120.0269687,
+      "last_reinforced_at": 1771942740.0140028,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.6986131111537524,
+        "75": 0.0003389296054771881
+      }
+    },
+    {
+      "price": 1796.0,
+      "side": "long",
+      "weight": 0.058914541132816765,
+      "created_at": 1771926120.0269687,
+      "last_reinforced_at": 1771936740.0042868,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.39252791212385446
+      }
+    },
+    {
+      "price": 1824.0,
+      "side": "short",
+      "weight": 0.1376373923705573,
+      "created_at": 1771940499.6450055,
+      "last_reinforced_at": 1771942037.711192,
+      "reinforcement_count": 2,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1804.0,
+      "side": "long",
+      "weight": 0.1313573394011331,
+      "created_at": 1771941924.4835217,
+      "last_reinforced_at": 1771942621.20138,
+      "reinforcement_count": 3,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1821.0,
+      "side": "short",
+      "weight": 0.10813594582029601,
+      "created_at": 1771942837.2479405,
+      "last_reinforced_at": 1771943121.510464,
+      "reinforcement_count": 1,
+      "source": "tape",
+      "tier_contributions": {}
+    }
+  ]
+}
