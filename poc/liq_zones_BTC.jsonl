@@ -886,3 +886,138 @@
 {"type": "zone_expired", "ts": 1771943160.0147262, "side": "long", "price": 62680.0, "weight": 0.0087, "source": "tape", "final_weight": 0.0087, "lifespan_min": 0.3, "age_since_reinforce_min": 0.3}
 {"type": "zone_created", "ts": 1771943171.5316658, "side": "long", "price": 62700.0, "weight": 0.0025, "source": "tape"}
 {"type": "zone_expired", "ts": 1771943220.015394, "side": "long", "price": 62700.0, "weight": 0.0025, "source": "tape", "final_weight": 0.0025, "lifespan_min": 0.8, "age_since_reinforce_min": 0.8}
+{"type": "zone_created", "ts": 1771946391.4015174, "side": "short", "price": 64000.0, "weight": 0.0038, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946391.6033788, "side": "short", "price": 64000.0, "weight": 0.0039, "source": "tape", "count": 1, "weight_before": 0.0038}
+{"type": "zone_reinforced", "ts": 1771946391.6532228, "side": "short", "price": 64000.0, "weight": 0.0056, "source": "tape", "count": 2, "weight_before": 0.0039}
+{"type": "zone_created", "ts": 1771946391.945205, "side": "long", "price": 64080.0, "weight": 0.0032, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946391.946202, "side": "long", "price": 64080.0, "weight": 0.0059, "source": "tape", "count": 1, "weight_before": 0.0032}
+{"type": "zone_created", "ts": 1771946393.2531943, "side": "short", "price": 64020.0, "weight": 0.4211, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946393.3180594, "side": "short", "price": 64020.0, "weight": 0.4217, "source": "tape", "count": 1, "weight_before": 0.4211}
+{"type": "zone_reinforced", "ts": 1771946394.4220884, "side": "short", "price": 64020.0, "weight": 0.4645, "source": "tape", "count": 2, "weight_before": 0.4217}
+{"type": "zone_created", "ts": 1771946395.1385717, "side": "short", "price": 64040.0, "weight": 0.0008, "source": "tape"}
+{"type": "zone_created", "ts": 1771946395.4435863, "side": "long", "price": 64100.0, "weight": 0.0096, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946395.6516163, "side": "short", "price": 64040.0, "weight": 0.9069, "source": "tape", "count": 1, "weight_before": 0.0008}
+{"type": "zone_reinforced", "ts": 1771946396.014337, "side": "short", "price": 64040.0, "weight": 0.907, "source": "tape", "count": 2, "weight_before": 0.9069}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "short", "price": 63480.0, "weight": 0.0603, "source": "tape", "final_weight": 0.0603, "lifespan_min": 492.3, "reinforcement_count": 5}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "short", "price": 63540.0, "weight": 0.4793, "source": "tape", "final_weight": 0.4793, "lifespan_min": 487.5, "reinforcement_count": 7}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "short", "price": 63440.0, "weight": 0.3241, "source": "tape", "final_weight": 0.3241, "lifespan_min": 220.4, "reinforcement_count": 0}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "short", "price": 63100.0, "weight": 0.1806, "source": "tape", "final_weight": 0.1806, "lifespan_min": 106.4, "reinforcement_count": 2}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "short", "price": 63200.0, "weight": 0.2887, "source": "tape", "final_weight": 0.2887, "lifespan_min": 100.5, "reinforcement_count": 1}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "short", "price": 63280.0, "weight": 3.9903, "source": "tape", "final_weight": 3.9903, "lifespan_min": 99.0, "reinforcement_count": 2}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "long", "price": 64080.0, "weight": 0.0059, "source": "tape", "final_weight": 0.0059, "lifespan_min": 0.1, "reinforcement_count": 1}
+{"type": "zone_swept", "ts": 1771946400.0036104, "side": "long", "price": 64100.0, "weight": 0.0096, "source": "tape", "final_weight": 0.0096, "lifespan_min": 0.1, "reinforcement_count": 0}
+{"type": "zone_expired", "ts": 1771946400.0036104, "side": "short", "price": 64000.0, "weight": 0.0056, "source": "tape", "final_weight": 0.0056, "lifespan_min": 0.1, "age_since_reinforce_min": 0.1}
+{"type": "zone_created", "ts": 1771946408.7677355, "side": "short", "price": 64020.0, "weight": 0.0006, "source": "tape"}
+{"type": "zone_expired", "ts": 1771946460.0368457, "side": "short", "price": 64020.0, "weight": 0.0006, "source": "tape", "final_weight": 0.0006, "lifespan_min": 0.9, "age_since_reinforce_min": 0.9}
+{"type": "zone_created", "ts": 1771946511.3266888, "side": "long", "price": 63380.0, "weight": 0.0627, "source": "tape"}
+{"type": "zone_created", "ts": 1771946635.9509792, "side": "long", "price": 64140.0, "weight": 0.0103, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946635.9509792, "side": "long", "price": 64140.0, "weight": 0.0106, "source": "tape", "count": 1, "weight_before": 0.0103}
+{"type": "zone_created", "ts": 1771946636.2860405, "side": "short", "price": 63800.0, "weight": 0.0029, "source": "tape"}
+{"type": "zone_created", "ts": 1771946636.4016, "side": "short", "price": 64060.0, "weight": 0.0019, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946636.4586458, "side": "long", "price": 64140.0, "weight": 0.0341, "source": "tape", "count": 2, "weight_before": 0.0106}
+{"type": "zone_reinforced", "ts": 1771946636.4586458, "side": "long", "price": 64140.0, "weight": 0.0347, "source": "tape", "count": 3, "weight_before": 0.0341}
+{"type": "zone_created", "ts": 1771946636.4596431, "side": "long", "price": 64120.0, "weight": 0.0186, "source": "tape"}
+{"type": "zone_created", "ts": 1771946636.5098872, "side": "short", "price": 64080.0, "weight": 0.0169, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946636.83056, "side": "short", "price": 64080.0, "weight": 1.2245, "source": "tape", "count": 1, "weight_before": 0.0169}
+{"type": "zone_reinforced", "ts": 1771946636.9713206, "side": "long", "price": 64140.0, "weight": 0.0355, "source": "tape", "count": 4, "weight_before": 0.0347}
+{"type": "zone_created", "ts": 1771946636.9713206, "side": "long", "price": 64180.0, "weight": 0.0013, "source": "tape"}
+{"type": "zone_created", "ts": 1771946636.9723182, "side": "long", "price": 64160.0, "weight": 0.0013, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946636.9723182, "side": "long", "price": 64160.0, "weight": 0.0046, "source": "tape", "count": 1, "weight_before": 0.0013}
+{"type": "zone_reinforced", "ts": 1771946636.9733179, "side": "long", "price": 64180.0, "weight": 0.0028, "source": "tape", "count": 1, "weight_before": 0.0013}
+{"type": "zone_reinforced", "ts": 1771946636.9733179, "side": "long", "price": 64180.0, "weight": 0.0042, "source": "tape", "count": 2, "weight_before": 0.0028}
+{"type": "zone_reinforced", "ts": 1771946636.9733179, "side": "long", "price": 64160.0, "weight": 0.014, "source": "tape", "count": 2, "weight_before": 0.0046}
+{"type": "zone_reinforced", "ts": 1771946637.4515967, "side": "long", "price": 64180.0, "weight": 0.0047, "source": "tape", "count": 3, "weight_before": 0.0042}
+{"type": "zone_reinforced", "ts": 1771946637.4525938, "side": "long", "price": 64180.0, "weight": 0.0111, "source": "tape", "count": 4, "weight_before": 0.0047}
+{"type": "zone_reinforced", "ts": 1771946637.515743, "side": "short", "price": 64060.0, "weight": 0.0185, "source": "tape", "count": 1, "weight_before": 0.0019}
+{"type": "zone_created", "ts": 1771946637.9877205, "side": "short", "price": 63860.0, "weight": 0.0056, "source": "tape"}
+{"type": "zone_created", "ts": 1771946638.5506127, "side": "short", "price": 64100.0, "weight": 0.0026, "source": "tape"}
+{"type": "zone_swept", "ts": 1771946640.18951, "side": "long", "price": 64140.0, "weight": 0.0355, "source": "tape", "final_weight": 0.0355, "lifespan_min": 0.1, "reinforcement_count": 4}
+{"type": "zone_swept", "ts": 1771946640.18951, "side": "short", "price": 63800.0, "weight": 0.0029, "source": "tape", "final_weight": 0.0029, "lifespan_min": 0.1, "reinforcement_count": 0}
+{"type": "zone_swept", "ts": 1771946640.18951, "side": "long", "price": 64120.0, "weight": 0.0186, "source": "tape", "final_weight": 0.0186, "lifespan_min": 0.1, "reinforcement_count": 0}
+{"type": "zone_swept", "ts": 1771946640.18951, "side": "long", "price": 64180.0, "weight": 0.0111, "source": "tape", "final_weight": 0.0111, "lifespan_min": 0.1, "reinforcement_count": 4}
+{"type": "zone_swept", "ts": 1771946640.18951, "side": "long", "price": 64160.0, "weight": 0.014, "source": "tape", "final_weight": 0.014, "lifespan_min": 0.1, "reinforcement_count": 2}
+{"type": "zone_swept", "ts": 1771946640.18951, "side": "short", "price": 63860.0, "weight": 0.0056, "source": "tape", "final_weight": 0.0056, "lifespan_min": 0.0, "reinforcement_count": 0}
+{"type": "zone_expired", "ts": 1771946640.18951, "side": "short", "price": 64060.0, "weight": 0.0184, "source": "tape", "final_weight": 0.0184, "lifespan_min": 0.1, "age_since_reinforce_min": 0.0}
+{"type": "zone_expired", "ts": 1771946640.18951, "side": "short", "price": 64100.0, "weight": 0.0026, "source": "tape", "final_weight": 0.0026, "lifespan_min": 0.0, "age_since_reinforce_min": 0.0}
+{"type": "zone_created", "ts": 1771946641.9194522, "side": "short", "price": 64100.0, "weight": 0.0019, "source": "tape"}
+{"type": "zone_created", "ts": 1771946647.6238441, "side": "long", "price": 63580.0, "weight": 0.014, "source": "tape"}
+{"type": "zone_created", "ts": 1771946648.9534605, "side": "long", "price": 64200.0, "weight": 0.0141, "source": "tape"}
+{"type": "zone_created", "ts": 1771946648.9534605, "side": "long", "price": 64180.0, "weight": 0.0212, "source": "tape"}
+{"type": "zone_created", "ts": 1771946649.033349, "side": "short", "price": 64120.0, "weight": 0.1652, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946649.2046936, "side": "short", "price": 64100.0, "weight": 0.2375, "source": "tape", "count": 1, "weight_before": 0.0019}
+{"type": "zone_reinforced", "ts": 1771946649.4689803, "side": "long", "price": 64200.0, "weight": 0.0145, "source": "tape", "count": 1, "weight_before": 0.0141}
+{"type": "zone_reinforced", "ts": 1771946649.4689803, "side": "long", "price": 64200.0, "weight": 0.0484, "source": "tape", "count": 2, "weight_before": 0.0145}
+{"type": "zone_created", "ts": 1771946649.9365673, "side": "short", "price": 64140.0, "weight": 0.0509, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946654.1820943, "side": "short", "price": 64140.0, "weight": 0.0524, "source": "tape", "count": 1, "weight_before": 0.0509}
+{"type": "zone_reinforced", "ts": 1771946654.2262537, "side": "short", "price": 64120.0, "weight": 0.1935, "source": "tape", "count": 1, "weight_before": 0.1652}
+{"type": "zone_reinforced", "ts": 1771946654.4535964, "side": "long", "price": 64200.0, "weight": 0.0727, "source": "tape", "count": 3, "weight_before": 0.0484}
+{"type": "zone_created", "ts": 1771946654.954123, "side": "long", "price": 64220.0, "weight": 0.1676, "source": "tape"}
+{"type": "zone_created", "ts": 1771946655.063248, "side": "short", "price": 63880.0, "weight": 0.0082, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946655.2442153, "side": "short", "price": 64140.0, "weight": 0.2062, "source": "tape", "count": 2, "weight_before": 0.0524}
+{"type": "zone_reinforced", "ts": 1771946662.7402651, "side": "short", "price": 64140.0, "weight": 0.2111, "source": "tape", "count": 3, "weight_before": 0.2062}
+{"type": "zone_created", "ts": 1771946662.9518247, "side": "long", "price": 64260.0, "weight": 0.0006, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946662.9528253, "side": "long", "price": 64220.0, "weight": 0.1703, "source": "tape", "count": 1, "weight_before": 0.1676}
+{"type": "zone_created", "ts": 1771946662.9528253, "side": "long", "price": 64240.0, "weight": 0.036, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946662.9528253, "side": "long", "price": 64220.0, "weight": 0.1707, "source": "tape", "count": 2, "weight_before": 0.1703}
+{"type": "zone_reinforced", "ts": 1771946662.9528253, "side": "long", "price": 64220.0, "weight": 0.1716, "source": "tape", "count": 3, "weight_before": 0.1707}
+{"type": "zone_reinforced", "ts": 1771946663.2496908, "side": "short", "price": 64140.0, "weight": 0.2288, "source": "tape", "count": 4, "weight_before": 0.2111}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64220.0, "weight": 0.1765, "source": "tape", "count": 4, "weight_before": 0.1716}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64260.0, "weight": 0.0035, "source": "tape", "count": 1, "weight_before": 0.0006}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64260.0, "weight": 0.0037, "source": "tape", "count": 2, "weight_before": 0.0035}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64240.0, "weight": 0.0362, "source": "tape", "count": 1, "weight_before": 0.036}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64220.0, "weight": 0.1793, "source": "tape", "count": 5, "weight_before": 0.1765}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64220.0, "weight": 0.1795, "source": "tape", "count": 6, "weight_before": 0.1793}
+{"type": "zone_reinforced", "ts": 1771946663.4547646, "side": "long", "price": 64240.0, "weight": 0.0385, "source": "tape", "count": 2, "weight_before": 0.0362}
+{"type": "zone_reinforced", "ts": 1771946663.9533262, "side": "long", "price": 64220.0, "weight": 0.199, "source": "tape", "count": 7, "weight_before": 0.1795}
+{"type": "zone_reinforced", "ts": 1771946663.9533262, "side": "long", "price": 64220.0, "weight": 0.2, "source": "tape", "count": 8, "weight_before": 0.199}
+{"type": "zone_reinforced", "ts": 1771946665.9526823, "side": "long", "price": 64240.0, "weight": 0.0448, "source": "tape", "count": 3, "weight_before": 0.0385}
+{"type": "zone_reinforced", "ts": 1771946666.9639988, "side": "long", "price": 64240.0, "weight": 0.045, "source": "tape", "count": 4, "weight_before": 0.0448}
+{"type": "zone_created", "ts": 1771946668.2439597, "side": "short", "price": 64180.0, "weight": 0.0122, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946695.3916886, "side": "short", "price": 64120.0, "weight": 0.1943, "source": "tape", "count": 2, "weight_before": 0.1935}
+{"type": "zone_swept", "ts": 1771946700.0144923, "side": "long", "price": 64200.0, "weight": 0.0727, "source": "tape", "final_weight": 0.0727, "lifespan_min": 0.9, "reinforcement_count": 3}
+{"type": "zone_swept", "ts": 1771946700.0144923, "side": "long", "price": 64180.0, "weight": 0.0212, "source": "tape", "final_weight": 0.0212, "lifespan_min": 0.9, "reinforcement_count": 0}
+{"type": "zone_swept", "ts": 1771946700.0144923, "side": "long", "price": 64220.0, "weight": 0.2, "source": "tape", "final_weight": 0.2, "lifespan_min": 0.8, "reinforcement_count": 8}
+{"type": "zone_swept", "ts": 1771946700.0144923, "side": "short", "price": 63880.0, "weight": 0.0082, "source": "tape", "final_weight": 0.0082, "lifespan_min": 0.7, "reinforcement_count": 0}
+{"type": "zone_swept", "ts": 1771946700.0144923, "side": "long", "price": 64260.0, "weight": 0.0037, "source": "tape", "final_weight": 0.0037, "lifespan_min": 0.6, "reinforcement_count": 2}
+{"type": "zone_swept", "ts": 1771946700.0144923, "side": "long", "price": 64240.0, "weight": 0.045, "source": "tape", "final_weight": 0.045, "lifespan_min": 0.6, "reinforcement_count": 4}
+{"type": "zone_expired", "ts": 1771946700.0144923, "side": "long", "price": 63580.0, "weight": 0.0139, "source": "tape", "final_weight": 0.0139, "lifespan_min": 0.9, "age_since_reinforce_min": 0.9}
+{"type": "zone_expired", "ts": 1771946700.0144923, "side": "short", "price": 64180.0, "weight": 0.0121, "source": "tape", "final_weight": 0.0121, "lifespan_min": 0.5, "age_since_reinforce_min": 0.5}
+{"type": "zone_created", "ts": 1771946722.2914438, "side": "short", "price": 64000.0, "weight": 0.0179, "source": "tape"}
+{"type": "zone_expired", "ts": 1771946760.0169675, "side": "short", "price": 64000.0, "weight": 0.0178, "source": "tape", "final_weight": 0.0178, "lifespan_min": 0.6, "age_since_reinforce_min": 0.6}
+{"type": "zone_created", "ts": 1771946849.683787, "side": "long", "price": 63480.0, "weight": 0.0133, "source": "tape"}
+{"type": "zone_expired", "ts": 1771946880.0229092, "side": "long", "price": 63480.0, "weight": 0.0133, "source": "tape", "final_weight": 0.0133, "lifespan_min": 0.5, "age_since_reinforce_min": 0.5}
+{"type": "zone_created", "ts": 1771946978.7029536, "side": "short", "price": 64120.0, "weight": 0.0186, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946981.432732, "side": "short", "price": 64140.0, "weight": 0.4154, "source": "tape", "count": 5, "weight_before": 0.4127}
+{"type": "zone_reinforced", "ts": 1771946985.4629917, "side": "short", "price": 64140.0, "weight": 0.4161, "source": "tape", "count": 6, "weight_before": 0.4154}
+{"type": "zone_created", "ts": 1771946993.4771326, "side": "short", "price": 64180.0, "weight": 0.0109, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771946994.682996, "side": "short", "price": 64180.0, "weight": 0.0214, "source": "tape", "count": 1, "weight_before": 0.0109}
+{"type": "zone_expired", "ts": 1771947000.0080094, "side": "short", "price": 64120.0, "weight": 0.0185, "source": "tape", "final_weight": 0.0185, "lifespan_min": 0.4, "age_since_reinforce_min": 0.4}
+{"type": "zone_expired", "ts": 1771947000.0090096, "side": "short", "price": 64180.0, "weight": 0.0213, "source": "tape", "final_weight": 0.0213, "lifespan_min": 0.1, "age_since_reinforce_min": 0.1}
+{"type": "zone_created", "ts": 1771947030.9174633, "side": "short", "price": 64180.0, "weight": 0.0505, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771947132.5479262, "side": "short", "price": 64140.0, "weight": 0.4109, "source": "tape", "count": 7, "weight_before": 0.4099}
+{"type": "zone_created", "ts": 1771947141.970295, "side": "long", "price": 64260.0, "weight": 0.0013, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771947141.970295, "side": "long", "price": 64260.0, "weight": 0.0021, "source": "tape", "count": 1, "weight_before": 0.0013}
+{"type": "zone_reinforced", "ts": 1771947142.479145, "side": "long", "price": 64260.0, "weight": 0.0051, "source": "tape", "count": 2, "weight_before": 0.0021}
+{"type": "zone_reinforced", "ts": 1771947142.479145, "side": "long", "price": 64260.0, "weight": 0.0092, "source": "tape", "count": 3, "weight_before": 0.0051}
+{"type": "zone_reinforced", "ts": 1771947142.479145, "side": "long", "price": 64260.0, "weight": 0.0477, "source": "tape", "count": 4, "weight_before": 0.0092}
+{"type": "zone_reinforced", "ts": 1771947142.498301, "side": "short", "price": 64180.0, "weight": 0.1569, "source": "tape", "count": 1, "weight_before": 0.05}
+{"type": "zone_reinforced", "ts": 1771947142.6596699, "side": "short", "price": 64180.0, "weight": 0.1574, "source": "tape", "count": 2, "weight_before": 0.1569}
+{"type": "zone_created", "ts": 1771947142.6596699, "side": "short", "price": 64200.0, "weight": 0.0019, "source": "tape"}
+{"type": "zone_reinforced", "ts": 1771947143.96937, "side": "long", "price": 64260.0, "weight": 0.0493, "source": "tape", "count": 5, "weight_before": 0.0477}
+{"type": "zone_reinforced", "ts": 1771947144.089013, "side": "short", "price": 64200.0, "weight": 0.0345, "source": "tape", "count": 1, "weight_before": 0.0019}
+{"type": "zone_reinforced", "ts": 1771947144.4759457, "side": "long", "price": 64260.0, "weight": 0.0686, "source": "tape", "count": 6, "weight_before": 0.0493}
+{"type": "zone_reinforced", "ts": 1771947144.9806063, "side": "long", "price": 64260.0, "weight": 0.0688, "source": "tape", "count": 7, "weight_before": 0.0686}
+{"type": "zone_reinforced", "ts": 1771947154.4995947, "side": "short", "price": 64200.0, "weight": 0.1761, "source": "tape", "count": 2, "weight_before": 0.0345}
+{"type": "zone_reinforced", "ts": 1771947155.782017, "side": "short", "price": 64200.0, "weight": 0.184, "source": "tape", "count": 3, "weight_before": 0.1761}
+{"type": "zone_swept", "ts": 1771947180.1126192, "side": "long", "price": 64260.0, "weight": 0.0688, "source": "tape", "final_weight": 0.0688, "lifespan_min": 0.6, "reinforcement_count": 7}
+{"type": "zone_created", "ts": 1771947356.555122, "side": "long", "price": 63520.0, "weight": 0.0114, "source": "tape"}
+{"type": "zone_expired", "ts": 1771947360.0002356, "side": "long", "price": 63520.0, "weight": 0.0114, "source": "tape", "final_weight": 0.0114, "lifespan_min": 0.1, "age_since_reinforce_min": 0.1}
+{"type": "zone_created", "ts": 1771947508.4320152, "side": "long", "price": 63500.0, "weight": 0.0013, "source": "tape"}
+{"type": "zone_expired", "ts": 1771947540.0039845, "side": "long", "price": 63500.0, "weight": 0.0013, "source": "tape", "final_weight": 0.0013, "lifespan_min": 0.5, "age_since_reinforce_min": 0.5}
+{"type": "zone_created", "ts": 1771947568.8335261, "side": "long", "price": 63460.0, "weight": 0.0108, "source": "tape"}
+{"type": "zone_expired", "ts": 1771947600.0248888, "side": "long", "price": 63460.0, "weight": 0.0107, "source": "tape", "final_weight": 0.0107, "lifespan_min": 0.5, "age_since_reinforce_min": 0.5}
+{"type": "zone_created", "ts": 1771947702.7021832, "side": "long", "price": 63440.0, "weight": 0.1484, "source": "tape"}
+{"type": "zone_created", "ts": 1771947716.6483884, "side": "long", "price": 63420.0, "weight": 0.0146, "source": "tape"}
+{"type": "zone_expired", "ts": 1771947720.0151107, "side": "long", "price": 63420.0, "weight": 0.0145, "source": "tape", "final_weight": 0.0145, "lifespan_min": 0.1, "age_since_reinforce_min": 0.1}
+{"type": "zone_reinforced", "ts": 1771947720.4999077, "side": "long", "price": 63380.0, "weight": 0.058, "source": "tape", "count": 1, "weight_before": 0.0565}
+{"type": "zone_reinforced", "ts": 1771947741.566653, "side": "long", "price": 63380.0, "weight": 0.0584, "source": "tape", "count": 2, "weight_before": 0.058}
