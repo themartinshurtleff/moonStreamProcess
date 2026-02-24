@@ -110,10 +110,18 @@ class BinanceConnector:
              f"{self.BASE_WS}/btcusdt@depth@100ms",
              ("binance", "btcusdt", "perpetual", "depth"), None),
 
-            # Trades stream
+            # Trades streams (all tracked symbols)
             ("trades_btcusdt",
              f"{self.BASE_WS}/btcusdt@aggTrade",
              ("binance", "btcusdt", "perpetual", "trades"), None),
+
+            ("trades_ethusdt",
+             f"{self.BASE_WS}/ethusdt@aggTrade",
+             ("binance", "ethusdt", "perpetual", "trades"), None),
+
+            ("trades_solusdt",
+             f"{self.BASE_WS}/solusdt@aggTrade",
+             ("binance", "solusdt", "perpetual", "trades"), None),
 
             # Liquidations stream (all symbols, we filter for BTC)
             ("liquidations",

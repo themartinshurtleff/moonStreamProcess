@@ -62,7 +62,7 @@ Base URL: `wss://fstream.binance.com/ws`
 | Stream | Data | Used By |
 |--------|------|---------|
 | `btcusdt@depth@100ms` | Orderbook diffs (100ms throttle) | `OrderbookReconstructor` → `OrderbookAccumulator` → 30s OB heatmap frames |
-| `btcusdt@aggTrade` | Aggregated trades (buyer_is_maker) | `TakerAggressionAccumulator`, price tracking, volume accumulation |
+| `{sym}usdt@aggTrade` (×3) | Aggregated trades (buyer_is_maker) | Per-symbol `TakerAggressionAccumulator`, per-symbol volume tracking (`symbol_volumes`). BTC, ETH, SOL. |
 | `!forceOrder@arr` | Liquidation events (ALL symbols) | `liq_normalizer` → `EngineManager` → calibrator + heatmap |
 | `{sym}usdt@markPrice@1s` (×3) | Mark price, funding rate | Per-symbol mark price for calibrator OHLC + event-time src, funding display. BTC, ETH, SOL. |
 
@@ -189,9 +189,17 @@ steps=20.0, max_zones=5, enter_margin=0.07, exit_margin=0.05,
 ttl_minutes=10, peak_drop_threshold=0.70, min_strength_threshold=0.01
 ```
 
-### TakerAggressionAccumulator — line 672
+### TakerAggressionAccumulator (per-symbol dict)
 ```python
-history_minutes=10
+self.taker_aggression = {sym: TakerAggressionAccumulator(history_minutes=10) for sym in SYMBOL_CONFIGS}
+# Access: self.taker_aggression["BTC"], self.taker_aggression["ETH"], self.taker_aggression["SOL"]
+```
+
+### Per-symbol Volume Tracking
+```python
+self.symbol_volumes = {sym: {"buy_vol": 0.0, "sell_vol": 0.0, "buy_count": 0, "sell_count": 0} for sym in SYMBOL_CONFIGS}
+# Accumulated from aggTrade stream in _process_trades(), reset every minute in _check_minute_rollover().
+# BTC also continues to update self.state.perp_buyVol/perp_sellVol for backwards-compat dashboard.
 ```
 
 ---
@@ -573,6 +581,8 @@ Frontend (consumer)
 - **Per-symbol liquidation counters:** `self.liq_counts` is `defaultdict(lambda: defaultdict(int))` in `FullMetricsProcessor`, incremented in `_process_liquidations()` after successful `engine_manager.on_force_order(...)` routing. Tracks per-symbol per-exchange liquidation event counts for dashboard display.
 - **Exchange heartbeat tracking:** `self.exchange_last_seen` is `defaultdict(float)` updated in `process_message()` as soon as the wrapped envelope is unpacked (`exchange`, `obj_type`, etc.). Used for LIVE/STALE/DOWN connection status in dashboard.
 - **Rich dashboard multi-symbol sections (4 FPS):** terminal UI now includes (A) `MULTI-SYMBOL OVERVIEW` with BTC/ETH/SOL rows (price, liq events, calibrator stats, zone count, aggregated OI), (B) `EXCHANGE LIQ BREAKDOWN` (Binance/Bybit/OKX counts per symbol), and (C) `EXCHANGE CONNECTIONS` status line from `exchange_last_seen`. Existing BTC-specific panels remain intact and are explicitly labeled BTC.
+- ~~Per-symbol aggTrade streams~~ **DONE** — BinanceConnector subscribes to `{sym}usdt@aggTrade` for BTC, ETH, SOL. `_process_trades()` routes by symbol using `INSTRUMENT_TO_SHORT` (same mapping as markPrice). Per-symbol volume accumulated in `self.symbol_volumes[sym]`, per-symbol taker aggression in `self.taker_aggression[sym]`. BTC continues updating `self.state.perp_buyVol`/`perp_sellVol` for backwards-compat dashboard. ETH/SOL minute snapshots now receive real `perp_buy_vol`/`perp_sell_vol` from `symbol_volumes` instead of hardcoded zeros.
+- **Per-symbol volume state:** `self.symbol_volumes` dict in `FullMetricsProcessor` tracks `{buy_vol, sell_vol, buy_count, sell_count}` per symbol. Accumulated from aggTrade, reset every minute alongside OHLC reset. `self.taker_aggression` is a per-symbol dict of `TakerAggressionAccumulator` instances — NEVER shared (CLAUDE.md Rule #8).
 
 ### Remaining TODO
 
@@ -583,7 +593,7 @@ Frontend (consumer)
 
 ## Testing Checklist Before Deployment
 
-- [ ] All WebSocket streams connecting — Binance (depth, aggTrade, forceOrder, markPrice ×3), Bybit (allLiquidation ×3), OKX (liquidation-orders)
+- [ ] All WebSocket streams connecting — Binance (depth, aggTrade ×3, forceOrder, markPrice ×3), Bybit (allLiquidation ×3), OKX (liquidation-orders)
 - [ ] Multi-exchange OI poller returning data for BTC, ETH, SOL (check `/oi?symbol=BTC`)
 - [ ] REST pollers returning data (ratios)
 - [ ] V2 heatmap snapshots being written to disk (`liq_api_snapshot_v2.json`)
@@ -628,15 +638,15 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 |---|---|---|---|---|---|---|
 | Engine instantiation / registration | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L84-L112, L711-L717, L721-L804 | All 3 symbols get independent `EngineInstance`, per-symbol calibrator + heatmap + zone manager wiring. | No change for core registration. |
 | Orderbook engine creation | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L82-L84, L101-L110, L772-L790 | ETH/SOL are explicitly `has_orderbook=False`; only BTC gets reconstructor/accumulator. This is intentional MVP but not parity with BTC reference pipeline. | Add ETH/SOL orderbook engines if parity target includes OB pipeline. |
-| WS subscriptions: Binance | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L107-L135 | Binance subscribes BTC depth+trades, global forceOrder, and markPrice for BTC/ETH/SOL. ETH/SOL lack depth/trades subscriptions. | Add ETH/SOL depth+aggTrade streams if full parity required. |
+| WS subscriptions: Binance | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L107-L145 | Binance subscribes BTC depth, aggTrade for BTC/ETH/SOL, global forceOrder, and markPrice for BTC/ETH/SOL. ETH/SOL lack depth subscriptions only. | ~~Add ETH/SOL aggTrade streams~~ **DONE**. Add ETH/SOL depth streams if full parity required. |
 | WS subscriptions: Bybit | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L338-L345 | Bybit subscribes BTC orderbook/publicTrade/tickers; ETH/SOL only get liquidation streams (`allLiquidation.*`). | Add ETH/SOL Bybit orderbook/trade/ticker subs if parity required. |
 | WS subscriptions: OKX | PARTIAL | PARTIAL | PARTIAL | `poc/ws_connectors.py` L222-L230 | OKX subscribes BTC books5/trades/funding/OI, plus global liquidation-orders for all swaps. ETH/SOL lack non-liquidation streams. | Add ETH/SOL OKX books/trades/funding/OI if parity required. |
 | Depth processing model | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L971-L1009 | Depth path is BTC-centric (`self._btc().ob_reconstructor`); storage keyed by exchange only (`self.orderbooks[exchange]`), not symbol. Multi-symbol depth would collide/overwrite. | Key orderbooks/reconstructors per symbol, and route depth by instrument+symbol. |
-| Trade/taker aggression ingestion | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L1137-L1166 | `_process_trades` updates BTC-global state; no symbol parameter/route. ETH/SOL trades cannot feed symbol-specific aggression. | Route trades by symbol and maintain per-symbol vol/aggression state. |
+| Trade/taker aggression ingestion | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1148-L1205 | ~~`_process_trades` updates BTC-global state; no symbol parameter/route.~~ **FIXED**: `_process_trades(exchange, instrument, data)` routes by symbol via `INSTRUMENT_TO_SHORT`, updates per-symbol `symbol_volumes` and `taker_aggression[sym]`. BTC backwards-compat preserved. | ~~Route trades by symbol and maintain per-symbol vol/aggression state.~~ **DONE**. |
 | Liquidation normalization | WORKING | WORKING | WORKING | `poc/liq_normalizer.py` L224-L229, L269-L356, L363-L390 | Symbol extraction and side conventions work for all three exchanges/symbols; Bybit inversion fix is present (`Buy→short`, `Sell→long`). | No change for core normalization. |
 | Engine routing on liquidations | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1174-L1248; `poc/engine_manager.py` L170-L220 | Normalized events route by `event.symbol_short` into per-symbol calibrator+heatmap; liq_counts increment per symbol/exchange. | No change for routing core. |
 | Minute inference (`heatmap_v2.on_minute`) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L1392-L1400 | Only BTC heatmap receives per-minute inference updates (`self._btc().heatmap_v2.on_minute(...)`). ETH/SOL heatmaps never run minute inference from OI/aggression. | Call `heatmap_v2.on_minute` per symbol with per-symbol OHLC, OI, aggression. |
-| Snapshot feed to calibrator (`on_minute_snapshot`) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1557-L1627 | All symbols now receive minute snapshots (stall fix), but ETH/SOL snapshots are low-fidelity placeholders (`buy/sell vol=0`, `oi_change=0`, `depth_band={}`). | Build real per-symbol `perp_buy_vol`, `perp_sell_vol`, `perp_oi_change`, and `depth_band` before snapshoting ETH/SOL. |
+| Snapshot feed to calibrator (`on_minute_snapshot`) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1603-L1668 | All symbols receive minute snapshots. ~~ETH/SOL had `buy/sell vol=0`~~ **FIXED**: ETH/SOL now get real `perp_buy_vol`/`perp_sell_vol` from `symbol_volumes`. Still missing: `oi_change` (separate task), `depth_band` (needs per-symbol OB). | ~~Build real per-symbol `perp_buy_vol`, `perp_sell_vol`~~ **DONE**. Still need `perp_oi_change` and `depth_band`. |
 | Calibration stall fix | WORKING | WORKING | WORKING | `poc/liq_calibrator.py` L952-L954, L2796-L2807 | `_get_snapshot_for_event` returns exact minute or closest prior snapshot; avoids hard drop when exact minute missing. | No change (fix present). |
 | Callback isolation (weights update) | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L752-L754, L889-L901 | Lambda captures `_sym=sym_short`, so callback updates correct symbol heatmap. | No change (fix present). |
 | Per-symbol zone persistence files | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L120-L124, L758-L770 | `ZONE_PERSIST_FILES` wired into each heatmap's `zone_persist_file`. | No change (fix present). |
@@ -669,14 +679,14 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 1. CLAUDE says per-symbol engines must have independent frame buffer/state; code still uses shared V1/V2 snapshot files and shared V1/V2 history files, so ETH/SOL API paths are not independent.
 2. CLAUDE notes remaining TODO for per-symbol snapshots/history buffers; this is still true in implementation and is currently the largest parity blocker.
 3. CLAUDE describes broad multi-symbol flow, but actual minute inference is BTC-only (`heatmap_v2.on_minute` only called for BTC), leaving ETH/SOL prediction updates incomplete.
-4. CLAUDE describes all three symbols being tracked with per-symbol price feeds/OHLC; code does that, but ETH/SOL calibrator inputs still miss key market fields (OI delta, aggression, depth).
+4. ~~CLAUDE describes all three symbols being tracked with per-symbol price feeds/OHLC; code does that, but ETH/SOL calibrator inputs still miss key market fields (OI delta, aggression, depth).~~ **PARTIALLY FIXED**: ETH/SOL now receive real trade volume (aggression) via per-symbol aggTrade streams and `symbol_volumes`. Still missing: OI delta, depth band.
 
 ### Net Assessment
 
 - **BTC** remains the only fully wired end-to-end reference pipeline (WS depth/trades/liquidations + minute inference + snapshots/history + API consistency).
-- **ETH/SOL** are **partially wired** for liquidations and OI, but **not at parity** in:
-  - per-minute inference updates,
-  - market microstructure inputs (trades/depth/OI delta) into calibration context,
+- **ETH/SOL** are **partially wired** for liquidations, OI, and now trades/aggression, but **not at parity** in:
+  - per-minute inference updates (`heatmap_v2.on_minute` still BTC-only),
+  - OI delta and depth band inputs into calibration context,
   - snapshot/history persistence partitioning,
   - API response partitioning for V1/V2 and orderbook paths.
 
