@@ -347,11 +347,18 @@ MultiExchangeOIPoller (oi_poller.py) polls every 15s:
 
 ```
 full_metrics_viewer detects new minute boundary
-  → computes OHLC4 from accumulated ticks
-  → calls self._btc().calibrator.on_minute_snapshot(...)  (via EngineManager)
-  → calls self._btc().heatmap_v2.compute_snapshot()       (via EngineManager)
-  → _write_api_snapshot(snapshot)       → poc/liq_api_snapshot.json
-  → _write_api_snapshot_v2(snapshot_v2) → poc/liq_api_snapshot_v2.json
+  → for each symbol (BTC, ETH, SOL):
+    → computes per-symbol OHLC4 from accumulated ticks / markPrice stream
+    → eng.heatmap_v2.on_minute(src, high, low, oi, taker_buy, taker_sell)
+  → for each symbol: computes V2 snapshot via get_api_response() + get_heatmap()
+    → write_json_atomic(liq_api_snapshot_v2_{SYM}.json)
+    → BTC also writes to legacy liq_api_snapshot_v2.json
+  → BTC zone tracker + display zones (BTC-only dashboard)
+  → for each symbol: computes V1 snapshot via get_heatmap() + smoothing
+    → write_json_atomic(liq_api_snapshot_{SYM}.json)
+    → BTC also writes to legacy liq_api_snapshot.json
+  → for each symbol: calibrator.on_minute_snapshot(...) with per-symbol OI delta
+  → per-symbol volume + OHLC resets (AFTER all snapshot writes)
   → Embedded API cache refresh thread reads JSON every 5 seconds
     → adds frame to LiquidationHeatmapBuffer (deduplicates by minute)
     → ResponseCache serves cached responses (TTL-based per endpoint)
@@ -454,13 +461,15 @@ Cache keys include all query parameters that affect the response (e.g., `liq_zon
 ```
 full_metrics_viewer.py (writer)
   │
-  ├─ liq_api_snapshot.json      ← V1 heatmap (overwritten every minute)
-  ├─ liq_api_snapshot_v2.json   ← V2 heatmap (overwritten every minute)
-  ├─ ob_heatmap_30s.bin         ← OB frames (appended every 30s, 4KB records)
-  ├─ ob_recon_stats.json        ← OB reconstructor diagnostics
-  ├─ liq_heatmap_v1.bin         ← V1 history ring buffer (appended by embedded API)
-  ├─ liq_heatmap_v2.bin         ← V2 history ring buffer (appended by embedded API)
-  └─ plot_feed.jsonl            ← OHLC + zone data for matplotlib plotter
+  ├─ liq_api_snapshot_{SYM}.json   ← Per-symbol V1 heatmap (atomic write every minute)
+  ├─ liq_api_snapshot.json        ← BTC V1 legacy alias (atomic write, same object as _BTC)
+  ├─ liq_api_snapshot_v2_{SYM}.json ← Per-symbol V2 heatmap (atomic write every minute)
+  ├─ liq_api_snapshot_v2.json     ← BTC V2 legacy alias (atomic write, same object as _BTC)
+  ├─ ob_heatmap_30s.bin           ← OB frames (appended every 30s, 4KB records)
+  ├─ ob_recon_stats.json          ← OB reconstructor diagnostics
+  ├─ liq_heatmap_v1.bin           ← V1 history ring buffer (appended by embedded API)
+  ├─ liq_heatmap_v2.bin           ← V2 history ring buffer (appended by embedded API)
+  └─ plot_feed.jsonl              ← OHLC + zone data for matplotlib plotter (all symbols)
 
 Embedded API Server (reader — daemon thread in viewer)
   │
@@ -474,7 +483,7 @@ Frontend (consumer)
   └─ Polls API endpoints, parses JSON responses
 ```
 
-**Write format for snapshot JSON:** plain `json.dump()` to file (NOT atomic — no tmp+rename for snapshots, only calibrator weights use atomic writes).
+**Write format for snapshot JSON:** `write_json_atomic()` (tmp + flush + fsync + `os.replace`) in `full_metrics_viewer.py`. Both calibrator weights and snapshot files now use atomic writes.
 
 **Write format for binary files:** fixed 4KB records. Header (48 bytes): `ts(d) + src(d) + price_min(d) + price_max(d) + step(d) + n_buckets(I)`. Followed by 1000 bytes long intensity (u8), 1000 bytes short intensity (u8), padded to 4096.
 
@@ -527,8 +536,8 @@ Frontend (consumer)
 - **Impact:** All Bybit liquidation events had longs/shorts swapped, corrupting calibrator learning, heatmap directionality, and zone predictions for Bybit data. The inline tests also encoded the wrong expected values, masking the bug.
 - **Fix (Phase 2):** Corrected mapping to `"Buy"` → `"short"`, `"Sell"` → `"long"` — matching Binance convention exactly. Updated all inline test assertions. All 36 tests pass.
 
-### DESIGN NOTE: Snapshot JSON writes are NOT atomic
-- `_write_api_snapshot()` and `_write_api_snapshot_v2()` use plain `json.dump()` — no tmp+rename. The API reader could see partial JSON on slow I/O. Only the calibrator weight file uses atomic writes (tmp + flush + fsync + rename).
+### RESOLVED: Snapshot JSON writes are now atomic
+- `write_json_atomic()` helper uses tmp + flush + fsync + `os.replace()`. All V1/V2 snapshot files and calibrator weights now use atomic writes. Temp file is in the same directory as target to avoid cross-filesystem rename failures.
 
 ---
 
@@ -545,8 +554,10 @@ Frontend (consumer)
 
 | File | Created By | Read By | Missing at Startup |
 |------|-----------|---------|-------------------|
-| `poc/liq_api_snapshot.json` | `full_metrics_viewer.py` (every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
-| `poc/liq_api_snapshot_v2.json` | `full_metrics_viewer.py` (every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot_{SYM}.json` | `full_metrics_viewer.py` (atomic, every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot.json` | `full_metrics_viewer.py` (BTC legacy alias, atomic) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot_v2_{SYM}.json` | `full_metrics_viewer.py` (atomic, every minute) | Embedded API (every 5s) | API returns 404 — normal on first run |
+| `poc/liq_api_snapshot_v2.json` | `full_metrics_viewer.py` (BTC legacy alias, atomic) | Embedded API (every 5s) | API returns 404 — normal on first run |
 | `poc/ob_heatmap_30s.bin` | `OrderbookAccumulator` (every 30s) | Embedded API (shared buffer, no disk read) | API returns 404 for OB endpoints — normal on first run |
 | `poc/ob_recon_stats.json` | `full_metrics_viewer.py` (periodically) | Embedded API `/orderbook_heatmap_stats` | Stats show "file not found" — non-fatal |
 | `poc/liq_heatmap_v1.bin` | Embedded API `LiquidationHeatmapBuffer` | Embedded API (loaded at startup for history) | No history available — empty response, non-fatal |
@@ -645,12 +656,12 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 | Trade/taker aggression ingestion | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1148-L1205 | ~~`_process_trades` updates BTC-global state; no symbol parameter/route.~~ **FIXED**: `_process_trades(exchange, instrument, data)` routes by symbol via `INSTRUMENT_TO_SHORT`, updates per-symbol `symbol_volumes` and `taker_aggression[sym]`. BTC backwards-compat preserved. | ~~Route trades by symbol and maintain per-symbol vol/aggression state.~~ **DONE**. |
 | Liquidation normalization | WORKING | WORKING | WORKING | `poc/liq_normalizer.py` L224-L229, L269-L356, L363-L390 | Symbol extraction and side conventions work for all three exchanges/symbols; Bybit inversion fix is present (`Buy→short`, `Sell→long`). | No change for core normalization. |
 | Engine routing on liquidations | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1174-L1248; `poc/engine_manager.py` L170-L220 | Normalized events route by `event.symbol_short` into per-symbol calibrator+heatmap; liq_counts increment per symbol/exchange. | No change for routing core. |
-| Minute inference (`heatmap_v2.on_minute`) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L1392-L1400 | Only BTC heatmap receives per-minute inference updates (`self._btc().heatmap_v2.on_minute(...)`). ETH/SOL heatmaps never run minute inference from OI/aggression. | Call `heatmap_v2.on_minute` per symbol with per-symbol OHLC, OI, aggression. |
-| Snapshot feed to calibrator (`on_minute_snapshot`) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1603-L1668 | All symbols receive minute snapshots. ~~ETH/SOL had `buy/sell vol=0`~~ **FIXED**: ETH/SOL now get real `perp_buy_vol`/`perp_sell_vol` from `symbol_volumes`. Still missing: `oi_change` (separate task), `depth_band` (needs per-symbol OB). | ~~Build real per-symbol `perp_buy_vol`, `perp_sell_vol`~~ **DONE**. Still need `perp_oi_change` and `depth_band`. |
+| Minute inference (`heatmap_v2.on_minute`) | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1437-L1489 | ~~Only BTC heatmap received per-minute inference updates.~~ **FIXED**: Per-symbol loop calls `eng.heatmap_v2.on_minute()` for all 3 symbols with per-symbol OHLC, OI from `oi_by_symbol`, and taker aggression from per-symbol accumulator. | ~~Call `heatmap_v2.on_minute` per symbol.~~ **DONE**. |
+| Snapshot feed to calibrator (`on_minute_snapshot`) | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L1720-L1803 | All symbols receive minute snapshots with real data. ~~ETH/SOL had `buy/sell vol=0` and `oi_change=0`~~ **FIXED**: ETH/SOL get real `perp_buy_vol`/`perp_sell_vol` from `symbol_volumes` and real `perp_oi_change` from `prev_oi_by_symbol` delta tracking. Still missing: `depth_band` (needs per-symbol OB). | ~~Build real per-symbol volumes and OI delta.~~ **DONE**. Still need `depth_band`. |
 | Calibration stall fix | WORKING | WORKING | WORKING | `poc/liq_calibrator.py` L952-L954, L2796-L2807 | `_get_snapshot_for_event` returns exact minute or closest prior snapshot; avoids hard drop when exact minute missing. | No change (fix present). |
 | Callback isolation (weights update) | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L752-L754, L889-L901 | Lambda captures `_sym=sym_short`, so callback updates correct symbol heatmap. | No change (fix present). |
 | Per-symbol zone persistence files | WORKING | WORKING | WORKING | `poc/full_metrics_viewer.py` L120-L124, L758-L770 | `ZONE_PERSIST_FILES` wired into each heatmap's `zone_persist_file`. | No change (fix present). |
-| API snapshots (V1/V2 JSON) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L170-L183, L1425-L1471, L1667-L1792; `poc/embedded_api.py` L593-L605, L705-L716 | Writer produces single BTC snapshot files; readers enforce snapshot `symbol` match and return 404 for ETH/SOL. | Write per-symbol snapshot files and load by requested symbol in API state. |
+| API snapshots (V1/V2 JSON) | WORKING | PARTIAL | PARTIAL | `poc/full_metrics_viewer.py` L1512-L1595, L1675-L1711, L1850-L1990 | ~~Writer produced single BTC snapshot files.~~ **FIXED**: Writer now produces per-symbol files (`liq_api_snapshot_{SYM}.json`, `liq_api_snapshot_v2_{SYM}.json`) via atomic writes. BTC legacy filenames still written. Readers in `embedded_api.py` still need updating to load per-symbol files (separate task). | ~~Write per-symbol snapshot files~~ **DONE**. Still need embedded_api.py to read per-symbol files. |
 | API history buffers (V1/V2 bin) | WORKING | BROKEN | BROKEN | `poc/full_metrics_viewer.py` L74-L75, L2220-L2221; `poc/embedded_api.py` L398-L401, L632-L637, L755-L760 | One shared V1/V2 history buffer/file; requests for ETH/SOL return BTC-backed history because frames are not symbol-partitioned. | Use per-symbol binary history files/buffers and endpoint symbol routing. |
 | API `/liq_stats` symbol handling | WORKING | BROKEN | BROKEN | `poc/embedded_api.py` L816-L839 | `symbol` query param exists, but endpoint always returns the single cached V2 snapshot stats without symbol validation/filtering. | Validate symbol and load per-symbol stats source. |
 | API orderbook endpoints | WORKING | BROKEN | BROKEN | `poc/embedded_api.py` L875-L880, L929-L966, L1004-L1015 | Endpoint accepts `symbol` but always serves shared BTC buffer/frames; ETH/SOL are synthetic labels only. | Either reject non-BTC explicitly or implement per-symbol OB buffers. |
@@ -678,15 +689,15 @@ This is a code-vs-spec parity audit across BTC/ETH/SOL for the full backend pipe
 
 1. CLAUDE says per-symbol engines must have independent frame buffer/state; code still uses shared V1/V2 snapshot files and shared V1/V2 history files, so ETH/SOL API paths are not independent.
 2. CLAUDE notes remaining TODO for per-symbol snapshots/history buffers; this is still true in implementation and is currently the largest parity blocker.
-3. CLAUDE describes broad multi-symbol flow, but actual minute inference is BTC-only (`heatmap_v2.on_minute` only called for BTC), leaving ETH/SOL prediction updates incomplete.
-4. ~~CLAUDE describes all three symbols being tracked with per-symbol price feeds/OHLC; code does that, but ETH/SOL calibrator inputs still miss key market fields (OI delta, aggression, depth).~~ **PARTIALLY FIXED**: ETH/SOL now receive real trade volume (aggression) via per-symbol aggTrade streams and `symbol_volumes`. Still missing: OI delta, depth band.
+3. ~~CLAUDE describes broad multi-symbol flow, but actual minute inference is BTC-only (`heatmap_v2.on_minute` only called for BTC), leaving ETH/SOL prediction updates incomplete.~~ **FIXED**: `heatmap_v2.on_minute()` now called for all 3 symbols with per-symbol OHLC, OI, and taker aggression.
+4. ~~CLAUDE describes all three symbols being tracked with per-symbol price feeds/OHLC; code does that, but ETH/SOL calibrator inputs still miss key market fields (OI delta, aggression, depth).~~ **MOSTLY FIXED**: ETH/SOL now receive real trade volume, taker aggression, and OI delta via `prev_oi_by_symbol` tracking. Still missing: `depth_band` (needs per-symbol OB).
 
 ### Net Assessment
 
-- **BTC** remains the only fully wired end-to-end reference pipeline (WS depth/trades/liquidations + minute inference + snapshots/history + API consistency).
-- **ETH/SOL** are **partially wired** for liquidations, OI, and now trades/aggression, but **not at parity** in:
-  - per-minute inference updates (`heatmap_v2.on_minute` still BTC-only),
-  - OI delta and depth band inputs into calibration context,
-  - snapshot/history persistence partitioning,
-  - API response partitioning for V1/V2 and orderbook paths.
+- **BTC** remains the fully wired end-to-end reference pipeline (WS depth/trades/liquidations + minute inference + snapshots/history + API consistency).
+- **ETH/SOL** are now **substantially wired** for liquidations, OI, trades/aggression, minute inference, OI delta, and per-symbol snapshot files. Remaining gaps:
+  - `depth_band` inputs (needs per-symbol orderbook engines),
+  - binary history buffer partitioning (`liq_heatmap_v1.bin` / `liq_heatmap_v2.bin` still shared),
+  - embedded_api.py reading per-symbol snapshot files (separate task),
+  - API response partitioning for orderbook endpoints.
 
