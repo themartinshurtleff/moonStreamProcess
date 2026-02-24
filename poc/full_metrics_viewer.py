@@ -7,6 +7,7 @@ Displays ALL metrics that the moonStreamProcess library computes.
 import argparse
 import asyncio
 import json
+import math
 import time
 import sys
 import os
@@ -167,22 +168,25 @@ def _write_plot_feed(entry: dict):
         pass  # Don't crash on write failures
 
 
-def _write_api_snapshot(snapshot: dict):
-    """Write API snapshot for terminal integration (overwrites each time)."""
-    try:
-        with open(LIQ_API_SNAPSHOT, "w") as f:
-            json.dump(snapshot, f)
-    except Exception:
-        pass  # Don't crash on write failures
+def write_json_atomic(filepath: str, data: dict):
+    """Atomically write JSON data to filepath using tmp+flush+fsync+rename.
 
-
-def _write_api_snapshot_v2(snapshot: dict):
-    """Write V2 API snapshot (tape + inference architecture)."""
+    Temp file is placed in the same directory as target to avoid
+    cross-filesystem rename failures.
+    """
+    tmp_path = f"{filepath}.tmp"
     try:
-        with open(LIQ_API_SNAPSHOT_V2, "w") as f:
-            json.dump(snapshot, f)
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
     except Exception:
-        pass  # Don't crash on write failures
+        # Clean up temp file on failure, don't crash
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 # =============================================================================
@@ -672,6 +676,12 @@ class FullMetricsProcessor:
         )
         # Per-symbol OI state for API exposure
         self.oi_by_symbol: Dict[str, Dict] = {}
+
+        # Previous OI per symbol for delta computation in minute rollover.
+        # Initialized to None (NOT 0.0) to avoid a fake spike on first value.
+        self.prev_oi_by_symbol: Dict[str, Optional[float]] = {
+            sym: None for sym in SYMBOL_CONFIGS
+        }
 
         # Per-symbol, per-exchange liquidation event counters
         self.liq_counts = defaultdict(lambda: defaultdict(int))
@@ -1424,17 +1434,61 @@ class FullMetricsProcessor:
                 total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
                 buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
 
-                self._btc().heatmap_v2.on_minute(
-                    minute_key=v2_minute_key,
-                    src_price=v2_src,
-                    high=self.state.perp_high,
-                    low=self.state.perp_low,
-                    oi=self.state.perp_total_oi,
-                    taker_buy_notional_usd=taker_buy_notional_usd,
-                    taker_sell_notional_usd=taker_sell_notional_usd
-                )
+                # === Per-symbol heatmap_v2.on_minute() ===
+                # Each symbol's heatmap needs per-minute market data for
+                # tape decay/sweep and inference projections.
+                for sym_on in self.engine_manager.get_all_symbols():
+                    try:
+                        eng_on = self.engine_manager.get_engine(sym_on)
+                        if eng_on is None:
+                            continue
 
-                # Log aggression diagnostics with full unit verification
+                        # Compute per-symbol OHLC4 and price bounds
+                        if sym_on == "BTC":
+                            sym_on_src = v2_src
+                            sym_on_high = self.state.perp_high
+                            sym_on_low = self.state.perp_low
+                        else:
+                            sp = self.symbol_prices.get(sym_on, {})
+                            o_s, h_s, l_s, c_s = (
+                                sp.get("open", 0.0), sp.get("high", 0.0),
+                                sp.get("low", 0.0), sp.get("close", 0.0),
+                            )
+                            sym_on_src = (o_s + h_s + l_s + c_s) / 4 if c_s > 0 else 0.0
+                            sym_on_high = h_s
+                            sym_on_low = l_s
+
+                        if sym_on_src <= 0:
+                            continue  # no price data yet for this symbol
+
+                        # Per-symbol OI from multi-exchange poller
+                        sym_on_oi_data = self.oi_by_symbol.get(sym_on, {})
+                        sym_on_oi = sym_on_oi_data.get("aggregated_oi", 0.0) or 0.0
+
+                        # Per-symbol taker aggression
+                        sym_prev_agg = self.taker_aggression[sym_on].get_previous_minute_data()
+                        if sym_prev_agg is not None and sym_prev_agg.trade_count > 0:
+                            sym_on_buy = sym_prev_agg.taker_buy_notional
+                            sym_on_sell = sym_prev_agg.taker_sell_notional
+                        else:
+                            # Fallback: convert base volume to USD notional
+                            sv = self.symbol_volumes.get(sym_on, {})
+                            sym_on_buy = sv.get("buy_vol", 0.0) * sym_on_src
+                            sym_on_sell = sv.get("sell_vol", 0.0) * sym_on_src
+
+                        eng_on.heatmap_v2.on_minute(
+                            minute_key=v2_minute_key,
+                            src_price=sym_on_src,
+                            high=sym_on_high,
+                            low=sym_on_low,
+                            oi=sym_on_oi,
+                            taker_buy_notional_usd=sym_on_buy,
+                            taker_sell_notional_usd=sym_on_sell,
+                        )
+                    except Exception as e:
+                        logger.error(f"on_minute failed for {sym_on}: {e}", exc_info=True)
+
+                # Log BTC aggression diagnostics with full unit verification
                 agg_history = self.taker_aggression["BTC"].get_last_n_minutes(5)
                 debug_entry = {
                     "type": "aggression_minute",
@@ -1455,55 +1509,90 @@ class FullMetricsProcessor:
                     debug_entry["perp_sellVol_btc"] = round(perp_sellVol_btc, 6)
                 _write_debug_log(debug_entry)
 
-                # Write V2 API snapshot (clustered pools with notional values)
-                # Use lower min_notional for snapshot so UI can filter
-                v2_snapshot = self._btc().heatmap_v2.get_api_response(
-                    price_center=v2_src,
-                    price_range_pct=0.10,      # ±10% range for more visibility
-                    min_notional_usd=1000.0    # Low threshold, UI can filter
-                )
-                v2_snapshot['stats'] = self._btc().heatmap_v2.get_stats()
+                # === Per-symbol V2 snapshot compute + atomic write ===
+                # Each symbol gets its own snapshot file. BTC also keeps
+                # legacy filename for backwards compat.
+                btc_v2_snapshot = None  # saved for BTC legacy write
+                v2_reference_keys = None  # for cross-symbol key validation
+                for sym_v2 in self.engine_manager.get_all_symbols():
+                    try:
+                        eng_v2 = self.engine_manager.get_engine(sym_v2)
+                        if eng_v2 is None:
+                            continue
 
-                # Add intensity arrays for history buffer (same format as V1)
-                # Build price grid and map pools to intensity arrays
-                v2_steps = self._btc().heatmap_v2.config.steps
-                band_pct = 0.10
-                price_min = round((v2_src * (1 - band_pct)) / v2_steps) * v2_steps
-                price_max = round((v2_src * (1 + band_pct)) / v2_steps) * v2_steps
-                v2_prices = []
-                p = price_min
-                while p <= price_max:
-                    v2_prices.append(p)
-                    p += v2_steps
+                        # Per-symbol price for snapshot
+                        if sym_v2 == "BTC":
+                            sym_v2_src = v2_src
+                        else:
+                            sp2 = self.symbol_prices.get(sym_v2, {})
+                            c2 = sp2.get("close", 0.0)
+                            sym_v2_src = (sp2.get("open", 0.0) + sp2.get("high", 0.0) +
+                                          sp2.get("low", 0.0) + c2) / 4 if c2 > 0 else 0.0
+                        if sym_v2_src <= 0:
+                            continue
 
-                # Get raw heatmap data for intensity arrays
-                v2_heatmap = self._btc().heatmap_v2.get_heatmap()
-                v2_all_longs = v2_heatmap.get("long", {})
-                v2_all_shorts = v2_heatmap.get("short", {})
+                        sym_v2_snap = eng_v2.heatmap_v2.get_api_response(
+                            price_center=sym_v2_src,
+                            price_range_pct=0.10,
+                            min_notional_usd=1000.0,
+                        )
+                        sym_v2_snap['stats'] = eng_v2.heatmap_v2.get_stats()
 
-                # Build intensity arrays (raw notional USD values)
-                v2_long_intensity = [v2_all_longs.get(price, 0.0) for price in v2_prices]
-                v2_short_intensity = [v2_all_shorts.get(price, 0.0) for price in v2_prices]
+                        # Build intensity arrays for history buffer
+                        sym_v2_steps = eng_v2.heatmap_v2.config.steps
+                        band_pct = 0.10
+                        sym_price_min = round((sym_v2_src * (1 - band_pct)) / sym_v2_steps) * sym_v2_steps
+                        sym_price_max = round((sym_v2_src * (1 + band_pct)) / sym_v2_steps) * sym_v2_steps
+                        sym_v2_prices = []
+                        pr = sym_price_min
+                        while pr <= sym_price_max:
+                            sym_v2_prices.append(pr)
+                            pr += sym_v2_steps
 
-                # Calculate BTC sizes: btc = usd / price
-                v2_long_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(v2_long_intensity, v2_prices)]
-                v2_short_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(v2_short_intensity, v2_prices)]
+                        sym_v2_hm = eng_v2.heatmap_v2.get_heatmap()
+                        sym_v2_longs = sym_v2_hm.get("long", {})
+                        sym_v2_shorts = sym_v2_hm.get("short", {})
+                        sym_v2_li = [sym_v2_longs.get(pp, 0.0) for pp in sym_v2_prices]
+                        sym_v2_si = [sym_v2_shorts.get(pp, 0.0) for pp in sym_v2_prices]
+                        sym_v2_lb = [round(u / pp, 6) if pp > 0 else 0.0
+                                     for u, pp in zip(sym_v2_li, sym_v2_prices)]
+                        sym_v2_sb = [round(u / pp, 6) if pp > 0 else 0.0
+                                     for u, pp in zip(sym_v2_si, sym_v2_prices)]
 
-                # Add to snapshot for history buffer
-                v2_snapshot['ts'] = time.time()
-                v2_snapshot['src'] = v2_src
-                v2_snapshot['step'] = v2_steps
-                v2_snapshot['price_min'] = price_min
-                v2_snapshot['price_max'] = price_max
-                v2_snapshot['prices'] = v2_prices
-                v2_snapshot['long_intensity'] = v2_long_intensity
-                v2_snapshot['short_intensity'] = v2_short_intensity
-                v2_snapshot['long_notional_usd'] = [round(v, 2) for v in v2_long_intensity]
-                v2_snapshot['short_notional_usd'] = [round(v, 2) for v in v2_short_intensity]
-                v2_snapshot['long_size_btc'] = v2_long_size_btc
-                v2_snapshot['short_size_btc'] = v2_short_size_btc
+                        sym_v2_snap['ts'] = time.time()
+                        sym_v2_snap['src'] = sym_v2_src
+                        sym_v2_snap['step'] = sym_v2_steps
+                        sym_v2_snap['price_min'] = sym_price_min
+                        sym_v2_snap['price_max'] = sym_price_max
+                        sym_v2_snap['prices'] = sym_v2_prices
+                        sym_v2_snap['long_intensity'] = sym_v2_li
+                        sym_v2_snap['short_intensity'] = sym_v2_si
+                        sym_v2_snap['long_notional_usd'] = [round(v, 2) for v in sym_v2_li]
+                        sym_v2_snap['short_notional_usd'] = [round(v, 2) for v in sym_v2_si]
+                        sym_v2_snap['long_size_btc'] = sym_v2_lb
+                        sym_v2_snap['short_size_btc'] = sym_v2_sb
 
-                _write_api_snapshot_v2(v2_snapshot)
+                        # Atomic write to per-symbol file
+                        sym_v2_file = os.path.join(POC_DIR, f"liq_api_snapshot_v2_{sym_v2}.json")
+                        write_json_atomic(sym_v2_file, sym_v2_snap)
+
+                        # BTC backwards compat: also write legacy filename
+                        if sym_v2 == "BTC":
+                            btc_v2_snapshot = sym_v2_snap
+                            write_json_atomic(LIQ_API_SNAPSHOT_V2, sym_v2_snap)
+
+                        # Cross-symbol key-set validation (log once on drift)
+                        snap_keys = set(sym_v2_snap.keys())
+                        if v2_reference_keys is None:
+                            v2_reference_keys = snap_keys
+                        elif snap_keys != v2_reference_keys:
+                            logger.warning(
+                                f"V2 snapshot key drift: {sym_v2} keys differ from reference. "
+                                f"missing={v2_reference_keys - snap_keys}, "
+                                f"extra={snap_keys - v2_reference_keys}"
+                            )
+                    except Exception as e:
+                        logger.error(f"V2 snapshot failed for {sym_v2}: {e}", exc_info=True)
 
                 # Apply persisted weights from calibrator on first update (all symbols)
                 for sym_short in self.engine_manager.get_all_symbols():
@@ -1572,6 +1661,7 @@ class FullMetricsProcessor:
                 short_zones_with_age.sort(key=lambda x: x[1], reverse=True)
 
                 _write_plot_feed({
+                    "symbol": "BTC",
                     "ts": time.time(),
                     "minute": current_minute_ts,
                     "o": round(self.state.perp_open, 2),
@@ -1582,12 +1672,43 @@ class FullMetricsProcessor:
                     "short_zones": [(round(p, 2), round(s, 4), a) for p, s, a in short_zones_with_age[:5]]
                 })
 
-                # Write API snapshot for terminal integration
-                self._write_api_heatmap_snapshot(
-                    current_minute_ts,
-                    long_zones_with_age,
-                    short_zones_with_age
-                )
+                # Write ETH/SOL plot feed entries (same file, with symbol field)
+                for sym_pf in self.engine_manager.get_all_symbols():
+                    if sym_pf == "BTC":
+                        continue  # already written above
+                    try:
+                        sp_pf = self.symbol_prices.get(sym_pf, {})
+                        pf_c = sp_pf.get("close", 0.0)
+                        if pf_c <= 0:
+                            continue
+                        _write_plot_feed({
+                            "symbol": sym_pf,
+                            "ts": time.time(),
+                            "minute": current_minute_ts,
+                            "o": round(sp_pf.get("open", 0.0), 4),
+                            "h": round(sp_pf.get("high", 0.0), 4),
+                            "l": round(sp_pf.get("low", 0.0), 4),
+                            "c": round(pf_c, 4),
+                            "long_zones": [],
+                            "short_zones": [],
+                        })
+                    except Exception as e:
+                        logger.error(f"Plot feed failed for {sym_pf}: {e}", exc_info=True)
+
+                # === Per-symbol V1 snapshot compute + atomic write ===
+                # BTC uses ZoneTracker-stabilized zones; ETH/SOL get empty
+                # zone lists (no zone tracker) but identical key schema.
+                v1_reference_keys = None
+                for sym_v1 in self.engine_manager.get_all_symbols():
+                    try:
+                        self._write_per_symbol_v1_snapshot(
+                            sym_v1, current_minute_ts,
+                            long_zones_with_age if sym_v1 == "BTC" else [],
+                            short_zones_with_age if sym_v1 == "BTC" else [],
+                            v1_reference_keys,
+                        )
+                    except Exception as e:
+                        logger.error(f"V1 snapshot failed for {sym_v1}: {e}", exc_info=True)
 
                 # Send snapshot to ALL symbol calibrators for learning.
                 # Each symbol's calibrator MUST receive on_minute_snapshot() every
@@ -1615,6 +1736,24 @@ class FullMetricsProcessor:
                         # Per-symbol volume from aggTrade stream
                         sym_vols = self.symbol_volumes.get(sym_short, {})
 
+                        # Per-symbol OI delta (change since last rollover).
+                        # prev_oi_by_symbol starts as None to avoid fake spike.
+                        sym_oi_data = self.oi_by_symbol.get(sym_short, {})
+                        current_oi = sym_oi_data.get("aggregated_oi", None)
+                        prev_oi = self.prev_oi_by_symbol.get(sym_short)
+                        if (current_oi is not None and prev_oi is not None
+                                and not math.isnan(current_oi) and not math.isinf(current_oi)
+                                and not math.isnan(prev_oi) and not math.isinf(prev_oi)):
+                            sym_oi_change = current_oi - prev_oi
+                        else:
+                            sym_oi_change = 0.0
+                        # Update prev_oi for next minute (only if valid)
+                        if current_oi is not None and not math.isnan(current_oi) and not math.isinf(current_oi):
+                            self.prev_oi_by_symbol[sym_short] = current_oi
+                        # BTC backwards compat
+                        if sym_short == "BTC":
+                            self.state.perp_oi_change = sym_oi_change
+
                         if sym_short == "BTC":
                             # BTC: primary price from orderbook mid (perp_*),
                             # backed by markPrice stream in symbol_prices
@@ -1624,7 +1763,6 @@ class FullMetricsProcessor:
                             sym_close = self.state.perp_close
                             sym_buy_vol = sym_vols.get("buy_vol", 0.0)
                             sym_sell_vol = sym_vols.get("sell_vol", 0.0)
-                            sym_oi_change = self.state.perp_oi_change
                             sym_depth = self._build_depth_band(btc_src, v2_cfg.steps)
                         else:
                             # ETH/SOL: OHLC from Binance markPrice@1s stream,
@@ -1640,7 +1778,6 @@ class FullMetricsProcessor:
                             sym_close = c
                             sym_buy_vol = sym_vols.get("buy_vol", 0.0)
                             sym_sell_vol = sym_vols.get("sell_vol", 0.0)
-                            sym_oi_change = 0.0
                             sym_depth = {}
 
                         self.engine_manager.on_minute_snapshot(
@@ -1710,52 +1847,57 @@ class FullMetricsProcessor:
 
             self.current_minute = current_minute
 
-    def _write_api_heatmap_snapshot(
+    def _write_per_symbol_v1_snapshot(
         self,
+        sym_short: str,
         current_minute: int,
         long_zones_with_age: list,
-        short_zones_with_age: list
+        short_zones_with_age: list,
+        reference_keys: Optional[set] = None,
     ):
-        """Write comprehensive heatmap snapshot for API consumption (using V2)."""
-        src = self.state.perp_close
+        """Write per-symbol V1 heatmap snapshot with atomic write.
+
+        Produces identical top-level keys for all symbols. BTC uses
+        ZoneTracker-stabilized zones; ETH/SOL receive empty zone lists.
+        BTC also writes to the legacy filename for backwards compat.
+        """
+        eng = self.engine_manager.get_engine(sym_short)
+        if eng is None:
+            return
+
+        if sym_short == "BTC":
+            src = self.state.perp_close
+        else:
+            sp = self.symbol_prices.get(sym_short, {})
+            src = sp.get("close", 0.0)
         if src <= 0:
             return
 
-        steps = self._btc().heatmap_v2.config.steps
+        steps = eng.heatmap_v2.config.steps
 
         # Build price range: ±8% around src, bucketed by steps
         band_pct = 0.08
         price_min = round((src * (1 - band_pct)) / steps) * steps
         price_max = round((src * (1 + band_pct)) / steps) * steps
 
-        # Generate price buckets
         prices = []
         p = price_min
         while p <= price_max:
             prices.append(p)
             p += steps
 
-        # Get all zone strengths from V2 engine
-        v2_heatmap = self._btc().heatmap_v2.get_heatmap()
-        all_longs = v2_heatmap.get("long", {})
-        all_shorts = v2_heatmap.get("short", {})
+        v1_heatmap = eng.heatmap_v2.get_heatmap()
+        all_longs = v1_heatmap.get("long", {})
+        all_shorts = v1_heatmap.get("short", {})
 
-        # Build intensity arrays (raw strengths)
-        long_intensity_raw = []
-        short_intensity_raw = []
+        long_intensity_raw = [all_longs.get(price, 0.0) for price in prices]
+        short_intensity_raw = [all_shorts.get(price, 0.0) for price in prices]
 
-        for price in prices:
-            long_intensity_raw.append(all_longs.get(price, 0.0))
-            short_intensity_raw.append(all_shorts.get(price, 0.0))
-
-        # === SPATIAL SMOOTHING ===
-        # Apply ±2 bucket weighted average to reduce noise while preserving clusters
-        # Weights: [0.1, 0.2, 0.4, 0.2, 0.1] = center-weighted
+        # Spatial smoothing (±2 bucket weighted average)
         def smooth_array(arr, radius=2):
-            """Apply weighted spatial smoothing to intensity array."""
             if len(arr) < 2 * radius + 1:
                 return arr
-            weights = [0.1, 0.2, 0.4, 0.2, 0.1]  # Must sum to 1.0
+            weights = [0.1, 0.2, 0.4, 0.2, 0.1]
             smoothed = []
             for i in range(len(arr)):
                 total = 0.0
@@ -1768,12 +1910,10 @@ class FullMetricsProcessor:
                 smoothed.append(total / weight_sum if weight_sum > 0 else 0.0)
             return smoothed
 
-        long_intensity_smooth = smooth_array(long_intensity_raw)
-        short_intensity_smooth = smooth_array(short_intensity_raw)
+        long_smooth = smooth_array(long_intensity_raw)
+        short_smooth = smooth_array(short_intensity_raw)
 
-        # Compute rolling normalization using all non-zero SMOOTHED strengths
-        all_strengths = [s for s in long_intensity_smooth + short_intensity_smooth if s > 0]
-
+        all_strengths = [s for s in long_smooth + short_smooth if s > 0]
         if all_strengths:
             sorted_s = sorted(all_strengths)
             n = len(sorted_s)
@@ -1784,20 +1924,16 @@ class FullMetricsProcessor:
         else:
             p50, p95 = 0.0, 1.0
 
-        # Normalize intensities to 0..1 using p50/p95
-        # Also apply threshold: only show if normalized value > 0.1
         def normalize(val):
             if val <= 0:
                 return 0.0
             norm = (val - p50) / (p95 - p50)
             norm = max(0.0, min(1.0, norm))
-            # Threshold filter: suppress very weak signals
             return norm if norm > 0.1 else 0.0
 
-        long_intensity = [round(normalize(s), 4) for s in long_intensity_smooth]
-        short_intensity = [round(normalize(s), 4) for s in short_intensity_smooth]
+        long_intensity = [round(normalize(s), 4) for s in long_smooth]
+        short_intensity = [round(normalize(s), 4) for s in short_smooth]
 
-        # Build top zones with age
         top_long_zones = [
             {"price": round(p, 2), "strength": round(s, 4), "age_min": a}
             for p, s, a in long_zones_with_age[:5]
@@ -1807,13 +1943,14 @@ class FullMetricsProcessor:
             for p, s, a in short_zones_with_age[:5]
         ]
 
-        # Calculate BTC sizes from USD notional: btc = usd / price
-        long_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(long_intensity_raw, prices)]
-        short_size_btc = [round(usd / p, 6) if p > 0 else 0.0 for usd, p in zip(short_intensity_raw, prices)]
+        long_size_btc = [round(usd / pp, 6) if pp > 0 else 0.0
+                         for usd, pp in zip(long_intensity_raw, prices)]
+        short_size_btc = [round(usd / pp, 6) if pp > 0 else 0.0
+                          for usd, pp in zip(short_intensity_raw, prices)]
 
         snapshot = {
             "schema_version": 2,
-            "symbol": "BTC",
+            "symbol": sym_short,
             "ts": time.time(),
             "src": round(src, 2),
             "step": steps,
@@ -1835,7 +1972,22 @@ class FullMetricsProcessor:
             }
         }
 
-        _write_api_snapshot(snapshot)
+        # Atomic write to per-symbol file
+        sym_v1_file = os.path.join(POC_DIR, f"liq_api_snapshot_{sym_short}.json")
+        write_json_atomic(sym_v1_file, snapshot)
+
+        # BTC backwards compat: also write to legacy filename
+        if sym_short == "BTC":
+            write_json_atomic(LIQ_API_SNAPSHOT, snapshot)
+
+        # Cross-symbol key-set validation
+        snap_keys = set(snapshot.keys())
+        if reference_keys is not None and snap_keys != reference_keys:
+            logger.warning(
+                f"V1 snapshot key drift: {sym_short} keys differ from reference. "
+                f"missing={reference_keys - snap_keys}, "
+                f"extra={snap_keys - reference_keys}"
+            )
 
     def get_state(self) -> FullMetricsState:
         with self.lock:
