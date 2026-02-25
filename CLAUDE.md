@@ -159,6 +159,10 @@ HeatmapConfig(symbol={SYM}, steps={from SYMBOL_CONFIGS}, decay=0.995, buffer=0.0
 # Also: cluster_radius_pct=0.005, min_notional_usd=10000.0, max_pools_per_side=20
 ```
 
+**Independent normalization:** Tape and inference heatmaps are normalized to 0-1 independently BEFORE applying the 0.35/0.65 weights in `get_combined_heatmap()`. This is required because tape values (observed liquidation flow, ~$1-10K/min) and inference values (estimated position inventory, ~$1-5M/min after OI×price conversion) differ by 100-1000x in magnitude. Without independent normalization, inference completely dominates and tape becomes invisible. Each source uses p99-based scaling (`_p99_scale()` in `entry_inference.py`) to prevent single outlier spikes from crushing the rest. The `get_api_response()` path (clustered pools) keeps raw USD values for `notional_usd` since the API consumer needs real USD; visual intensity is handled by `_normalize_pools()` downstream.
+
+**heatmap_balance debug metric:** Every 10 minutes, a `{"type": "heatmap_balance", ...}` entry is logged to `liq_cycles_{SYM}.jsonl` with `tape_max_raw`, `inf_max_raw`, `tape_scale`, `inf_scale`, and `combined_max`. This proves the normalization is working and makes magnitude regressions obvious.
+
 ### MultiExchangeOIPoller (via `OIPollerThread`)
 ```python
 symbols=["BTC", "ETH", "SOL"], poll_interval=15.0
@@ -501,6 +505,7 @@ Frontend (consumer)
 15. **NEVER add code to the per-symbol minute snapshot loop without exception isolation — one symbol failure must not block others**
 16. **NEVER build price grids with incremental `p += step` loops** — floating-point drift corrupts grids for non-integer steps (e.g. SOL step=0.1). Always use index-based construction: `round(price_min + i * step, ndigits)` with `ndigits = max(0, -Decimal(str(step)).as_tuple().exponent)`
 17. **NEVER assume OI values from `oi_poller` are in USD** — they are in **base asset units** (BTC count, ETH count, SOL count). Multiply by `src_price` to convert to USD before threshold comparisons or USD-denominated computations
+18. **NEVER combine tape and inference raw USD values without independent normalization** — tape (observed liquidation flow, ~$1-10K/min) and inference (estimated position inventory, ~$1-5M/min) differ by 100-1000x in magnitude. Always normalize each source to 0-1 independently via `_p99_scale()` before applying `tape_weight`/`projection_weight`. Raw combination makes the weight split useless and produces persistent horizontal lines.
 
 ## Known Bugs and Past Issues
 
@@ -545,6 +550,11 @@ Frontend (consumer)
 - **Root cause:** `entry_inference.py` assumed OI was in USD (comment: "Assuming OI is in USD"), but `oi_poller.py` delivers OI in **base asset units** (e.g. BTC count). A typical BTC OI delta of ~118 BTC was treated as $118, which after buy_weight split became ~$77 — below the `$100` minimum threshold in `_project_side()`. Every inference was silently dropped.
 - **Impact:** BTC produced 0 inferences despite 191 minutes of positive OI deltas. ETH and SOL were also affected but had larger base-unit OI counts that sometimes exceeded thresholds by accident.
 - **Fix (2026-02-24):** In `entry_inference.py`, convert OI delta from base units to USD by multiplying by `src_price`: `oi_delta_usd = abs(oi_delta) * src_price`. Also converted: (a) `oi_threshold` to USD (`last_oi * src_price * MIN_OI_CHANGE_PCT`), (b) closing branch `close_factor` ratio (`abs(oi_delta) * src_price / total_projected`), (c) debug log field to actual USD value.
+
+### RESOLVED: Persistent horizontal lines — inference overwhelms tape after OI unit fix
+- **Root cause:** After Bug #2 fix (OI base→USD conversion), inference values became $1-5M/min per symbol while tape values remained $1-10K/min. The `get_combined_heatmap()` combined raw USD values with a 0.35/0.65 split, making inference 134-2626x larger than tape regardless of weighting. Max-value normalization in `get_heatmap()` then crushed tape to <1/255 intensity. Inference levels (projected at fixed leverage offsets from entry price) appeared as permanent horizontal lines, while actual liquidation tape events were invisible.
+- **Impact:** BTC switched from dynamic (variable) to persistent heatmap at fix deployment (inference activated for the first time). ETH started persistent from run start (inference already dominant in old code due to large ETH OI deltas passing $100 threshold). SOL showed no data previously due to FP grid bug.
+- **Fix (2026-02-25):** In `get_combined_heatmap()` (`entry_inference.py`), independently normalize tape and inference heatmaps to 0-1 using p99-based scaling before applying weights: `combined = tape_norm * 0.35 + inf_norm * 0.65`. Added `_p99_scale()` helper for outlier-resistant normalization. The `get_api_response()` path in `liq_heatmap.py` retains raw USD for `notional_usd` field (API consumer needs real values); visual intensity handled by `_normalize_pools()`. Added `heatmap_balance` debug metric logged every 10 minutes to `liq_cycles_{SYM}.jsonl`.
 
 ### NOTE: Weight file saving gated by calibration_enabled
 - `_save_weights()` is only called inside `_run_calibration()` and is conditional on `self.calibration_enabled == True`. When a safety trip (e.g. entropy collapse) sets `calibration_enabled = False`, weight saving is intentionally suspended. The return value of `_save_weights()` is not checked at the call site (line 2418), but the method logs errors internally. This is intentional design — weights freeze when safety guardrails trip.

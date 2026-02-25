@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from liq_tape import LiquidationTape
-from entry_inference import EntryInference
+from entry_inference import EntryInference, _p99_scale
 
 # V3: Import zone manager for persistent zones
 try:
@@ -128,6 +128,7 @@ class LiquidationHeatmap:
         self.current_minute: int = 0
         self.current_price: float = 0.0
         self.last_oi: float = 0.0
+        self._last_balance_log_minute: int = 0
 
         # Learning feedback: how often to push tape learning to inference
         self.tape_learning_interval = 60  # Every 60 minutes
@@ -355,6 +356,26 @@ class LiquidationHeatmap:
 
         try:
             self._cycle_log_fh.write(json.dumps(cycle_entry) + '\n')
+            # Heatmap balance metric every 10 minutes — proves normalization is working
+            if minute_key - self._last_balance_log_minute >= 10:
+                combined = self.inference.get_combined_heatmap(
+                    self.tape.get_heatmap(),
+                    tape_weight=self.config.tape_weight,
+                    projection_weight=self.config.projection_weight
+                )
+                combined_vals = list(combined.get("long", {}).values()) + list(combined.get("short", {}).values())
+                balance_entry = {
+                    "type": "heatmap_balance",
+                    "ts": _time.time(),
+                    "symbol": self.config.symbol,
+                    "tape_max_raw": round(self.inference._last_tape_max_raw, 2),
+                    "inf_max_raw": round(self.inference._last_proj_max_raw, 2),
+                    "tape_scale": round(self.inference._last_tape_scale, 2),
+                    "inf_scale": round(self.inference._last_proj_scale, 2),
+                    "combined_max": round(max(combined_vals) if combined_vals else 0.0, 6),
+                }
+                self._cycle_log_fh.write(json.dumps(balance_entry) + '\n')
+                self._last_balance_log_minute = minute_key
             self._cycle_log_fh.flush()
         except Exception as e:
             logger.warning(f"Failed to write cycle summary: {e}")
@@ -531,7 +552,13 @@ class LiquidationHeatmap:
         tape_heatmap = self.tape.get_heatmap()
         projections = self.inference.get_projections()
 
-        # Combine tape and projections into notional values
+        # Combine tape and projections into notional values.
+        # NOTE: This path uses raw USD values (not independently normalized)
+        # because _cluster_zones() and the API consumer expect real USD notional
+        # for filtering and display. Visual intensity is handled downstream
+        # by _normalize_pools() which applies sqrt scaling to 0-1.
+        # (The heatmap intensity path in get_heatmap() uses independent
+        # normalization via get_combined_heatmap() instead.)
         combined_long = {}
         combined_short = {}
 

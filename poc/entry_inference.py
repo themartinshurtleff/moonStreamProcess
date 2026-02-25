@@ -38,6 +38,28 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _p99_scale(values: list) -> float:
+    """Compute p99-based scaling factor for normalization.
+
+    Uses 99th percentile instead of max to prevent a single outlier spike
+    from crushing all other values. Falls back to max for small sets (<10).
+    Returns at least 1e-9 to prevent division by zero.
+    """
+    if not values:
+        return 1e-9
+    positive = [v for v in values if v > 0]
+    if not positive:
+        return 1e-9
+    positive.sort()
+    if len(positive) >= 10:
+        idx = int(len(positive) * 0.99)
+        idx = min(idx, len(positive) - 1)
+        scale = positive[idx]
+    else:
+        scale = positive[-1]  # max
+    return max(scale, 1e-9)
+
+
 @dataclass
 class InferredEntry:
     """An inferred position entry from OI + aggression analysis."""
@@ -145,6 +167,12 @@ class EntryInference:
                 self._log_fh = open(log_file, 'a')
             except Exception as e:
                 logger.warning(f"Could not open inference log file: {e}")
+
+        # Normalization debug metrics (populated by get_combined_heatmap)
+        self._last_tape_scale: float = 1e-9
+        self._last_proj_scale: float = 1e-9
+        self._last_tape_max_raw: float = 0.0
+        self._last_proj_max_raw: float = 0.0
 
         # Debug logging (per-minute detailed diagnostics)
         self.debug_log_file = debug_log_file
@@ -683,33 +711,60 @@ class EntryInference:
         """
         Combine tape (historical) with projections (forward-looking).
 
+        Independent normalization: tape and inference are normalized to 0-1
+        independently BEFORE applying weights. This is required because tape
+        values (observed liquidation flow, ~$1-10K/min) and inference values
+        (estimated position inventory, ~$1-5M/min) differ by 100-1000x in
+        magnitude. Without independent normalization, inference completely
+        dominates and tape becomes invisible regardless of the weight split.
+
         Args:
             tape_heatmap: From LiquidationTape.get_heatmap()
             tape_weight: Weight for historical liquidations
             projection_weight: Weight for projected liquidations
 
         Returns:
-            Combined heatmap for display
+            Combined heatmap with values in [0, tape_weight + projection_weight]
         """
         result = {"long": {}, "short": {}}
 
-        # Combine long zones
-        all_long_prices = set(tape_heatmap.get("long", {}).keys()) | set(self.projected_long_liqs.keys())
+        # Collect all raw values from each source (both sides combined)
+        tape_long = tape_heatmap.get("long", {})
+        tape_short = tape_heatmap.get("short", {})
+        all_tape_vals = [max(0.0, v) for v in list(tape_long.values()) + list(tape_short.values())]
+
+        proj_long = {b.price: max(0.0, b.size_usd) for b in self.projected_long_liqs.values()}
+        proj_short = {b.price: max(0.0, b.size_usd) for b in self.projected_short_liqs.values()}
+        all_proj_vals = list(proj_long.values()) + list(proj_short.values())
+
+        # Compute p99-based scaling factors (p99 prevents single spike from
+        # crushing all other values; falls back to max for small sets)
+        tape_scale = _p99_scale(all_tape_vals)
+        proj_scale = _p99_scale(all_proj_vals)
+
+        # Combine long zones with independent normalization
+        all_long_prices = set(tape_long.keys()) | set(self.projected_long_liqs.keys())
         for price in all_long_prices:
-            tape_val = tape_heatmap.get("long", {}).get(price, 0)
-            proj_val = self.projected_long_liqs.get(price, PositionBucket(0, 0, "", 0, 0, 0)).size_usd
-            combined = tape_val * tape_weight + proj_val * projection_weight
+            tape_norm = min(max(0.0, tape_long.get(price, 0)) / tape_scale, 1.0)
+            proj_norm = min(max(0.0, proj_long.get(price, 0)) / proj_scale, 1.0)
+            combined = tape_norm * tape_weight + proj_norm * projection_weight
             if combined > 0:
                 result["long"][price] = combined
 
-        # Combine short zones
-        all_short_prices = set(tape_heatmap.get("short", {}).keys()) | set(self.projected_short_liqs.keys())
+        # Combine short zones with independent normalization
+        all_short_prices = set(tape_short.keys()) | set(self.projected_short_liqs.keys())
         for price in all_short_prices:
-            tape_val = tape_heatmap.get("short", {}).get(price, 0)
-            proj_val = self.projected_short_liqs.get(price, PositionBucket(0, 0, "", 0, 0, 0)).size_usd
-            combined = tape_val * tape_weight + proj_val * projection_weight
+            tape_norm = min(max(0.0, tape_short.get(price, 0)) / tape_scale, 1.0)
+            proj_norm = min(max(0.0, proj_short.get(price, 0)) / proj_scale, 1.0)
+            combined = tape_norm * tape_weight + proj_norm * projection_weight
             if combined > 0:
                 result["short"][price] = combined
+
+        # Store raw scales for debug metric (read by LiquidationHeatmap)
+        self._last_tape_scale = tape_scale
+        self._last_proj_scale = proj_scale
+        self._last_tape_max_raw = max(all_tape_vals) if all_tape_vals else 0.0
+        self._last_proj_max_raw = max(all_proj_vals) if all_proj_vals else 0.0
 
         return result
 
