@@ -1,12 +1,12 @@
 {
   "symbol": "BTC",
-  "saved_at": 1771947151.693539,
-  "zone_count": 12,
+  "saved_at": 1771947992.6056495,
+  "zone_count": 11,
   "zones": [
     {
       "price": 62320.0,
       "side": "long",
-      "weight": 0.07038098354620759,
+      "weight": 0.06561127269585475,
       "created_at": 1771939993.2694876,
       "last_reinforced_at": 1771939993.2694876,
       "reinforcement_count": 0,
@@ -16,7 +16,7 @@
     {
       "price": 62400.0,
       "side": "long",
-      "weight": 0.19820217752637206,
+      "weight": 0.18477003962380306,
       "created_at": 1771940111.4615424,
       "last_reinforced_at": 1771940111.4615424,
       "reinforcement_count": 0,
@@ -26,7 +26,7 @@
     {
       "price": 62460.0,
       "side": "long",
-      "weight": 0.1450085678597166,
+      "weight": 0.1351813545321205,
       "created_at": 1771940209.7184703,
       "last_reinforced_at": 1771940209.7184703,
       "reinforcement_count": 0,
@@ -36,7 +36,7 @@
     {
       "price": 62600.0,
       "side": "long",
-      "weight": 0.06711209104163467,
+      "weight": 0.06256391264596058,
       "created_at": 1771941612.9612353,
       "last_reinforced_at": 1771941612.9612353,
       "reinforcement_count": 0,
@@ -46,7 +46,7 @@
     {
       "price": 62560.0,
       "side": "long",
-      "weight": 0.2517759587675639,
+      "weight": 0.23471313210781417,
       "created_at": 1771942621.2023842,
       "last_reinforced_at": 1771942621.2023842,
       "reinforcement_count": 0,
@@ -56,7 +56,7 @@
     {
       "price": 64040.0,
       "side": "short",
-      "weight": 1.285002610863597,
+      "weight": 1.197918137374478,
       "created_at": 1771946395.1385717,
       "last_reinforced_at": 1771946396.014337,
       "reinforcement_count": 2,
@@ -66,17 +66,17 @@
     {
       "price": 63380.0,
       "side": "long",
-      "weight": 0.059373127053135154,
+      "weight": 0.057213201786853254,
       "created_at": 1771946511.3266888,
-      "last_reinforced_at": 1771946511.3266888,
-      "reinforcement_count": 0,
+      "last_reinforced_at": 1771947741.566653,
+      "reinforcement_count": 2,
       "source": "tape",
       "tier_contributions": {}
     },
     {
       "price": 64080.0,
       "side": "short",
-      "weight": 1.3986346982319338,
+      "weight": 1.3038493917512843,
       "created_at": 1771946636.5098872,
       "last_reinforced_at": 1771946636.83056,
       "reinforcement_count": 1,
@@ -86,7 +86,7 @@
     {
       "price": 64140.0,
       "side": "short",
-      "weight": 0.41087789029387994,
+      "weight": 0.3830327447338134,
       "created_at": 1771946649.9365673,
       "last_reinforced_at": 1771947132.5479262,
       "reinforcement_count": 7,
@@ -94,32 +94,22 @@
       "tier_contributions": {}
     },
     {
-      "price": 64180.0,
-      "side": "short",
-      "weight": 0.15743731134633754,
-      "created_at": 1771947030.9174633,
-      "last_reinforced_at": 1771947142.6596699,
-      "reinforcement_count": 2,
-      "source": "tape",
-      "tier_contributions": {}
-    },
-    {
-      "price": 64260.0,
-      "side": "long",
-      "weight": 0.0687651855,
-      "created_at": 1771947141.970295,
-      "last_reinforced_at": 1771947144.9806063,
-      "reinforcement_count": 7,
-      "source": "tape",
-      "tier_contributions": {}
-    },
-    {
       "price": 64200.0,
       "side": "short",
-      "weight": 0.03450770244999999,
+      "weight": 0.3182543439047145,
       "created_at": 1771947142.6596699,
-      "last_reinforced_at": 1771947144.089013,
-      "reinforcement_count": 1,
+      "last_reinforced_at": 1771947155.782017,
+      "reinforcement_count": 3,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 63440.0,
+      "side": "long",
+      "weight": 0.14476866926340243,
+      "created_at": 1771947702.7021832,
+      "last_reinforced_at": 1771947702.7021832,
+      "reinforcement_count": 0,
       "source": "tape",
       "tier_contributions": {}
     }

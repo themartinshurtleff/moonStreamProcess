@@ -330,3 +330,12 @@
 {"type": "forceOrder", "ts": 1771943121.642, "symbol": "SOL", "side": "long", "price": 75.87, "qty": 32.53, "notional": 2468.0511, "bucket": 75.9, "entry_est": 77.049433475}
 {"type": "forceOrder", "ts": 1771943122.836, "symbol": "SOL", "side": "short", "price": 75.87, "qty": 4.8, "notional": 364.176, "bucket": 75.9, "entry_est": null}
 {"type": "forceOrder", "ts": 1771943131.638, "symbol": "SOL", "side": "long", "price": 75.87, "qty": 5.12, "notional": 388.4544, "bucket": 75.9, "entry_est": 77.049433475}
+{"type": "forceOrder", "ts": 1771946408.637, "symbol": "SOL", "side": "short", "price": 77.72, "qty": 2.09, "notional": 162.4348, "bucket": 77.7, "entry_est": null}
+{"type": "forceOrder", "ts": 1771946621.345, "symbol": "SOL", "side": "long", "price": 76.78, "qty": 0.45, "notional": 34.551, "bucket": 76.80000000000001, "entry_est": null}
+{"type": "forceOrder", "ts": 1771946647.472, "symbol": "SOL", "side": "short", "price": 77.63, "qty": 69.22, "notional": 5373.548599999999, "bucket": 77.60000000000001, "entry_est": null}
+{"type": "forceOrder", "ts": 1771946666.738, "symbol": "SOL", "side": "long", "price": 77.77, "qty": 170.0, "notional": 13220.9, "bucket": 77.80000000000001, "entry_est": null}
+{"type": "forceOrder", "ts": 1771946667.229, "symbol": "SOL", "side": "long", "price": 77.78, "qty": 0.4, "notional": 31.112000000000002, "bucket": 77.80000000000001, "entry_est": null}
+{"type": "forceOrder", "ts": 1771946667.043, "symbol": "SOL", "side": "short", "price": 77.88, "qty": 0.02, "notional": 1.5575999999999999, "bucket": 77.9, "entry_est": 77.17500000000001}
+{"type": "forceOrder", "ts": 1771946668.396, "symbol": "SOL", "side": "short", "price": 77.78, "qty": 19.63, "notional": 1526.8214, "bucket": 77.80000000000001, "entry_est": 77.17500000000001}
+{"type": "forceOrder", "ts": 1771947717.751, "symbol": "SOL", "side": "short", "price": 76.51, "qty": 0.5, "notional": 38.255, "bucket": 76.5, "entry_est": null}
+{"type": "forceOrder", "ts": 1771947718.422, "symbol": "SOL", "side": "long", "price": 76.57, "qty": 13.78, "notional": 1055.1345999999999, "bucket": 76.60000000000001, "entry_est": null}
