@@ -32,7 +32,7 @@ from decimal import Decimal
 from typing import Dict, List, Tuple, Optional, Callable
 import logging
 
-from leverage_config import is_tier_disabled, get_enabled_tiers, log_disabled_tiers, DISABLED_TIERS
+from leverage_config import is_tier_disabled, get_enabled_tiers, log_disabled_tiers, DISABLED_TIERS, get_leverage_config
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +520,9 @@ class LiquidationCalibrator:
                 logger.info(f"  Overriding hit_bucket_tolerance: {self.hit_bucket_tolerance} -> {HIT_BUCKET_TOLERANCE}")
                 self.hit_bucket_tolerance = HIT_BUCKET_TOLERANCE
 
+            # Enforce disabled tiers: zero disabled weights, renormalize enabled
+            self._enforce_disabled_tiers()
+
             return True
 
         except Exception as e:
@@ -626,6 +629,9 @@ class LiquidationCalibrator:
         if not self.weights_file:
             return False
 
+        # Clean in-memory weights before persisting (no divergence between memory and disk)
+        self._enforce_disabled_tiers()
+
         tmp_file = self.weights_file + '.tmp'
 
         try:
@@ -670,6 +676,66 @@ class LiquidationCalibrator:
             except Exception:
                 pass
             return False
+
+    def _enforce_disabled_tiers(self) -> None:
+        """
+        Zero out weights for DISABLED_TIERS and renormalize enabled tiers to sum to 1.0.
+
+        Must be called after any operation that may shift weight into disabled tiers:
+        - _run_calibration() after weight update + normalization
+        - _load_weights() after loading from file
+        - _save_weights() before persisting (cleans in-memory state first)
+
+        If enabled-tier sum is <= EPS (degenerate case), restores default weights
+        from leverage_config for this symbol, normalized over enabled tiers only.
+
+        Mutates self.current_weights in-place. self.current_ladder must be set.
+        """
+        if not self.current_ladder or not self.current_weights:
+            return
+        if len(self.current_ladder) != len(self.current_weights):
+            return
+
+        # Zero disabled tiers
+        for i, lev in enumerate(self.current_ladder):
+            if lev in DISABLED_TIERS:
+                self.current_weights[i] = 0.0
+
+        # Sum enabled tiers
+        enabled_sum = sum(self.current_weights)
+
+        if enabled_sum > EPS:
+            # Renormalize enabled tiers to sum to 1.0
+            self.current_weights = [w / enabled_sum for w in self.current_weights]
+        else:
+            # Degenerate: all enabled tiers are zero. Restore defaults from leverage_config.
+            logger.warning(
+                f"[{self.symbol}] _enforce_disabled_tiers: all enabled weights are zero, "
+                f"restoring defaults from leverage_config"
+            )
+            default_config = get_leverage_config(self.symbol)
+            default_by_lev = dict(zip(default_config.ladder, default_config.weights))
+
+            fallback = []
+            for lev in self.current_ladder:
+                if lev in DISABLED_TIERS:
+                    fallback.append(0.0)
+                else:
+                    fallback.append(default_by_lev.get(lev, 1.0))
+
+            fallback_sum = sum(fallback)
+            if fallback_sum > EPS:
+                self.current_weights = [w / fallback_sum for w in fallback]
+            else:
+                # Ultimate fallback: uniform over enabled tiers
+                n_enabled = sum(1 for lev in self.current_ladder if lev not in DISABLED_TIERS)
+                if n_enabled > 0:
+                    self.current_weights = [
+                        (1.0 / n_enabled) if lev not in DISABLED_TIERS else 0.0
+                        for lev in self.current_ladder
+                    ]
+                else:
+                    logger.error(f"[{self.symbol}] _enforce_disabled_tiers: ALL tiers disabled, cannot recover")
 
     def on_liquidation(self, event_data: dict) -> None:
         """
@@ -2033,6 +2099,16 @@ class LiquidationCalibrator:
             # Enforce minimum mass on low/mid leverage (<=25x) to prevent collapse toward CMP
             new_weights, floor_info = self._enforce_mid_mass_floor(new_weights)
 
+            # === ENFORCE DISABLED TIERS ===
+            # Zero disabled tiers and renormalize to prevent weight drift into disabled tiers.
+            # Applied to the local new_weights list before entropy calculation and persistence.
+            for i, lev in enumerate(self.current_ladder):
+                if lev in DISABLED_TIERS:
+                    new_weights[i] = 0.0
+            enabled_sum = sum(new_weights)
+            if enabled_sum > EPS:
+                new_weights = [w / enabled_sum for w in new_weights]
+
             # NOTE: closer-level prior has been REMOVED to fix calibration collapse
 
         # Buffer tuning (optional)
@@ -2228,12 +2304,23 @@ class LiquidationCalibrator:
             self.log_fh.flush()
 
         # === CYCLE SUMMARY ===
-        # Compute weight entropy: H = -sum(w * log(w)) for w > 0
-        # Higher entropy = more uniform, lower = more concentrated (collapse warning)
+        # Compute weight entropy over ENABLED tiers only: H = -sum(w * log(w)) for w > 0
+        # Disabled tiers (weight forced to 0.0) are excluded from the entropy calculation
+        # to prevent false-positive safety trips. A disabled tier structurally caps entropy
+        # below the safety threshold regardless of how well-distributed enabled tiers are.
+        # Enabled weights are renormalized to sum to 1.0 before computing entropy so that
+        # the result reflects concentration among tiers that actually participate.
+        enabled_weights = [
+            w for w, lev in zip(new_weights, self.current_ladder)
+            if lev not in DISABLED_TIERS
+        ]
+        enabled_total = sum(enabled_weights)
         weight_entropy = 0.0
-        for w in new_weights:
-            if w > EPS:
-                weight_entropy -= w * math.log(w)
+        if enabled_total > EPS:
+            for w in enabled_weights:
+                w_norm = w / enabled_total
+                if w_norm > EPS:
+                    weight_entropy -= w_norm * math.log(w_norm)
 
         # Compute approach-to-force ratio
         force_events = self.stats.total_events

@@ -411,6 +411,24 @@ If `on_minute_snapshot()` is never called, `self.snapshots` stays empty. If `sel
 - Check `len(calibrator.snapshots)` — must be > 0 (proves `on_minute_snapshot()` is being called)
 - Check `calibrator.minutes_since_calibration` — must increment each minute
 
+### Disabled Tier Weight Enforcement (`_enforce_disabled_tiers`)
+
+The `_enforce_disabled_tiers()` method in `LiquidationCalibrator` zeros all `DISABLED_TIERS` weights and renormalizes enabled tiers to sum to 1.0. It is called in three mandatory locations:
+
+1. **`_load_weights()`** — after loading weights from file (cleans stale disabled-tier weight from disk)
+2. **`_save_weights()`** — before persisting (mutates `self.current_weights` in-memory first, so disk and memory never diverge)
+3. **`_run_calibration()`** — inline after mid-mass floor enforcement, before entropy calculation (cleans the local `new_weights` list)
+
+**Degenerate fallback:** If all enabled tiers have zero weight (sum ≤ 1e-9), the helper restores default weights from `get_leverage_config(symbol)` in `leverage_config.py`, normalized over enabled tiers only. Ultimate fallback: uniform distribution over enabled tiers.
+
+### `calibration_enabled` Persistence Behavior
+
+`calibration_enabled` is initialized to `True` in `__init__` and is **never persisted** to the weight file or any other file. A process restart always resets it to `True`, allowing calibration to resume even if a safety trip occurred in the previous session.
+
+### Entropy Safety Check — Disabled Tier Exclusion
+
+The Shannon entropy check in `_run_calibration()` computes entropy over **enabled tiers only** (excluding `DISABLED_TIERS`). Enabled weights are renormalized to sum to 1.0 before the entropy calculation. This prevents false positives where disabled tiers with structural zero-weight artificially cap the entropy below the safety threshold (`SAFETY_ENTROPY_MIN = 1.6`).
+
 ## API Endpoint Inventory
 
 ### Embedded Server (embedded_api.py, v3.0.0, port 8899)
@@ -506,6 +524,8 @@ Frontend (consumer)
 16. **NEVER build price grids with incremental `p += step` loops** — floating-point drift corrupts grids for non-integer steps (e.g. SOL step=0.1). Always use index-based construction: `round(price_min + i * step, ndigits)` with `ndigits = max(0, -Decimal(str(step)).as_tuple().exponent)`
 17. **NEVER assume OI values from `oi_poller` are in USD** — they are in **base asset units** (BTC count, ETH count, SOL count). Multiply by `src_price` to convert to USD before threshold comparisons or USD-denominated computations
 18. **NEVER combine tape and inference raw USD values without independent normalization** — tape (observed liquidation flow, ~$1-10K/min) and inference (estimated position inventory, ~$1-5M/min) differ by 100-1000x in magnitude. Always normalize each source to 0-1 independently via `_p99_scale()` before applying `tape_weight`/`projection_weight`. Raw combination makes the weight split useless and produces persistent horizontal lines.
+19. **NEVER compute entropy for safety checks without excluding DISABLED_TIERS** — structural zero-weight tiers cap entropy below safety thresholds (e.g. 10 tiers with one disabled → max H ≈ 1.59, below the 1.6 threshold). Always filter to enabled tiers and renormalize before entropy calculation. See `_run_calibration()` entropy block.
+20. **NEVER normalize weights without calling `_enforce_disabled_tiers()` afterward** — disabled tiers absorb weight through normalization drift (dividing total across all tiers including zeroed ones). After any weight normalization, zero disabled tiers and renormalize enabled tiers to sum to 1.0.
 
 ## Known Bugs and Past Issues
 
@@ -555,6 +575,17 @@ Frontend (consumer)
 - **Root cause:** After Bug #2 fix (OI base→USD conversion), inference values became $1-5M/min per symbol while tape values remained $1-10K/min. The `get_combined_heatmap()` combined raw USD values with a 0.35/0.65 split, making inference 134-2626x larger than tape regardless of weighting. Max-value normalization in `get_heatmap()` then crushed tape to <1/255 intensity. Inference levels (projected at fixed leverage offsets from entry price) appeared as permanent horizontal lines, while actual liquidation tape events were invisible.
 - **Impact:** BTC switched from dynamic (variable) to persistent heatmap at fix deployment (inference activated for the first time). ETH started persistent from run start (inference already dominant in old code due to large ETH OI deltas passing $100 threshold). SOL showed no data previously due to FP grid bug.
 - **Fix (2026-02-25):** In `get_combined_heatmap()` (`entry_inference.py`), independently normalize tape and inference heatmaps to 0-1 using p99-based scaling before applying weights: `combined = tape_norm * 0.35 + inf_norm * 0.65`. Added `_p99_scale()` helper for outlier-resistant normalization. The `get_api_response()` path in `liq_heatmap.py` retains raw USD for `notional_usd` field (API consumer needs real values); visual intensity handled by `_normalize_pools()`. Added `heatmap_balance` debug metric logged every 10 minutes to `liq_cycles_{SYM}.jsonl`.
+
+### RESOLVED: Entropy false positive disables calibration for all symbols
+- **Root cause:** The safety entropy check (`H < SAFETY_ENTROPY_MIN` for 3 consecutive windows) did not account for disabled tiers. With 10x in `DISABLED_TIERS` (weight forced to 0.0), the maximum achievable Shannon entropy for the remaining tiers was ~1.59, structurally below the 1.6 threshold. Every run tripped after 3-4 calibration cycles, setting `calibration_enabled = False` for all symbols. Weight files froze at calibration #1 values while in-memory weights continued evolving for 85+ cycles.
+- **Fix (2026-02-26):** Entropy calculation in `_run_calibration()` now filters to enabled tiers only (excluding `DISABLED_TIERS`) and renormalizes their weights to sum to 1.0 before computing Shannon entropy. This produces entropy values reflecting concentration among active tiers only.
+
+### RESOLVED: Disabled 10x tier accumulates weight through normalization drift
+- **Root cause:** After each calibration cycle, weights are normalized to sum to 1.0 across all tiers including disabled ones. Even though the 10x tier started at 0.0, the anchoring step (`w_new = 0.9*w_old + 0.1*w_update`) could push non-zero values into the disabled slot, and subsequent normalization redistributed weight to it. Over 85 cycles, the 10x tier absorbed 30-47% of total weight across symbols.
+- **Fix (2026-02-26):** Added `_enforce_disabled_tiers()` helper in `liq_calibrator.py` that zeros all `DISABLED_TIERS` weights and renormalizes enabled tiers to sum to 1.0. Called in three locations: `_load_weights()` (after loading from file), `_save_weights()` (before persisting, mutates in-memory state), and inline in `_run_calibration()` (after mid-mass floor, before entropy check). Includes degenerate fallback: if all enabled tiers are zero, restores default weights from `leverage_config` normalized over enabled tiers only.
+
+### NOTE: `calibration_enabled` resets to True on restart
+- `calibration_enabled` is initialized to `True` in `__init__` and is NOT persisted in the weight file. A process restart always resets it, allowing calibration to resume even if a safety trip occurred in the previous run. This is correct behavior — especially after the entropy false positive fix, the trip condition that caused the original freeze will no longer trigger.
 
 ### NOTE: Weight file saving gated by calibration_enabled
 - `_save_weights()` is only called inside `_run_calibration()` and is conditional on `self.calibration_enabled == True`. When a safety trip (e.g. entropy collapse) sets `calibration_enabled = False`, weight saving is intentionally suspended. The return value of `_save_weights()` is not checked at the call site (line 2418), but the method logs errors internally. This is intentional design — weights freeze when safety guardrails trip.
