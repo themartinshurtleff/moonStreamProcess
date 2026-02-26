@@ -60,6 +60,20 @@ def _p99_scale(values: list) -> float:
     return max(scale, 1e-9)
 
 
+# --- Tuning constants for projection persistence ---
+
+# Sweep: partial reduction instead of hard delete when price crosses projection bucket.
+# First sweep takes SWEEP_REDUCTION_FACTOR, level stays visible but dimmer.
+# Second sweep takes another SWEEP_REDUCTION_FACTOR of the remainder. Level fades naturally.
+SWEEP_REDUCTION_FACTOR = 0.70   # Fraction to remove on sweep (starting default, expected to tune)
+SWEEP_MIN_BUCKET_USD = 100.0    # Delete bucket only if reduced value falls below this threshold
+
+# OI-based reduction: maximum fraction of projections removed per minute when OI drops.
+# Previous value was 0.50 (50%); reduced to 0.25 to prevent rapid wipeout of accumulated
+# projections during brief OI declines. A 2-minute decline now removes ~44% instead of 75%.
+MAX_OI_REDUCTION_PER_MINUTE = 0.25
+
+
 @dataclass
 class InferredEntry:
     """An inferred position entry from OI + aggression analysis."""
@@ -333,13 +347,17 @@ class EntryInference:
 
         elif oi_delta < 0:
             # Positions closing - proportionally decay BOTH sides
-            # Calculate close factor relative to current projected total
             total_projected = sum(b.size_usd for b in self.projected_long_liqs.values()) + \
                               sum(b.size_usd for b in self.projected_short_liqs.values())
 
             if total_projected > 0:
-                # Convert base-unit OI delta to USD for consistent ratio with total_projected (USD)
-                close_factor = min(0.5, abs(oi_delta) * src_price / total_projected)  # Cap at 50% per minute
+                # Scale reduction proportionally to OI drop magnitude
+                if self.last_oi > 0:
+                    # OI-relative ratio: fraction of total OI that closed this minute
+                    close_factor = min(abs(oi_delta) / self.last_oi, MAX_OI_REDUCTION_PER_MINUTE)
+                else:
+                    # Fallback: use projected-relative ratio when OI is zero
+                    close_factor = min(abs(oi_delta) * src_price / total_projected, MAX_OI_REDUCTION_PER_MINUTE)
 
                 # Reduce both sides proportionally
                 self._reduce_projections(self.projected_long_liqs, close_factor)
@@ -546,7 +564,12 @@ class EntryInference:
 
     def _sweep(self, high: float, low: float, minute_key: int = 0) -> Tuple[int, int, float, float]:
         """
-        Remove projected zones that price has crossed.
+        Partially reduce projected zones that price has crossed.
+
+        Uses SWEEP_REDUCTION_FACTOR to reduce bucket value instead of hard-deleting.
+        Buckets are only fully deleted if reduced value falls below SWEEP_MIN_BUCKET_USD.
+        This preserves levels that built over time — a single wick dims the level
+        instead of erasing it.
 
         Returns (swept_long_count, swept_short_count, swept_long_notional, swept_short_notional).
         """
@@ -557,13 +580,31 @@ class EntryInference:
         ts_now = time.time()
 
         # Short projections above price get swept when high >= bucket
-        to_remove = [p for p in self.projected_short_liqs if high >= p]
-        for price in to_remove:
+        to_sweep = [p for p in self.projected_short_liqs if high >= p]
+        for price in to_sweep:
             bucket = self.projected_short_liqs[price]
-            swept_short_notional += bucket.size_usd
+            before_usd = bucket.size_usd
+            bucket.size_usd *= (1.0 - SWEEP_REDUCTION_FACTOR)
+            deleted = bucket.size_usd < SWEEP_MIN_BUCKET_USD
+
+            swept_short_notional += before_usd if deleted else (before_usd - bucket.size_usd)
             swept_short += 1
 
-            # Log sweep event
+            # Debug log: sweep reduction (one entry per bucket per sweep event)
+            if self._debug_log_fh:
+                debug_entry = {
+                    "type": "sweep_reduced",
+                    "symbol": self.symbol,
+                    "side": "short",
+                    "bucket": price,
+                    "before_usd": round(before_usd, 2),
+                    "after_usd": round(bucket.size_usd, 2),
+                    "deleted": deleted
+                }
+                self._debug_log_fh.write(json.dumps(debug_entry) + '\n')
+                self._debug_log_fh.flush()
+
+            # Sweep log (existing format, enhanced with reduction info)
             if self._sweep_log_fh:
                 sweep_entry = {
                     "type": "sweep",
@@ -571,27 +612,47 @@ class EntryInference:
                     "minute_key": minute_key,
                     "side": "short",
                     "bucket": price,
-                    # V3: Enhanced sweep logging
-                    "total_notional_usd": round(bucket.size_usd, 2),
+                    "total_notional_usd": round(before_usd, 2),
                     "trade_count": bucket.inference_count,
                     "peak_notional_usd": round(bucket.peak_size_usd, 2),
                     "layer": "projection",
                     "reason": f"high>={price:.0f}",
-                    "trigger_high": high
+                    "trigger_high": high,
+                    "reduced_to_usd": round(bucket.size_usd, 2),
+                    "deleted": deleted
                 }
                 self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
                 self._sweep_log_fh.flush()
 
-            del self.projected_short_liqs[price]
+            if deleted:
+                del self.projected_short_liqs[price]
 
         # Long projections below price get swept when low <= bucket
-        to_remove = [p for p in self.projected_long_liqs if low <= p]
-        for price in to_remove:
+        to_sweep = [p for p in self.projected_long_liqs if low <= p]
+        for price in to_sweep:
             bucket = self.projected_long_liqs[price]
-            swept_long_notional += bucket.size_usd
+            before_usd = bucket.size_usd
+            bucket.size_usd *= (1.0 - SWEEP_REDUCTION_FACTOR)
+            deleted = bucket.size_usd < SWEEP_MIN_BUCKET_USD
+
+            swept_long_notional += before_usd if deleted else (before_usd - bucket.size_usd)
             swept_long += 1
 
-            # Log sweep event
+            # Debug log: sweep reduction (one entry per bucket per sweep event)
+            if self._debug_log_fh:
+                debug_entry = {
+                    "type": "sweep_reduced",
+                    "symbol": self.symbol,
+                    "side": "long",
+                    "bucket": price,
+                    "before_usd": round(before_usd, 2),
+                    "after_usd": round(bucket.size_usd, 2),
+                    "deleted": deleted
+                }
+                self._debug_log_fh.write(json.dumps(debug_entry) + '\n')
+                self._debug_log_fh.flush()
+
+            # Sweep log (existing format, enhanced with reduction info)
             if self._sweep_log_fh:
                 sweep_entry = {
                     "type": "sweep",
@@ -599,18 +660,20 @@ class EntryInference:
                     "minute_key": minute_key,
                     "side": "long",
                     "bucket": price,
-                    # V3: Enhanced sweep logging
-                    "total_notional_usd": round(bucket.size_usd, 2),
+                    "total_notional_usd": round(before_usd, 2),
                     "trade_count": bucket.inference_count,
                     "peak_notional_usd": round(bucket.peak_size_usd, 2),
                     "layer": "projection",
                     "reason": f"low<={price:.0f}",
-                    "trigger_low": low
+                    "trigger_low": low,
+                    "reduced_to_usd": round(bucket.size_usd, 2),
+                    "deleted": deleted
                 }
                 self._sweep_log_fh.write(json.dumps(sweep_entry) + '\n')
                 self._sweep_log_fh.flush()
 
-            del self.projected_long_liqs[price]
+            if deleted:
+                del self.projected_long_liqs[price]
 
         # V3: Sweep zones in persistent zone manager
         if self.zone_manager:
