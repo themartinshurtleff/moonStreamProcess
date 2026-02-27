@@ -73,6 +73,13 @@ SWEEP_MIN_BUCKET_USD = 100.0    # Delete bucket only if reduced value falls belo
 # projections during brief OI declines. A 2-minute decline now removes ~44% instead of 75%.
 MAX_OI_REDUCTION_PER_MINUTE = 0.25
 
+# Combined-source boost: display-only multiplier for buckets where both tape
+# and inference contribute. Combined-source zones have 56.5% sweep rate vs 0%
+# for pure inference — the money signal. Applied in get_combined_heatmap_display()
+# only; the raw get_combined_heatmap() is unchanged for zone/calibrator consumers.
+COMBINED_ZONE_BOOST = 1.5      # Multiplier for both-source overlap buckets
+COMBINED_SOURCE_EPS = 1e-4     # Minimum normalized value to count as "present"
+
 
 @dataclass
 class InferredEntry:
@@ -187,6 +194,9 @@ class EntryInference:
         self._last_proj_scale: float = 1e-9
         self._last_tape_max_raw: float = 0.0
         self._last_proj_max_raw: float = 0.0
+
+        # Combined-zone boost debug logging cadence
+        self._last_boost_log_minute: int = 0
 
         # Debug logging (per-minute detailed diagnostics)
         self.debug_log_file = debug_log_file
@@ -828,6 +838,80 @@ class EntryInference:
         self._last_proj_scale = proj_scale
         self._last_tape_max_raw = max(all_tape_vals) if all_tape_vals else 0.0
         self._last_proj_max_raw = max(all_proj_vals) if all_proj_vals else 0.0
+
+        return result
+
+    def get_combined_heatmap_display(
+        self,
+        tape_heatmap: Dict[str, Dict[float, float]],
+        tape_weight: float = 0.4,
+        projection_weight: float = 0.6
+    ) -> Dict[str, Dict[float, float]]:
+        """
+        Display-only wrapper around get_combined_heatmap().
+
+        Applies COMBINED_ZONE_BOOST to buckets where both tape and inference
+        contribute above COMBINED_SOURCE_EPS. This highlights the highest-quality
+        signal (combined-source zones have 56.5% sweep rate vs 0% for pure
+        inference). Clamped to 1.0 max after application.
+
+        For zone logic, clustering, persistence, or calibrator input,
+        always use get_combined_heatmap() — never this display wrapper.
+        """
+        # Get raw combined result (also sets _last_tape_scale / _last_proj_scale)
+        result = self.get_combined_heatmap(tape_heatmap, tape_weight, projection_weight)
+
+        tape_scale = self._last_tape_scale
+        proj_scale = self._last_proj_scale
+
+        tape_long = tape_heatmap.get("long", {})
+        tape_short = tape_heatmap.get("short", {})
+        proj_long = {b.price: max(0.0, b.size_usd) for b in self.projected_long_liqs.values()}
+        proj_short = {b.price: max(0.0, b.size_usd) for b in self.projected_short_liqs.values()}
+
+        # Track boost statistics for debug logging
+        total_buckets = 0
+        boosted_buckets = 0
+        clamped_buckets = 0
+        sum_before = 0.0
+        sum_after = 0.0
+
+        for side_key, tape_dict, proj_dict in [
+            ("long", tape_long, proj_long),
+            ("short", tape_short, proj_short)
+        ]:
+            for price in list(result[side_key].keys()):
+                total_buckets += 1
+                tape_norm_val = min(max(0.0, tape_dict.get(price, 0)) / tape_scale, 1.0)
+                inf_norm_val = min(max(0.0, proj_dict.get(price, 0)) / proj_scale, 1.0)
+                if tape_norm_val > COMBINED_SOURCE_EPS and inf_norm_val > COMBINED_SOURCE_EPS:
+                    before_val = result[side_key][price]
+                    after_val = min(before_val * COMBINED_ZONE_BOOST, 1.0)
+                    result[side_key][price] = after_val
+                    boosted_buckets += 1
+                    sum_before += before_val
+                    sum_after += after_val
+                    if before_val * COMBINED_ZONE_BOOST > 1.0:
+                        clamped_buckets += 1
+
+        # Debug log: combined_zone_boost every 10 minutes
+        if self._debug_log_fh and self.current_minute - self._last_boost_log_minute >= 10:
+            self._last_boost_log_minute = self.current_minute
+            debug_entry = {
+                "type": "combined_zone_boost",
+                "ts": time.time(),
+                "symbol": self.symbol,
+                "total_buckets": total_buckets,
+                "boosted_buckets": boosted_buckets,
+                "boosted_pct": round(100.0 * boosted_buckets / total_buckets, 2) if total_buckets > 0 else 0.0,
+                "clamped_buckets": clamped_buckets,
+                "clamped_pct": round(100.0 * clamped_buckets / boosted_buckets, 2) if boosted_buckets > 0 else 0.0,
+                "avg_before_boost": round(sum_before / boosted_buckets, 6) if boosted_buckets > 0 else 0.0,
+                "avg_after_boost": round(sum_after / boosted_buckets, 6) if boosted_buckets > 0 else 0.0,
+                "boost_factor": COMBINED_ZONE_BOOST
+            }
+            self._debug_log_fh.write(json.dumps(debug_entry) + '\n')
+            self._debug_log_fh.flush()
 
         return result
 

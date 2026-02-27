@@ -443,6 +443,54 @@ class LiquidationHeatmap:
             }
         }
 
+    def get_heatmap_display(self) -> Dict[str, any]:
+        """
+        Display-only variant of get_heatmap().
+
+        Applies combined-source boost via get_combined_heatmap_display().
+        Use this for API/display snapshot rendering. For zone logic, calibrator
+        input, or any non-display consumer, use get_heatmap() instead.
+        """
+        tape_heatmap = self.tape.get_heatmap()
+        projections = self.inference.get_projections()
+
+        # Combine with weights + display boost
+        combined = self.inference.get_combined_heatmap_display(
+            tape_heatmap,
+            tape_weight=self.config.tape_weight,
+            projection_weight=self.config.projection_weight
+        )
+
+        # Normalize combined values to 0-1 intensity
+        long_zones = combined.get("long", {})
+        short_zones = combined.get("short", {})
+
+        all_values = list(long_zones.values()) + list(short_zones.values())
+        max_val = max(all_values) if all_values else 1.0
+
+        long_normalized = {p: v / max_val for p, v in long_zones.items()} if max_val > 0 else {}
+        short_normalized = {p: v / max_val for p, v in short_zones.items()} if max_val > 0 else {}
+
+        return {
+            "symbol": self.config.symbol,
+            "timestamp": time.time(),
+            "current_price": self.current_price,
+            "long": long_normalized,
+            "short": short_normalized,
+            "tape": tape_heatmap,
+            "projection": projections,
+            "stats": {
+                "total_force_orders": self.total_force_orders,
+                "total_inferences": self.total_inferences,
+                "tape_long_buckets": len(tape_heatmap.get("long", {})),
+                "tape_short_buckets": len(tape_heatmap.get("short", {})),
+                "proj_long_buckets": len(projections.get("long", {})),
+                "proj_short_buckets": len(projections.get("short", {})),
+                "tape_weight": self.config.tape_weight,
+                "projection_weight": self.config.projection_weight
+            }
+        }
+
     def _cluster_zones(
         self,
         zones: Dict[float, float],

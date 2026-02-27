@@ -1562,7 +1562,7 @@ class FullMetricsProcessor:
                         sym_price_max = round(round((sym_v2_src * (1 + band_pct)) / sym_v2_steps) * sym_v2_steps, sym_v2_ndigits)
                         sym_v2_prices = _build_price_grid(sym_price_min, sym_price_max, sym_v2_steps)
 
-                        sym_v2_hm = eng_v2.heatmap_v2.get_heatmap()
+                        sym_v2_hm = eng_v2.heatmap_v2.get_heatmap_display()
                         sym_v2_longs = sym_v2_hm.get("long", {})
                         sym_v2_shorts = sym_v2_hm.get("short", {})
                         sym_v2_li = [sym_v2_longs.get(pp, 0.0) for pp in sym_v2_prices]
@@ -1894,7 +1894,7 @@ class FullMetricsProcessor:
 
         prices = _build_price_grid(price_min, price_max, steps)
 
-        v1_heatmap = eng.heatmap_v2.get_heatmap()
+        v1_heatmap = eng.heatmap_v2.get_heatmap_display()
         all_longs = v1_heatmap.get("long", {})
         all_shorts = v1_heatmap.get("short", {})
 

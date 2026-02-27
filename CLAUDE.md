@@ -349,6 +349,30 @@ When OI drops (positions closing), projections are reduced proportionally. The r
 
 Reduction formula: `close_factor = min(abs(oi_delta) / total_oi, MAX_OI_REDUCTION_PER_MINUTE)` — scales proportionally to the magnitude of the OI drop relative to total OI, capped at 25% per minute. Falls back to `abs(oi_delta) * src_price / total_projected` when total OI is unavailable.
 
+### Combined-Source Display Boost
+
+Buckets where both tape and inference contribute are the highest-quality signal (56.5% sweep rate vs 0% for pure inference). A display-only intensity boost makes them visually prominent.
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `COMBINED_ZONE_BOOST` | 1.5 | Multiplier applied to heatmap buckets where both tape and inference contribute above EPS threshold. Clamped to 1.0 max after application. |
+| `COMBINED_SOURCE_EPS` | 1e-4 | Minimum normalized value (after independent p99 normalization) to count as "present" from a source. Prevents float noise from triggering false combined classifications. |
+
+**Display-only boundary:** Two parallel methods exist on `EntryInference`:
+- **`get_combined_heatmap()`** — raw combined map (tape_norm × tape_weight + inf_norm × projection_weight). Used by zone logic, calibrator input (`on_minute_snapshot` via `get_heatmap()`), diagnostic logging, and any non-display consumer. **NEVER modify this method to include the boost.**
+- **`get_combined_heatmap_display()`** — display wrapper that calls `get_combined_heatmap()` internally, then applies `COMBINED_ZONE_BOOST` to overlap buckets. Used only for API/display snapshot rendering (via `LiquidationHeatmap.get_heatmap_display()`).
+
+Similarly on `LiquidationHeatmap`:
+- **`get_heatmap()`** — raw version, feeds calibrator `pred_longs`/`pred_shorts` via `on_minute_snapshot()`.
+- **`get_heatmap_display()`** — display wrapper using `get_combined_heatmap_display()`. Used for V1/V2 snapshot JSON writes.
+
+**If any future code needs combined heatmap data for logic (zones, clustering, persistence, calibrator), it MUST call `get_combined_heatmap()` / `get_heatmap()` — never the display wrappers.**
+
+Boost debug metric logged every 10 minutes to `liq_debug_{SYM}.jsonl`:
+```json
+{"type": "combined_zone_boost", "symbol": "BTC", "total_buckets": 150, "boosted_buckets": 12, "boosted_pct": 8.0, "clamped_buckets": 2, "clamped_pct": 16.67, "avg_before_boost": 0.45, "avg_after_boost": 0.675, "boost_factor": 1.5}
+```
+
 ---
 
 ## Data Flow — Critical Paths
