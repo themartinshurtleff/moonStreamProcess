@@ -1,300 +1,1068 @@
 {
   "symbol": "ETH",
-  "saved_at": 1772066551.903309,
-  "zone_count": 24,
+  "saved_at": 1772153083.555855,
+  "zone_count": 87,
   "zones": [
     {
-      "price": 2092.0,
+      "price": 1945.0,
+      "side": "long",
+      "weight": 0.06337516709300282,
+      "created_at": 1772148240.0196736,
+      "last_reinforced_at": 1772148720.0408497,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.18461325217236527
+      }
+    },
+    {
+      "price": 1986.0,
+      "side": "long",
+      "weight": 0.3216792409450947,
+      "created_at": 1772148240.0196736,
+      "last_reinforced_at": 1772148600.0236366,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.3375840452288423
+      }
+    },
+    {
+      "price": 2116.0,
       "side": "short",
-      "weight": 0.02720926350708912,
-      "created_at": 1772066160.0148513,
-      "last_reinforced_at": 1772066160.0148513,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "125": 0.2745623117439368
-      }
-    },
-    {
-      "price": 1962.0,
-      "side": "long",
-      "weight": 0.04705232207231838,
-      "created_at": 1772066220.1911974,
-      "last_reinforced_at": 1772066220.1911974,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "20": 0.3859718614082727
-      }
-    },
-    {
-      "price": 1983.0,
-      "side": "long",
-      "weight": 0.04410051151025861,
-      "created_at": 1772066220.1911974,
-      "last_reinforced_at": 1772066220.1911974,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "25": 0.3617580550118167
-      }
-    },
-    {
-      "price": 2024.0,
-      "side": "long",
-      "weight": 0.1444113682017769,
-      "created_at": 1772066220.1911974,
-      "last_reinforced_at": 1772066460.0060217,
+      "weight": 0.32062835841134973,
+      "created_at": 1772148240.0196736,
+      "last_reinforced_at": 1772148600.0236366,
       "reinforcement_count": 1,
       "source": "inference",
       "tier_contributions": {
-        "50": 1.5969794543685296,
-        "75": 0.11516687629375714
+        "25": 0.6312929594389153
       }
     },
     {
-      "price": 2038.0,
-      "side": "long",
-      "weight": 0.08058030528139472,
-      "created_at": 1772066220.1911974,
-      "last_reinforced_at": 1772066340.0073252,
-      "reinforcement_count": 1,
+      "price": 2055.0,
+      "side": "short",
+      "weight": 1.452992958851905,
+      "created_at": 1772148240.0196736,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 5,
       "source": "inference",
       "tier_contributions": {
-        "75": 0.9292298846675411,
-        "125": 0.08598344015523908
+        "100": 0.3736924926921055,
+        "75": 1.962342603851463
       }
     },
     {
-      "price": 2045.0,
+      "price": 1925.0,
       "side": "long",
-      "weight": 0.0748361697906747,
-      "created_at": 1772066220.1911974,
-      "last_reinforced_at": 1772066468.3316724,
-      "reinforcement_count": 1,
+      "weight": 0.25790277801213435,
+      "created_at": 1772148600.0226402,
+      "last_reinforced_at": 1772148600.0226402,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.37277207849131294
+      }
+    },
+    {
+      "price": 1946.0,
+      "side": "long",
+      "weight": 0.4835677087727526,
+      "created_at": 1772148600.0236366,
+      "last_reinforced_at": 1772148600.0236366,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.6989476471712118
+      }
+    },
+    {
+      "price": 2011.0,
+      "side": "long",
+      "weight": 0.32523264998388957,
+      "created_at": 1772148600.0236366,
+      "last_reinforced_at": 1772152000.062363,
+      "reinforcement_count": 9,
       "source": "combined",
       "tier_contributions": {
-        "100": 0.8644735176415468,
-        "125": 1.2645336127958966
+        "125": 0.12275605608948868
       }
     },
     {
-      "price": 2049.0,
-      "side": "long",
-      "weight": 0.19841143394822944,
-      "created_at": 1772066220.192197,
-      "last_reinforced_at": 1772066309.3003154,
-      "reinforcement_count": 2,
-      "source": "combined",
-      "tier_contributions": {
-        "125": 2.3993966067123833
-      }
-    },
-    {
-      "price": 2115.0,
+      "price": 2137.0,
       "side": "short",
-      "weight": 0.02675401515556472,
-      "created_at": 1772066220.192197,
-      "last_reinforced_at": 1772066220.192197,
+      "weight": 0.17193925197398618,
+      "created_at": 1772148600.0236366,
+      "last_reinforced_at": 1772148600.0236366,
       "reinforcement_count": 0,
       "source": "inference",
       "tier_contributions": {
-        "50": 0.3937377986734472
-      }
-    },
-    {
-      "price": 2090.0,
-      "side": "short",
-      "weight": 0.04855489467754684,
-      "created_at": 1772066220.192197,
-      "last_reinforced_at": 1772066340.0083241,
-      "reinforcement_count": 1,
-      "source": "inference",
-      "tier_contributions": {
-        "125": 0.5939174091313449,
-        "75": 0.11097515893062597
-      }
-    },
-    {
-      "price": 2165.0,
-      "side": "short",
-      "weight": 0.029287232576041777,
-      "created_at": 1772066340.0083241,
-      "last_reinforced_at": 1772066340.0083241,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "20": 0.11892388414044883
-      }
-    },
-    {
-      "price": 2145.0,
-      "side": "short",
-      "weight": 0.02744990853667579,
-      "created_at": 1772066340.0083241,
-      "last_reinforced_at": 1772066340.0083241,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "25": 0.11146323689019391
-      }
-    },
-    {
-      "price": 2104.0,
-      "side": "short",
-      "weight": 0.04679932033178349,
-      "created_at": 1772066340.0083241,
-      "last_reinforced_at": 1772066340.0083241,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "50": 0.19003355590318347
-      }
-    },
-    {
-      "price": 2083.0,
-      "side": "short",
-      "weight": 0.02554139093960392,
-      "created_at": 1772066340.0083241,
-      "last_reinforced_at": 1772066340.0083241,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "100": 0.10371350072086213
-      }
-    },
-    {
-      "price": 1948.0,
-      "side": "long",
-      "weight": 0.06139937947928212,
-      "created_at": 1772066460.0050206,
-      "last_reinforced_at": 1772066460.0050206,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "20": 0.12341583814931079
-      }
-    },
-    {
-      "price": 1969.0,
-      "side": "long",
-      "weight": 0.05754751141265832,
-      "created_at": 1772066460.0050206,
-      "last_reinforced_at": 1772066460.0050206,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "25": 0.11567338977418758
-      }
-    },
-    {
-      "price": 2010.0,
-      "side": "long",
-      "weight": 0.09811269197125382,
-      "created_at": 1772066460.0050206,
-      "last_reinforced_at": 1772066460.0050206,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "50": 0.19721144114824887
-      }
-    },
-    {
-      "price": 2030.0,
-      "side": "long",
-      "weight": 0.05354638922123067,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "100": 0.10763093310800136
-      }
-    },
-    {
-      "price": 2035.0,
-      "side": "long",
-      "weight": 0.14799401026467526,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "125": 0.2974753975169352
-      }
-    },
-    {
-      "price": 2162.0,
-      "side": "short",
-      "weight": 0.15829019994322296,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "20": 0.31817125616728237
-      }
-    },
-    {
-      "price": 2141.0,
-      "side": "short",
-      "weight": 0.1483599209796297,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "25": 0.2982108964414667
-      }
-    },
-    {
-      "price": 2100.0,
-      "side": "short",
-      "weight": 0.2529386739867293,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "50": 0.5084194451994559
-      }
-    },
-    {
-      "price": 2087.0,
-      "side": "short",
-      "weight": 0.1477102789134771,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "75": 0.29690508324317005
-      }
-    },
-    {
-      "price": 2080.0,
-      "side": "short",
-      "weight": 0.2086373472043219,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
-      "reinforcement_count": 0,
-      "source": "inference",
-      "tier_contributions": {
-        "100": 0.2774771026389595,
-        "125": 0.2866482150057457
+        "20": 0.2520654671097905
       }
     },
     {
       "price": 2076.0,
       "side": "short",
-      "weight": 0.38153482451886067,
-      "created_at": 1772066460.0060217,
-      "last_reinforced_at": 1772066460.0060217,
+      "weight": 0.5731295664448447,
+      "created_at": 1772148600.0236366,
+      "last_reinforced_at": 1772148600.0236366,
       "reinforcement_count": 0,
       "source": "inference",
       "tier_contributions": {
-        "125": 0.7669041698871571
+        "50": 0.8402163567758731
       }
+    },
+    {
+      "price": 1924.0,
+      "side": "long",
+      "weight": 0.07964211147910744,
+      "created_at": 1772148720.0408497,
+      "last_reinforced_at": 1772150940.0127475,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.1916843182677498
+      }
+    },
+    {
+      "price": 1985.0,
+      "side": "long",
+      "weight": 0.4166593901948926,
+      "created_at": 1772148720.0408497,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.6389461002575724,
+        "75": 0.5109236558901533
+      }
+    },
+    {
+      "price": 1999.0,
+      "side": "long",
+      "weight": 0.15217508631169396,
+      "created_at": 1772148720.0408497,
+      "last_reinforced_at": 1772151660.00777,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.13116266458674192,
+        "100": 0.22664486571243772
+      }
+    },
+    {
+      "price": 2074.0,
+      "side": "short",
+      "weight": 0.2155799542195938,
+      "created_at": 1772148720.0408497,
+      "last_reinforced_at": 1772151000.0058494,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.5329971537194123
+      }
+    },
+    {
+      "price": 1983.0,
+      "side": "long",
+      "weight": 0.308272653053839,
+      "created_at": 1772149080.014169,
+      "last_reinforced_at": 1772151060.2042053,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.102721668432764
+      }
+    },
+    {
+      "price": 2133.0,
+      "side": "short",
+      "weight": 0.3723962776544825,
+      "created_at": 1772149080.014169,
+      "last_reinforced_at": 1772151060.2042053,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.627929563060095
+      }
+    },
+    {
+      "price": 2113.0,
+      "side": "short",
+      "weight": 0.5305558242520231,
+      "created_at": 1772149080.014169,
+      "last_reinforced_at": 1772151060.2042053,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 1.0222690768772045
+      }
+    },
+    {
+      "price": 2072.0,
+      "side": "short",
+      "weight": 1.413241407799817,
+      "created_at": 1772149080.014169,
+      "last_reinforced_at": 1772150220.0115683,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.8421756752899114
+      }
+    },
+    {
+      "price": 2059.0,
+      "side": "short",
+      "weight": 1.317257431639836,
+      "created_at": 1772149080.014169,
+      "last_reinforced_at": 1772151060.2042053,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 1.0791936190105005,
+        "50": 0.7464150495908921
+      }
+    },
+    {
+      "price": 1923.0,
+      "side": "long",
+      "weight": 0.5144663768274464,
+      "created_at": 1772149200.0138414,
+      "last_reinforced_at": 1772151000.0058494,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.8143843128783718
+      }
+    },
+    {
+      "price": 1943.0,
+      "side": "long",
+      "weight": 0.9714078583655862,
+      "created_at": 1772149200.0138414,
+      "last_reinforced_at": 1772151060.2042053,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 1.5520090447762616
+      }
+    },
+    {
+      "price": 1984.0,
+      "side": "long",
+      "weight": 1.7148838080583626,
+      "created_at": 1772149200.0138414,
+      "last_reinforced_at": 1772151000.0058494,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 2.714607743339105
+      }
+    },
+    {
+      "price": 1997.0,
+      "side": "long",
+      "weight": 1.6348922614600165,
+      "created_at": 1772149200.0138414,
+      "last_reinforced_at": 1772152320.0139513,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 1.5518571702161537,
+        "100": 2.3640509037828537
+      }
+    },
+    {
+      "price": 2004.0,
+      "side": "long",
+      "weight": 1.2807591542717849,
+      "created_at": 1772149200.0138414,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 6,
+      "source": "combined",
+      "tier_contributions": {
+        "100": 1.6167445520124022,
+        "125": 0.21612613711088785
+      }
+    },
+    {
+      "price": 1921.0,
+      "side": "long",
+      "weight": 0.10885814312770277,
+      "created_at": 1772149680.0181942,
+      "last_reinforced_at": 1772150460.00005,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.19283236117821004
+      }
+    },
+    {
+      "price": 1941.0,
+      "side": "long",
+      "weight": 0.21595962808830615,
+      "created_at": 1772149680.0181942,
+      "last_reinforced_at": 1772150460.00005,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.41088714385086955
+      }
+    },
+    {
+      "price": 1982.0,
+      "side": "long",
+      "weight": 0.3362567912822121,
+      "created_at": 1772149680.0181942,
+      "last_reinforced_at": 1772150400.0160859,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.5331470949350551
+      }
+    },
+    {
+      "price": 1995.0,
+      "side": "long",
+      "weight": 0.21593864625300746,
+      "created_at": 1772149680.0181942,
+      "last_reinforced_at": 1772150460.0010524,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.41083985863355743
+      }
+    },
+    {
+      "price": 1922.0,
+      "side": "long",
+      "weight": 0.14891529684525065,
+      "created_at": 1772150220.0115683,
+      "last_reinforced_at": 1772151060.2042053,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.30861573157815714
+      }
+    },
+    {
+      "price": 1942.0,
+      "side": "long",
+      "weight": 0.19399426865920213,
+      "created_at": 1772150220.0115683,
+      "last_reinforced_at": 1772150220.0115683,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.24468272245824468
+      }
+    },
+    {
+      "price": 1996.0,
+      "side": "long",
+      "weight": 0.25981919195164915,
+      "created_at": 1772150220.0115683,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.24464462310131022,
+        "100": 0.15292127756828044,
+        "125": 0.07545268353645967
+      }
+    },
+    {
+      "price": 2057.0,
+      "side": "short",
+      "weight": 0.3115266122459071,
+      "created_at": 1772150280.0271642,
+      "last_reinforced_at": 1772150460.0010524,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.9341593288594214
+      }
+    },
+    {
+      "price": 1981.0,
+      "side": "long",
+      "weight": 0.0968284482690542,
+      "created_at": 1772150340.01849,
+      "last_reinforced_at": 1772150460.00005,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.19731708824581928
+      }
+    },
+    {
+      "price": 2070.0,
+      "side": "short",
+      "weight": 1.2708402642776415,
+      "created_at": 1772150340.01849,
+      "last_reinforced_at": 1772150340.01849,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.5752854847859412
+      }
+    },
+    {
+      "price": 1919.0,
+      "side": "long",
+      "weight": 0.2477314580665657,
+      "created_at": 1772150700.0101178,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.7544029461843047
+      }
+    },
+    {
+      "price": 1939.0,
+      "side": "long",
+      "weight": 0.4644964838747938,
+      "created_at": 1772150700.0101178,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 1.4145055240955227
+      }
+    },
+    {
+      "price": 1979.0,
+      "side": "long",
+      "weight": 0.6188766860587365,
+      "created_at": 1772150700.0101178,
+      "last_reinforced_at": 1772151660.00777,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.7252751124171177
+      }
+    },
+    {
+      "price": 1993.0,
+      "side": "long",
+      "weight": 0.46443583358132695,
+      "created_at": 1772150700.0101178,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 4,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 1.4143286812545743
+      }
+    },
+    {
+      "price": 1944.0,
+      "side": "long",
+      "weight": 0.27064054516248776,
+      "created_at": 1772150940.0127475,
+      "last_reinforced_at": 1772151000.0058494,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.5371732107505448
+      }
+    },
+    {
+      "price": 1998.0,
+      "side": "long",
+      "weight": 0.8608937865312157,
+      "created_at": 1772150940.0127475,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 6,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.5370895679265382,
+        "100": 1.9630187335381333,
+        "125": 0.11535127609896437
+      }
+    },
+    {
+      "price": 1980.0,
+      "side": "long",
+      "weight": 0.868574514692065,
+      "created_at": 1772151300.0030732,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.4699895434989805
+      }
+    },
+    {
+      "price": 2130.0,
+      "side": "short",
+      "weight": 0.4749076960479719,
+      "created_at": 1772151300.0030732,
+      "last_reinforced_at": 1772151780.0097964,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.9859106272135832
+      }
+    },
+    {
+      "price": 2110.0,
+      "side": "short",
+      "weight": 0.809036578373856,
+      "created_at": 1772151300.0030732,
+      "last_reinforced_at": 1772151300.0030732,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 1.8763918578139935
+      }
+    },
+    {
+      "price": 2049.0,
+      "side": "short",
+      "weight": 1.0011608227873248,
+      "created_at": 1772151300.0040746,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "100": 1.0930828019483132,
+        "125": 0.08281746975403123,
+        "75": 1.5953706716883043
+      }
+    },
+    {
+      "price": 1917.0,
+      "side": "long",
+      "weight": 0.6496435186385953,
+      "created_at": 1772151600.0043514,
+      "last_reinforced_at": 1772152620.007116,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 1.770668047751844
+      }
+    },
+    {
+      "price": 1938.0,
+      "side": "long",
+      "weight": 1.0105611691719918,
+      "created_at": 1772151600.0043514,
+      "last_reinforced_at": 1772152560.0011168,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 2.621248075450941
+      }
+    },
+    {
+      "price": 1978.0,
+      "side": "long",
+      "weight": 1.7004969460565866,
+      "created_at": 1772151600.0043514,
+      "last_reinforced_at": 1772152560.0011168,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 4.295430385343731
+      }
+    },
+    {
+      "price": 1991.0,
+      "side": "long",
+      "weight": 1.2176587673667763,
+      "created_at": 1772151600.0043514,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 3.3185747054147234
+      }
+    },
+    {
+      "price": 1918.0,
+      "side": "long",
+      "weight": 0.18170846183149364,
+      "created_at": 1772151660.00777,
+      "last_reinforced_at": 1772151660.00777,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.20417886210921513
+      }
+    },
+    {
+      "price": 1992.0,
+      "side": "long",
+      "weight": 0.4301014942167398,
+      "created_at": 1772151660.00777,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.38281920427023963,
+        "100": 0.3021633512216779
+      }
+    },
+    {
+      "price": 1937.0,
+      "side": "long",
+      "weight": 1.4949639222495292,
+      "created_at": 1772151840.0137944,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 4.904498049791544
+      }
+    },
+    {
+      "price": 2107.0,
+      "side": "short",
+      "weight": 4.823058916008959,
+      "created_at": 1772151840.0137944,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 8.151175813987361
+      }
+    },
+    {
+      "price": 2067.0,
+      "side": "short",
+      "weight": 4.798943621428914,
+      "created_at": 1772151840.0137944,
+      "last_reinforced_at": 1772152560.0011168,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 12.025905701040859
+      }
+    },
+    {
+      "price": 2053.0,
+      "side": "short",
+      "weight": 4.823058916008959,
+      "created_at": 1772151840.0137944,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 7.130003792055879,
+        "100": 0.6963450782657848
+      }
+    },
+    {
+      "price": 2013.0,
+      "side": "long",
+      "weight": 0.4856881072400491,
+      "created_at": 1772151874.809394,
+      "last_reinforced_at": 1772151968.650041,
+      "reinforcement_count": 1,
+      "source": "tape",
+      "tier_contributions": {}
+    },
+    {
+      "price": 1913.0,
+      "side": "long",
+      "weight": 0.3835260214461646,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.4160225869155116
+      }
+    },
+    {
+      "price": 1934.0,
+      "side": "long",
+      "weight": 0.7191112902115588,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.7800423504665843
+      }
+    },
+    {
+      "price": 1974.0,
+      "side": "long",
+      "weight": 1.278417230900906,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 1.3867388751128467
+      }
+    },
+    {
+      "price": 1987.0,
+      "side": "long",
+      "weight": 0.7190809314453767,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.780009419370032
+      }
+    },
+    {
+      "price": 1994.0,
+      "side": "long",
+      "weight": 0.42572577165894776,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "100": 0.46179796660034156
+      }
+    },
+    {
+      "price": 2123.0,
+      "side": "short",
+      "weight": 0.7844343302144725,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.8509002807439754
+      }
+    },
+    {
+      "price": 2103.0,
+      "side": "short",
+      "weight": 1.4708143691521365,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 1.5954380263949546
+      }
+    },
+    {
+      "price": 2063.0,
+      "side": "short",
+      "weight": 2.8873443843041295,
+      "created_at": 1772152080.0047286,
+      "last_reinforced_at": 1772152080.0047286,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 2.8363279669518113,
+        "75": 0.5742120102130831
+      }
+    },
+    {
+      "price": 1916.0,
+      "side": "long",
+      "weight": 0.7210910050086224,
+      "created_at": 1772152200.0329425,
+      "last_reinforced_at": 1772152320.0139513,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 2.129716117704033
+      }
+    },
+    {
+      "price": 1977.0,
+      "side": "long",
+      "weight": 2.7831753317261607,
+      "created_at": 1772152200.0329425,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 8.403048391079196
+      }
+    },
+    {
+      "price": 1990.0,
+      "side": "long",
+      "weight": 1.351988554996308,
+      "created_at": 1772152200.0329425,
+      "last_reinforced_at": 1772152320.0139513,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 3.993049138773535
+      }
+    },
+    {
+      "price": 2001.0,
+      "side": "long",
+      "weight": 1.4928966679213664,
+      "created_at": 1772152260.000325,
+      "last_reinforced_at": 1772152320.0139513,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "125": 1.1755196281880473,
+        "75": 0.7523609334112498,
+        "100": 0.8657906785280286
+      }
+    },
+    {
+      "price": 2127.0,
+      "side": "short",
+      "weight": 2.77205394920632,
+      "created_at": 1772152260.000325,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 4.279406075688282
+      }
+    },
+    {
+      "price": 2046.0,
+      "side": "short",
+      "weight": 3.49193299020421,
+      "created_at": 1772152260.0013254,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "100": 4.749454391392503,
+        "75": 0.41964157046842343
+      }
+    },
+    {
+      "price": 1936.0,
+      "side": "long",
+      "weight": 0.16018601859674642,
+      "created_at": 1772152320.0139513,
+      "last_reinforced_at": 1772152320.0139513,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.17030955144206142
+      }
+    },
+    {
+      "price": 1976.0,
+      "side": "long",
+      "weight": 0.4156883909335393,
+      "created_at": 1772152320.0139513,
+      "last_reinforced_at": 1772152440.0158546,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.7626936933378073
+      }
+    },
+    {
+      "price": 2065.0,
+      "side": "short",
+      "weight": 4.823058916008959,
+      "created_at": 1772152320.0139513,
+      "last_reinforced_at": 1772152440.0163586,
+      "reinforcement_count": 2,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 8.762519447767021
+      }
+    },
+    {
+      "price": 1935.0,
+      "side": "long",
+      "weight": 0.11768118296659251,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152440.0158546,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.2587066594754165
+      }
+    },
+    {
+      "price": 1989.0,
+      "side": "long",
+      "weight": 0.11762010355047599,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152440.0158546,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 0.2585723843831046
+      }
+    },
+    {
+      "price": 2125.0,
+      "side": "short",
+      "weight": 1.333534173529005,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152440.0163586,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 1.4438122735733454
+      }
+    },
+    {
+      "price": 2105.0,
+      "side": "short",
+      "weight": 2.500376575366883,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152440.0163586,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 2.707148012950021
+      }
+    },
+    {
+      "price": 2051.0,
+      "side": "short",
+      "weight": 2.499078818686972,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152440.0163586,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "75": 2.705742936829917
+      }
+    },
+    {
+      "price": 2044.0,
+      "side": "short",
+      "weight": 2.6429160055420287,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152440.0163586,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "100": 2.544718482067279,
+        "125": 0.9999754826101431
+      }
+    },
+    {
+      "price": 2040.0,
+      "side": "short",
+      "weight": 0.8929851187849829,
+      "created_at": 1772152380.0039914,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 3,
+      "source": "inference",
+      "tier_contributions": {
+        "125": 0.8829566868763508,
+        "100": 0.24817857185287254
+      }
+    },
+    {
+      "price": 1915.0,
+      "side": "long",
+      "weight": 0.09735842962062373,
+      "created_at": 1772152440.0158546,
+      "last_reinforced_at": 1772152440.0158546,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.10247882083330201
+      }
+    },
+    {
+      "price": 2042.0,
+      "side": "short",
+      "weight": 0.0780919619395238,
+      "created_at": 1772152620.008118,
+      "last_reinforced_at": 1772152620.008118,
+      "reinforcement_count": 0,
+      "source": "inference",
+      "tier_contributions": {
+        "125": 0.08095688161751116
+      }
+    },
+    {
+      "price": 2006.0,
+      "side": "long",
+      "weight": 1.2195859917900314,
+      "created_at": 1772152692.3739002,
+      "last_reinforced_at": 1772152812.68589,
+      "reinforcement_count": 3,
+      "source": "combined",
+      "tier_contributions": {
+        "100": 0.4137885616475713,
+        "125": 0.32487100917256767
+      }
+    },
+    {
+      "price": 1911.0,
+      "side": "long",
+      "weight": 0.2433425154344487,
+      "created_at": 1772152860.00054,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.2726341202603085
+      }
+    },
+    {
+      "price": 1931.0,
+      "side": "long",
+      "weight": 0.45626721643959106,
+      "created_at": 1772152860.00054,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.5111889754880782
+      }
+    },
+    {
+      "price": 1972.0,
+      "side": "long",
+      "weight": 0.811139742844196,
+      "created_at": 1772152860.00054,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "50": 0.9087781878299512
+      }
+    },
+    {
+      "price": 2121.0,
+      "side": "short",
+      "weight": 0.14824640035917533,
+      "created_at": 1772152860.00054,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "20": 0.22392506017358943
+      }
+    },
+    {
+      "price": 2101.0,
+      "side": "short",
+      "weight": 0.27796200067345367,
+      "created_at": 1772152860.00054,
+      "last_reinforced_at": 1772152980.0306952,
+      "reinforcement_count": 1,
+      "source": "inference",
+      "tier_contributions": {
+        "25": 0.41985948782548
+      }
+    },
+    {
+      "price": 2005.0,
+      "side": "long",
+      "weight": 0.053878288960000006,
+      "created_at": 1772153072.4017105,
+      "last_reinforced_at": 1772153074.9415329,
+      "reinforcement_count": 2,
+      "source": "tape",
+      "tier_contributions": {}
     }
   ]
 }
