@@ -9,18 +9,19 @@ Single source of truth for how this codebase works. Read this before making any 
 3. [Calibrator Constants](#calibrator-constants--tuning-parameters)
 4. [Leverage Configuration](#leverage-configuration)
 5. [Zone Manager Configuration](#zone-manager-configuration)
-6. [Data Flow — Critical Paths](#data-flow--critical-paths)
-7. [Calibrator Integration Rules — CRITICAL](#calibrator-integration-rules--critical)
-8. [API Endpoint Inventory](#api-endpoint-inventory)
-9. [Response Caching](#response-caching)
-10. [Snapshot Pipeline](#snapshot-pipeline)
-11. [NEVER DO — Code Rules](#never-do--code-rules)
-12. [Known Bugs and Past Issues](#known-bugs-and-past-issues)
-13. [Symbol Conventions](#symbol-conventions)
-14. [File and State Inventory](#file-and-state-inventory)
-15. [Multi-Exchange Implementation Notes](#multi-exchange-implementation-notes)
-16. [Testing Checklist](#testing-checklist-before-deployment)
-17. [Verification Steps](#verification-steps-after-code-changes)
+6. [Entry Inference Tuning Parameters](#entry-inference-tuning-parameters)
+7. [Data Flow — Critical Paths](#data-flow--critical-paths)
+8. [Calibrator Integration Rules — CRITICAL](#calibrator-integration-rules--critical)
+9. [API Endpoint Inventory](#api-endpoint-inventory)
+10. [Response Caching](#response-caching)
+11. [Snapshot Pipeline](#snapshot-pipeline)
+12. [NEVER DO — Code Rules](#never-do--code-rules)
+13. [Known Bugs and Past Issues](#known-bugs-and-past-issues)
+14. [Symbol Conventions](#symbol-conventions)
+15. [File and State Inventory](#file-and-state-inventory)
+16. [Multi-Exchange Implementation Notes](#multi-exchange-implementation-notes)
+17. [Testing Checklist](#testing-checklist-before-deployment)
+18. [Verification Steps](#verification-steps-after-code-changes)
 
 ---
 
@@ -310,6 +311,67 @@ Defined in `active_zone_manager.py`. Governs the V3 persistent zone lifecycle.
 | `DEFAULT_PERSIST_FILE` | `liq_active_zones.json` | Zone state persistence file (default only — runtime uses per-symbol paths: `liq_active_zones_BTC.json`, `liq_active_zones_ETH.json`, `liq_active_zones_SOL.json` via `ZONE_PERSIST_FILES` in viewer) |
 
 Zone lifecycle: **CREATED** → **REINFORCED** (repeatable) → **SWEPT** (by price) or **EXPIRED** (by time/decay)
+
+---
+
+## Entry Inference Tuning Parameters
+
+Defined as module-level constants in `entry_inference.py`. These control how projection buckets persist through price sweeps and OI declines.
+
+### Sweep Behavior (Partial Reduction)
+
+When price crosses a projected liquidation level, the bucket is **partially reduced** instead of hard-deleted. This prevents levels that accumulated over many minutes from vanishing on a single wick.
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `SWEEP_REDUCTION_FACTOR` | 0.70 | Fraction of bucket value removed per sweep. **Starting default, expected to tune based on soak test results.** First sweep takes 70%, leaving 30%. Second sweep takes 70% of remainder, leaving 9%. Level fades naturally. |
+| `SWEEP_MIN_BUCKET_USD` | 100.0 | Delete bucket entirely if reduced value falls below this threshold. Prevents ghost buckets with negligible value from persisting. |
+
+Sweep logic per bucket:
+1. `bucket.size_usd *= (1.0 - SWEEP_REDUCTION_FACTOR)` — reduce by configured fraction
+2. If `bucket.size_usd < SWEEP_MIN_BUCKET_USD` → delete the bucket
+3. Otherwise bucket survives at reduced intensity
+
+**Applies to projection buckets only.** Tape (observed liquidation flow) continues to hard-delete on sweep because tape represents consumed liquidity — semantically different from projected inventory.
+
+Each sweep reduction emits a debug log entry to `liq_debug_{SYM}.jsonl`:
+```json
+{"type": "sweep_reduced", "symbol": "BTC", "side": "long", "bucket": 67000.0, "before_usd": 50000.0, "after_usd": 15000.0, "deleted": false}
+```
+
+### OI-Based Reduction Cap
+
+When OI drops (positions closing), projections are reduced proportionally. The reduction rate is capped to prevent rapid wipeout during brief OI declines.
+
+| Constant | Value | Previous | Purpose |
+|----------|-------|----------|---------|
+| `MAX_OI_REDUCTION_PER_MINUTE` | 0.25 (25%) | 0.50 (50%) | Maximum fraction of projections removed per minute on OI drop. A 2-minute decline now removes ~44% instead of 75%. |
+
+Reduction formula: `close_factor = min(abs(oi_delta) / total_oi, MAX_OI_REDUCTION_PER_MINUTE)` — scales proportionally to the magnitude of the OI drop relative to total OI, capped at 25% per minute. Falls back to `abs(oi_delta) * src_price / total_projected` when total OI is unavailable.
+
+### Combined-Source Display Boost
+
+Buckets where both tape and inference contribute are the highest-quality signal (56.5% sweep rate vs 0% for pure inference). A display-only intensity boost makes them visually prominent.
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `COMBINED_ZONE_BOOST` | 1.5 | Multiplier applied to heatmap buckets where both tape and inference contribute above EPS threshold. Clamped to 1.0 max after application. |
+| `COMBINED_SOURCE_EPS` | 1e-4 | Minimum normalized value (after independent p99 normalization) to count as "present" from a source. Prevents float noise from triggering false combined classifications. |
+
+**Display-only boundary:** Two parallel methods exist on `EntryInference`:
+- **`get_combined_heatmap()`** — raw combined map (tape_norm × tape_weight + inf_norm × projection_weight). Used by zone logic, calibrator input (`on_minute_snapshot` via `get_heatmap()`), diagnostic logging, and any non-display consumer. **NEVER modify this method to include the boost.**
+- **`get_combined_heatmap_display()`** — display wrapper that calls `get_combined_heatmap()` internally, then applies `COMBINED_ZONE_BOOST` to overlap buckets. Used only for API/display snapshot rendering (via `LiquidationHeatmap.get_heatmap_display()`).
+
+Similarly on `LiquidationHeatmap`:
+- **`get_heatmap()`** — raw version, feeds calibrator `pred_longs`/`pred_shorts` via `on_minute_snapshot()`.
+- **`get_heatmap_display()`** — display wrapper using `get_combined_heatmap_display()`. Used for V1/V2 snapshot JSON writes.
+
+**If any future code needs combined heatmap data for logic (zones, clustering, persistence, calibrator), it MUST call `get_combined_heatmap()` / `get_heatmap()` — never the display wrappers.**
+
+Boost debug metric logged every 10 minutes to `liq_debug_{SYM}.jsonl`:
+```json
+{"type": "combined_zone_boost", "symbol": "BTC", "total_buckets": 150, "boosted_buckets": 12, "boosted_pct": 8.0, "clamped_buckets": 2, "clamped_pct": 16.67, "avg_before_boost": 0.45, "avg_after_boost": 0.675, "boost_factor": 1.5}
+```
 
 ---
 
