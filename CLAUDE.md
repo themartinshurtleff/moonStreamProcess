@@ -351,27 +351,35 @@ Reduction formula: `close_factor = min(abs(oi_delta) / total_oi, MAX_OI_REDUCTIO
 
 ### Combined-Source Display Boost
 
-Buckets where both tape and inference contribute are the highest-quality signal (56.5% sweep rate vs 0% for pure inference). A display-only intensity boost makes them visually prominent.
+Zones where both tape and inference contribute are the highest-quality signal (56.5% sweep rate vs 0% for pure inference). A display-only intensity boost makes them visually prominent.
+
+Applied at **cluster level** in the display path via `LiquidationHeatmap.get_api_response_display()`. For each clustered pool, if both tape and inference contribute buckets within the cluster's `[price_low, price_high]` range above `COMBINED_SOURCE_EPS` on the **same side**, the pool's intensity is boosted by 1.5x (clamped to 1.0). `notional_usd` is not modified. Bucket-level boost in `get_combined_heatmap_display()` is vestigial — tape and inference buckets are structurally ~$430 apart (21.5 steps) and never share a single $20 bucket. The bucket-level code remains for future cleanup.
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `COMBINED_ZONE_BOOST` | 1.5 | Multiplier applied to heatmap buckets where both tape and inference contribute above EPS threshold. Clamped to 1.0 max after application. |
+| `COMBINED_ZONE_BOOST` | 1.5 | Multiplier applied to clustered pool intensity where both tape and inference contribute within the cluster's price range above EPS threshold (side-specific). Clamped to 1.0 max after application. |
 | `COMBINED_SOURCE_EPS` | 1e-4 | Minimum normalized value (after independent p99 normalization) to count as "present" from a source. Prevents float noise from triggering false combined classifications. |
 
 **Display-only boundary:** Two parallel methods exist on `EntryInference`:
 - **`get_combined_heatmap()`** — raw combined map (tape_norm × tape_weight + inf_norm × projection_weight). Used by zone logic, calibrator input (`on_minute_snapshot` via `get_heatmap()`), diagnostic logging, and any non-display consumer. **NEVER modify this method to include the boost.**
-- **`get_combined_heatmap_display()`** — display wrapper that calls `get_combined_heatmap()` internally, then applies `COMBINED_ZONE_BOOST` to overlap buckets. Used only for API/display snapshot rendering (via `LiquidationHeatmap.get_heatmap_display()`).
+- **`get_combined_heatmap_display()`** — display wrapper that calls `get_combined_heatmap()` internally, then applies vestigial bucket-level `COMBINED_ZONE_BOOST` to overlap buckets (never fires in practice). Accepts optional `cluster_boost_stats` dict to merge cluster-level metrics into its 10-minute debug log. Used only for API/display snapshot rendering (via `LiquidationHeatmap.get_heatmap_display()`).
 
 Similarly on `LiquidationHeatmap`:
 - **`get_heatmap()`** — raw version, feeds calibrator `pred_longs`/`pred_shorts` via `on_minute_snapshot()`.
-- **`get_heatmap_display()`** — display wrapper using `get_combined_heatmap_display()`. Used for V1/V2 snapshot JSON writes.
+- **`get_heatmap_display()`** — display wrapper using `get_combined_heatmap_display()`. Used for V1/V2 intensity grid arrays in snapshot JSON writes.
+- **`get_api_response()`** — raw clustered pools. For non-display consumers (if any).
+- **`get_api_response_display()`** — display wrapper that calls `get_api_response()` then applies cluster-level `COMBINED_ZONE_BOOST`. Used for V2 snapshot `long_levels`/`short_levels` and BTC terminal zone tracker. Stores cluster boost stats in `_last_cluster_boost_stats` for the next `get_heatmap_display()` → debug log cycle.
 
-**If any future code needs combined heatmap data for logic (zones, clustering, persistence, calibrator), it MUST call `get_combined_heatmap()` / `get_heatmap()` — never the display wrappers.**
+**If any future code needs combined heatmap data for logic (zones, clustering, persistence, calibrator), it MUST call `get_combined_heatmap()` / `get_heatmap()` / `get_api_response()` — never the display wrappers.**
 
 Boost debug metric logged every 10 minutes to `liq_debug_{SYM}.jsonl`:
 ```json
-{"type": "combined_zone_boost", "symbol": "BTC", "total_buckets": 150, "boosted_buckets": 12, "boosted_pct": 8.0, "clamped_buckets": 2, "clamped_pct": 16.67, "avg_before_boost": 0.45, "avg_after_boost": 0.675, "boost_factor": 1.5}
+{"type": "combined_zone_boost", "symbol": "BTC", "total_buckets": 150, "boosted_buckets": 12, "boosted_pct": 8.0, "clamped_buckets": 2, "clamped_pct": 16.67, "avg_before_boost": 0.45, "avg_after_boost": 0.675, "boost_factor": 1.5, "tape_nonzero_buckets": 9, "inf_nonzero_buckets": 110, "exact_overlap_buckets": 12, "near_overlap_1step": 5, "near_overlap_2step": 8, "min_distance_avg": 42.5, "min_distance_median": 40.0, "step_size": 20.0, "cluster_total": 25, "cluster_combined": 3, "cluster_combined_pct": 12.0, "avg_intensity_before": 0.72, "avg_intensity_after": 0.95, "example_boosted_clusters": [{"price_low": 95000.0, "price_high": 95500.0, "side": "long", "intensity_before": 0.72, "intensity_after": 0.95}]}
 ```
+
+Near-overlap diagnostic fields (added 2026-02-27): `tape_nonzero_buckets` and `inf_nonzero_buckets` count buckets above `COMBINED_SOURCE_EPS` in each source. `exact_overlap_buckets` duplicates `boosted_buckets` for clarity. `near_overlap_1step` / `near_overlap_2step` count tape buckets with an inference bucket within ±1 or ±2 step sizes. `min_distance_avg` / `min_distance_median` give the average and median minimum price distance from each tape bucket to its nearest inference bucket. `step_size` is the symbol's bucket step for reference. These fields diagnose whether zero overlap is due to volume (will resolve) or keying/step mismatch (structural). Uses `bisect` for O(N log M) efficiency.
+
+Cluster-level diagnostic fields (added 2026-02-27): `cluster_total` is the total number of clustered pools (long + short). `cluster_combined` is the count of pools where both tape and inference contribute buckets within the pool's `[price_low, price_high]` range (side-specific checks). `cluster_combined_pct` is `cluster_combined / cluster_total` as percentage. `avg_intensity_before` / `avg_intensity_after` are the mean intensity of combined clusters before and after boost. `example_boosted_clusters` lists up to 3 boosted clusters with `price_low`, `price_high`, `side`, `intensity_before`, `intensity_after` for manual inspection. Presence checks use normalized per-side dicts (post `_p99_scale`) with `bisect` for O(N log M) efficiency.
 
 ---
 

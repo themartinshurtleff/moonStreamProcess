@@ -17,9 +17,11 @@ The quality of inference depends on:
 3. Leverage distribution assumptions (calibrated from LiquidationTape offsets)
 """
 
+import bisect
 import json
 import logging
 import math
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -845,7 +847,8 @@ class EntryInference:
         self,
         tape_heatmap: Dict[str, Dict[float, float]],
         tape_weight: float = 0.4,
-        projection_weight: float = 0.6
+        projection_weight: float = 0.6,
+        cluster_boost_stats: Optional[Dict] = None
     ) -> Dict[str, Dict[float, float]]:
         """
         Display-only wrapper around get_combined_heatmap().
@@ -876,6 +879,10 @@ class EntryInference:
         sum_before = 0.0
         sum_after = 0.0
 
+        # Track per-side nonzero keys for near-overlap analysis
+        all_tape_nonzero_keys: List[float] = []
+        all_inf_nonzero_keys: List[float] = []
+
         for side_key, tape_dict, proj_dict in [
             ("long", tape_long, proj_long),
             ("short", tape_short, proj_short)
@@ -884,6 +891,10 @@ class EntryInference:
                 total_buckets += 1
                 tape_norm_val = min(max(0.0, tape_dict.get(price, 0)) / tape_scale, 1.0)
                 inf_norm_val = min(max(0.0, proj_dict.get(price, 0)) / proj_scale, 1.0)
+                if tape_norm_val > COMBINED_SOURCE_EPS:
+                    all_tape_nonzero_keys.append(price)
+                if inf_norm_val > COMBINED_SOURCE_EPS:
+                    all_inf_nonzero_keys.append(price)
                 if tape_norm_val > COMBINED_SOURCE_EPS and inf_norm_val > COMBINED_SOURCE_EPS:
                     before_val = result[side_key][price]
                     after_val = min(before_val * COMBINED_ZONE_BOOST, 1.0)
@@ -897,6 +908,39 @@ class EntryInference:
         # Debug log: combined_zone_boost every 10 minutes
         if self._debug_log_fh and self.current_minute - self._last_boost_log_minute >= 10:
             self._last_boost_log_minute = self.current_minute
+
+            # Compute near-overlap metrics using bisect for O(N log M) efficiency
+            step = self.steps
+            tape_nonzero_count = len(all_tape_nonzero_keys)
+            inf_nonzero_count = len(all_inf_nonzero_keys)
+            # Deduplicate inference keys (a price could appear in both long and short
+            # result dicts, but the nonzero check ran per-side; duplicates are harmless
+            # for bisect but we keep them for accurate counts — near-overlap uses set)
+            inf_sorted = sorted(set(all_inf_nonzero_keys))
+
+            near_1step = 0
+            near_2step = 0
+            min_distances: List[float] = []
+
+            if tape_nonzero_count > 0 and len(inf_sorted) > 0:
+                for tp in all_tape_nonzero_keys:
+                    # Find nearest inference key via bisect
+                    idx = bisect.bisect_left(inf_sorted, tp)
+                    best_dist = float('inf')
+                    for ci in (idx - 1, idx):
+                        if 0 <= ci < len(inf_sorted):
+                            d = abs(inf_sorted[ci] - tp)
+                            if d < best_dist:
+                                best_dist = d
+                    min_distances.append(best_dist)
+                    if best_dist <= step * 1.0 + 1e-9:
+                        near_1step += 1
+                    if best_dist <= step * 2.0 + 1e-9:
+                        near_2step += 1
+
+            min_dist_avg = round(statistics.mean(min_distances), 4) if min_distances else 0.0
+            min_dist_median = round(statistics.median(min_distances), 4) if min_distances else 0.0
+
             debug_entry = {
                 "type": "combined_zone_boost",
                 "ts": time.time(),
@@ -908,8 +952,19 @@ class EntryInference:
                 "clamped_pct": round(100.0 * clamped_buckets / boosted_buckets, 2) if boosted_buckets > 0 else 0.0,
                 "avg_before_boost": round(sum_before / boosted_buckets, 6) if boosted_buckets > 0 else 0.0,
                 "avg_after_boost": round(sum_after / boosted_buckets, 6) if boosted_buckets > 0 else 0.0,
-                "boost_factor": COMBINED_ZONE_BOOST
+                "boost_factor": COMBINED_ZONE_BOOST,
+                "tape_nonzero_buckets": tape_nonzero_count,
+                "inf_nonzero_buckets": inf_nonzero_count,
+                "exact_overlap_buckets": boosted_buckets,
+                "near_overlap_1step": near_1step,
+                "near_overlap_2step": near_2step,
+                "min_distance_avg": min_dist_avg,
+                "min_distance_median": min_dist_median,
+                "step_size": step
             }
+            # Merge cluster-level boost stats if available
+            if cluster_boost_stats:
+                debug_entry.update(cluster_boost_stats)
             self._debug_log_fh.write(json.dumps(debug_entry) + '\n')
             self._debug_log_fh.flush()
 
