@@ -370,8 +370,10 @@ Similarly on `LiquidationHeatmap`:
 
 Boost debug metric logged every 10 minutes to `liq_debug_{SYM}.jsonl`:
 ```json
-{"type": "combined_zone_boost", "symbol": "BTC", "total_buckets": 150, "boosted_buckets": 12, "boosted_pct": 8.0, "clamped_buckets": 2, "clamped_pct": 16.67, "avg_before_boost": 0.45, "avg_after_boost": 0.675, "boost_factor": 1.5}
+{"type": "combined_zone_boost", "symbol": "BTC", "total_buckets": 150, "boosted_buckets": 12, "boosted_pct": 8.0, "clamped_buckets": 2, "clamped_pct": 16.67, "avg_before_boost": 0.45, "avg_after_boost": 0.675, "boost_factor": 1.5, "tape_nonzero_buckets": 9, "inf_nonzero_buckets": 110, "exact_overlap_buckets": 12, "near_overlap_1step": 5, "near_overlap_2step": 8, "min_distance_avg": 42.5, "min_distance_median": 40.0, "step_size": 20.0}
 ```
+
+Near-overlap diagnostic fields (added 2026-02-27): `tape_nonzero_buckets` and `inf_nonzero_buckets` count buckets above `COMBINED_SOURCE_EPS` in each source. `exact_overlap_buckets` duplicates `boosted_buckets` for clarity. `near_overlap_1step` / `near_overlap_2step` count tape buckets with an inference bucket within ±1 or ±2 step sizes. `min_distance_avg` / `min_distance_median` give the average and median minimum price distance from each tape bucket to its nearest inference bucket. `step_size` is the symbol's bucket step for reference. These fields diagnose whether zero overlap is due to volume (will resolve) or keying/step mismatch (structural). Uses `bisect` for O(N log M) efficiency.
 
 ---
 
