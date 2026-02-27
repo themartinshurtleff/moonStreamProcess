@@ -1547,7 +1547,7 @@ class FullMetricsProcessor:
                         if sym_v2_src <= 0:
                             continue
 
-                        sym_v2_snap = eng_v2.heatmap_v2.get_api_response(
+                        sym_v2_snap = eng_v2.heatmap_v2.get_api_response_display(
                             price_center=sym_v2_src,
                             price_range_pct=0.10,
                             min_notional_usd=1000.0,
@@ -1623,7 +1623,7 @@ class FullMetricsProcessor:
                     self._applied_persisted_weights[sym_short] = True
 
                 # Get top predicted liquidation zones from V2 engine (clustered pools)
-                v2_response = self._btc().heatmap_v2.get_api_response(
+                v2_response = self._btc().heatmap_v2.get_api_response_display(
                     price_center=v2_src,
                     price_range_pct=0.25,      # ±25% range for more visibility
                     min_notional_usd=0         # No filtering, let UI handle it

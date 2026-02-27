@@ -14,6 +14,7 @@ Both layers feed back into each other:
 - Inference provides entry estimates for tape offset learning
 """
 
+import bisect
 import json
 import logging
 import math
@@ -24,7 +25,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from liq_tape import LiquidationTape
-from entry_inference import EntryInference, _p99_scale
+from entry_inference import EntryInference, _p99_scale, COMBINED_ZONE_BOOST, COMBINED_SOURCE_EPS
 
 # V3: Import zone manager for persistent zones
 try:
@@ -129,6 +130,7 @@ class LiquidationHeatmap:
         self.current_price: float = 0.0
         self.last_oi: float = 0.0
         self._last_balance_log_minute: int = 0
+        self._last_cluster_boost_stats: Dict = {}
 
         # Learning feedback: how often to push tape learning to inference
         self.tape_learning_interval = 60  # Every 60 minutes
@@ -455,10 +457,12 @@ class LiquidationHeatmap:
         projections = self.inference.get_projections()
 
         # Combine with weights + display boost
+        # Pass cluster-level boost stats if available (set by get_api_response_display)
         combined = self.inference.get_combined_heatmap_display(
             tape_heatmap,
             tape_weight=self.config.tape_weight,
-            projection_weight=self.config.projection_weight
+            projection_weight=self.config.projection_weight,
+            cluster_boost_stats=self._last_cluster_boost_stats or None
         )
 
         # Normalize combined values to 0-1 intensity
@@ -692,6 +696,129 @@ class LiquidationHeatmap:
                 "raw_short_buckets": len(short_in_range)
             }
         }
+
+    def get_api_response_display(
+        self,
+        price_center: float = None,
+        price_range_pct: float = 0.10,
+        min_notional_usd: float = None
+    ) -> Dict:
+        """
+        Display-only wrapper around get_api_response().
+
+        Applies COMBINED_ZONE_BOOST at the cluster level: for each clustered pool,
+        if both tape and inference contribute buckets within [price_low, price_high]
+        above COMBINED_SOURCE_EPS on the same side, the pool's intensity is boosted
+        by COMBINED_ZONE_BOOST (clamped to 1.0). Notional_usd is NOT modified.
+
+        For non-display consumers (calibrator, zone logic, persistence), always
+        use get_api_response() — never this display wrapper.
+        """
+        response = self.get_api_response(price_center, price_range_pct, min_notional_usd)
+        if "error" in response:
+            return response
+
+        # Get raw tape and inference per-side dicts for presence checks
+        tape_heatmap = self.tape.get_heatmap()
+        projections = self.inference.get_projections()
+
+        tape_long_raw = tape_heatmap.get("long", {})
+        tape_short_raw = tape_heatmap.get("short", {})
+        proj_long_raw = projections.get("long", {})
+        proj_short_raw = projections.get("short", {})
+
+        # Compute p99 scales so COMBINED_SOURCE_EPS has consistent meaning
+        all_tape_vals = [max(0.0, v) for v in
+                         list(tape_long_raw.values()) + list(tape_short_raw.values())]
+        all_proj_vals = [max(0.0, v) for v in
+                         list(proj_long_raw.values()) + list(proj_short_raw.values())]
+        tape_scale = _p99_scale(all_tape_vals)
+        proj_scale = _p99_scale(all_proj_vals)
+
+        # Build normalized per-side dicts: {price: normalized_value}
+        # Only keep entries > 0 for efficient iteration
+        tape_long_norm = {}
+        for p, v in tape_long_raw.items():
+            nv = min(max(0.0, v) / tape_scale, 1.0)
+            if nv > COMBINED_SOURCE_EPS:
+                tape_long_norm[p] = nv
+        tape_short_norm = {}
+        for p, v in tape_short_raw.items():
+            nv = min(max(0.0, v) / tape_scale, 1.0)
+            if nv > COMBINED_SOURCE_EPS:
+                tape_short_norm[p] = nv
+        proj_long_norm = {}
+        for p, v in proj_long_raw.items():
+            nv = min(max(0.0, v) / proj_scale, 1.0)
+            if nv > COMBINED_SOURCE_EPS:
+                proj_long_norm[p] = nv
+        proj_short_norm = {}
+        for p, v in proj_short_raw.items():
+            nv = min(max(0.0, v) / proj_scale, 1.0)
+            if nv > COMBINED_SOURCE_EPS:
+                proj_short_norm[p] = nv
+
+        # Sort keys for bisect lookups
+        tape_long_keys = sorted(tape_long_norm.keys())
+        tape_short_keys = sorted(tape_short_norm.keys())
+        proj_long_keys = sorted(proj_long_norm.keys())
+        proj_short_keys = sorted(proj_short_norm.keys())
+
+        # For each side, check clusters for combined-source presence
+        cluster_total = 0
+        cluster_combined = 0
+        sum_intensity_before = 0.0
+        sum_intensity_after = 0.0
+        example_boosted: List[Dict] = []
+
+        for side_key, tape_keys, proj_keys in [
+            ("long", tape_long_keys, proj_long_keys),
+            ("short", tape_short_keys, proj_short_keys),
+        ]:
+            levels_key = f"{side_key}_levels"
+            for level in response.get(levels_key, []):
+                cluster_total += 1
+                p_low = level["price_low"]
+                p_high = level["price_high"]
+
+                # Find tape keys in [p_low, p_high] via bisect
+                ti_lo = bisect.bisect_left(tape_keys, p_low)
+                ti_hi = bisect.bisect_right(tape_keys, p_high)
+                tape_present = ti_lo < ti_hi  # at least one key in range
+
+                # Find proj keys in [p_low, p_high] via bisect
+                pi_lo = bisect.bisect_left(proj_keys, p_low)
+                pi_hi = bisect.bisect_right(proj_keys, p_high)
+                proj_present = pi_lo < pi_hi  # at least one key in range
+
+                if tape_present and proj_present:
+                    cluster_combined += 1
+                    before_intensity = level["intensity"]
+                    after_intensity = min(before_intensity * COMBINED_ZONE_BOOST, 1.0)
+                    level["intensity"] = after_intensity
+                    sum_intensity_before += before_intensity
+                    sum_intensity_after += after_intensity
+                    if len(example_boosted) < 3:
+                        example_boosted.append({
+                            "price_low": p_low,
+                            "price_high": p_high,
+                            "side": side_key,
+                            "intensity_before": round(before_intensity, 4),
+                            "intensity_after": round(after_intensity, 4)
+                        })
+
+        # Store cluster-level boost stats for debug logging (read by
+        # get_combined_heatmap_display's 10-minute log cycle)
+        self._last_cluster_boost_stats = {
+            "cluster_total": cluster_total,
+            "cluster_combined": cluster_combined,
+            "cluster_combined_pct": round(100.0 * cluster_combined / cluster_total, 2) if cluster_total > 0 else 0.0,
+            "avg_intensity_before": round(sum_intensity_before / cluster_combined, 6) if cluster_combined > 0 else 0.0,
+            "avg_intensity_after": round(sum_intensity_after / cluster_combined, 6) if cluster_combined > 0 else 0.0,
+            "example_boosted_clusters": example_boosted
+        }
+
+        return response
 
     def get_stats(self) -> dict:
         """Get comprehensive statistics."""

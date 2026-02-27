@@ -847,7 +847,8 @@ class EntryInference:
         self,
         tape_heatmap: Dict[str, Dict[float, float]],
         tape_weight: float = 0.4,
-        projection_weight: float = 0.6
+        projection_weight: float = 0.6,
+        cluster_boost_stats: Optional[Dict] = None
     ) -> Dict[str, Dict[float, float]]:
         """
         Display-only wrapper around get_combined_heatmap().
@@ -961,6 +962,9 @@ class EntryInference:
                 "min_distance_median": min_dist_median,
                 "step_size": step
             }
+            # Merge cluster-level boost stats if available
+            if cluster_boost_stats:
+                debug_entry.update(cluster_boost_stats)
             self._debug_log_fh.write(json.dumps(debug_entry) + '\n')
             self._debug_log_fh.flush()
 
