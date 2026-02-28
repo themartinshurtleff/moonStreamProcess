@@ -1,0 +1,1 @@
+{"type": "sweep", "ts": 1772242560.0011961, "minute_key": 29537376, "side": "short", "bucket": 65460.0, "total_notional_usd": 3191.81, "trade_count": 1, "peak_notional_usd": 3191.81, "layer": "tape", "reason": "high>=65460", "trigger_high": 65801.25}

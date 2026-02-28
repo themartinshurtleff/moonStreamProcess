@@ -1,0 +1,16 @@
+{"type": "forceOrder", "ts": 1772242489.584, "symbol": "ETH", "side": "long", "price": 1914.13, "qty": 0.131, "notional": 250.75103000000001, "bucket": 1914.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772242493.71, "symbol": "ETH", "side": "long", "price": 1914.27, "qty": 0.222, "notional": 424.96794, "bucket": 1914.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772242572.861, "symbol": "ETH", "side": "short", "price": 1933.89, "qty": 4.11, "notional": 7948.287900000001, "bucket": 1934.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772242779.353, "symbol": "ETH", "side": "long", "price": 1918.85, "qty": 0.044, "notional": 84.42939999999999, "bucket": 1919.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772243285.52, "symbol": "ETH", "side": "short", "price": 1935.07, "qty": 0.015, "notional": 29.026049999999998, "bucket": 1935.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772243302.564, "symbol": "ETH", "side": "short", "price": 1935.39, "qty": 2.487, "notional": 4813.3149300000005, "bucket": 1935.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772243309.736, "symbol": "ETH", "side": "short", "price": 1935.56, "qty": 0.168, "notional": 325.17408, "bucket": 1936.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772243620.334, "symbol": "ETH", "side": "short", "price": 1933.96, "qty": 0.022, "notional": 42.54712, "bucket": 1934.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772243982.542, "symbol": "ETH", "side": "long", "price": 1916.42, "qty": 0.073, "notional": 139.89866, "bucket": 1916.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772244091.052, "symbol": "ETH", "side": "long", "price": 1915.43, "qty": 0.723, "notional": 1384.85589, "bucket": 1915.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772244183.088, "symbol": "ETH", "side": "long", "price": 1914.86, "qty": 0.335, "notional": 641.4781, "bucket": 1915.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772244189.347, "symbol": "ETH", "side": "long", "price": 1914.16, "qty": 1.12, "notional": 2143.8592000000003, "bucket": 1914.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772244488.208, "symbol": "ETH", "side": "short", "price": 1934.57, "qty": 0.607, "notional": 1174.28399, "bucket": 1935.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772244489.481, "symbol": "ETH", "side": "short", "price": 1934.78, "qty": 0.506, "notional": 978.99868, "bucket": 1935.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772244490.587, "symbol": "ETH", "side": "short", "price": 1935.02, "qty": 29.331, "notional": 56756.071619999995, "bucket": 1935.0, "entry_est": null}
+{"type": "forceOrder", "ts": 1772245056.104, "symbol": "ETH", "side": "short", "price": 1936.1, "qty": 0.038, "notional": 73.5718, "bucket": 1936.0, "entry_est": null}
