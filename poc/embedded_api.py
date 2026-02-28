@@ -26,6 +26,7 @@ Usage:
     api_thread = start_api_thread(app, host="127.0.0.1", port=8899)
 """
 
+import copy
 import json
 import os
 import struct
@@ -211,6 +212,8 @@ class LiquidationHeatmapBuffer:
         frames_to_load = min(total_frames, self.max_frames)
         start_offset = (total_frames - frames_to_load) * LIQ_FRAME_RECORD_SIZE
 
+        loaded = 0
+        skipped = 0
         try:
             with open(self.persistence_path, 'rb') as f:
                 f.seek(start_offset)
@@ -223,10 +226,19 @@ class LiquidationHeatmapBuffer:
                         if frame is not None:
                             self._frames.append(frame)
                             self._last_ts = frame.ts
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                            loaded += 1
+                        else:
+                            skipped += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.warning("Skipped corrupt frame in %s: %s",
+                                       self.persistence_path, e)
+        except Exception as e:
+            logger.error("Failed to load history file %s: %s",
+                         self.persistence_path, e, exc_info=True)
+        if loaded > 0 or skipped > 0:
+            logger.info("Loaded %d frames, skipped %d corrupt frames from %s",
+                        loaded, skipped, self.persistence_path)
 
     def _frame_from_bytes(self, data: bytes) -> Optional[HistoryFrame]:
         """Deserialize frame from binary record."""
@@ -872,7 +884,8 @@ def create_embedded_app(
                 detail=f"Data for {sym} is warming up, try again shortly"
             )
 
-        stats = snapshot.get('stats', {})
+        # Copy stats to avoid mutating the cached snapshot dict in-place
+        stats = copy.deepcopy(snapshot.get('stats', {}))
         stats['symbol'] = sym
         stats['snapshot_ts'] = snapshot.get('ts', 0)
         stats['snapshot_age_s'] = round(time.time() - snapshot.get('ts', 0), 1)
@@ -923,6 +936,12 @@ def create_embedded_app(
         Returns the most recently WRITTEN frame (never synthesized/rewritten).
         """
         _require_btc_orderbook(symbol)
+
+        # Validate user-provided grid parameters
+        if step <= 0:
+            raise HTTPException(status_code=400, detail="step must be positive")
+        if range_pct <= 0 or range_pct > 1.0:
+            raise HTTPException(status_code=400, detail="range_pct must be between 0 and 1.0")
 
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
@@ -1051,6 +1070,10 @@ def create_embedded_app(
         Binary format (format=bin) returns compact blob for low-latency backfill.
         """
         _require_btc_orderbook(symbol)
+
+        # Validate user-provided grid parameters
+        if step <= 0:
+            raise HTTPException(status_code=400, detail="step must be positive")
 
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(

@@ -5,11 +5,14 @@ Supports Binance, Bybit, and OKX perpetual streams.
 
 import asyncio
 import json
+import logging
 import time
 import websockets
 from typing import Callable, Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from collections import deque
+
+logger = logging.getLogger(__name__)
 
 # Default symbols for multi-symbol connectors (Bybit, OKX).
 # Binance uses !forceOrder@arr which already gets all symbols.
@@ -89,14 +92,16 @@ class BinanceConnector:
                             self.message_counts[name] = self.message_counts.get(name, 0) + 1
                             self.last_messages[name] = time.time()
                             self.on_message(wrapped)
-                        except json.JSONDecodeError:
-                            pass
+                        except json.JSONDecodeError as e:
+                            logger.warning("Binance %s JSON decode error: %s", name, e)
 
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
                 if self.running:
-                    await asyncio.sleep(1)  # Reconnect delay
+                    logger.error("Binance %s connection closed: %s", name, e)
+                    await asyncio.sleep(1)
             except Exception as e:
                 if self.running:
+                    logger.error("Binance %s error: %s", name, e, exc_info=True)
                     await asyncio.sleep(1)
 
     async def connect_all(self):
@@ -267,14 +272,16 @@ class OKXConnector:
                             self.message_counts[obj] = self.message_counts.get(obj, 0) + 1
                             self.last_messages[obj] = time.time()
                             self.on_message(wrapped)
-                        except json.JSONDecodeError:
-                            pass
+                        except json.JSONDecodeError as e:
+                            logger.warning("OKX JSON decode error: %s", e)
 
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
                 if self.running:
+                    logger.error("OKX connection closed: %s", e)
                     await asyncio.sleep(1)
-            except Exception:
+            except Exception as e:
                 if self.running:
+                    logger.error("OKX error: %s", e, exc_info=True)
                     await asyncio.sleep(1)
 
     def stop(self):
@@ -383,14 +390,16 @@ class BybitConnector:
                             self.message_counts[obj] = self.message_counts.get(obj, 0) + 1
                             self.last_messages[obj] = time.time()
                             self.on_message(wrapped)
-                        except json.JSONDecodeError:
-                            pass
+                        except json.JSONDecodeError as e:
+                            logger.warning("Bybit JSON decode error: %s", e)
 
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
                 if self.running:
+                    logger.error("Bybit connection closed: %s", e)
                     await asyncio.sleep(1)
-            except Exception:
+            except Exception as e:
                 if self.running:
+                    logger.error("Bybit error: %s", e, exc_info=True)
                     await asyncio.sleep(1)
 
     def stop(self):

@@ -70,8 +70,10 @@ class MultiExchangeOIPoller:
         self.running = False
         self._session: Optional[aiohttp.ClientSession] = None
 
-        # Latest snapshots per symbol (thread-safe reads from API thread)
+        # Latest snapshots per symbol — protected by _snapshot_lock for
+        # thread-safe access between the poller thread and API thread.
         self.snapshots: Dict[str, OISnapshot] = {}
+        self._snapshot_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Per-exchange fetch functions — return OI in BASE ASSET or None
@@ -181,13 +183,14 @@ class MultiExchangeOIPoller:
 
         aggregated = sum(per_exchange.values())
 
-        # Store snapshot
-        self.snapshots[symbol_short] = OISnapshot(
-            symbol=symbol_short,
-            aggregated_oi=aggregated,
-            per_exchange=dict(per_exchange),
-            ts=time.time(),
-        )
+        # Store snapshot (thread-safe write)
+        with self._snapshot_lock:
+            self.snapshots[symbol_short] = OISnapshot(
+                symbol=symbol_short,
+                aggregated_oi=aggregated,
+                per_exchange=dict(per_exchange),
+                ts=time.time(),
+            )
 
         # Deliver to callback
         try:
@@ -226,7 +229,8 @@ class MultiExchangeOIPoller:
 
     def get_snapshot(self, symbol: str) -> Optional[OISnapshot]:
         """Get the latest OI snapshot for a symbol (thread-safe read)."""
-        return self.snapshots.get(symbol)
+        with self._snapshot_lock:
+            return self.snapshots.get(symbol)
 
 
 class OIPollerThread:
