@@ -32,7 +32,7 @@ All core code lives in `poc/`. The system collects market data from **Binance, B
 | File | Role |
 |------|------|
 | `full_metrics_viewer.py` | **Main entry point.** Launches WebSocket/REST connections, instantiates all sub-engines, runs Rich terminal dashboard at 4 FPS, writes snapshot files, starts embedded API server. |
-| `ws_connectors.py` | `BinanceConnector`, `BybitConnector`, `OKXConnector`, and `MultiExchangeConnector` — WebSocket streams for depth, aggTrade, forceOrder/liquidations, markPrice. All three exchanges active. |
+| `ws_connectors.py` | `BinanceConnector`, `BybitConnector`, `OKXConnector`, and `MultiExchangeConnector` — WebSocket streams for depth, aggTrade, forceOrder/liquidations, markPrice. All three exchanges active. All error paths log via `logger` (Sprint 1 H2-lite). |
 | `liq_normalizer.py` | **Liquidation normalizer.** Converts raw exchange-specific liquidation messages into `CommonLiqEvent` before reaching `EngineManager`. Handles Binance/Bybit order-side → position-side inversion (both use same convention), OKX contract-to-base conversion. |
 | `oi_poller.py` | `MultiExchangeOIPoller` + `OIPollerThread` — polls OI from Binance, Bybit, OKX every 15s per symbol (BTC, ETH, SOL). Aggregates across exchanges, delivers per-symbol updates via callback. All OI in base asset. |
 | `rest_pollers.py` | `BinanceRESTPollerThread` — polls trader ratios (TTA, TTP, GTA) from Binance REST. OI polling moved to `oi_poller.py`. |
@@ -46,7 +46,7 @@ All core code lives in `poc/`. The system collects market data from **Binance, B
 | `ob_heatmap.py` | Orderbook heatmap with `OrderbookReconstructor` (snapshot+diff) and `OrderbookAccumulator` (30-second frames). Binary ring buffer persistence. |
 | `liq_api.py` | **ORPHANED (Phase 1).** Standalone FastAPI HTTP server (v3.0.0). Reads from snapshot files on disk. Superseded by `embedded_api.py` which now has all endpoints including V3 zones. |
 | `engine_manager.py` | `EngineManager` + `EngineInstance` — per-symbol container holding calibrator, heatmap_v2, zone_manager, ob_reconstructor, ob_accumulator. Single owner of all engine objects after init. |
-| `embedded_api.py` | **Embedded** FastAPI server (v3.0.0). Runs as daemon thread inside viewer. Shares `ob_buffer` by direct Python reference. Receives `EngineManager` for V3 zone endpoints. Includes `ResponseCache` with eviction for concurrent-user scaling. Cache refresh loops log errors instead of swallowing exceptions. All endpoints (V1–V3) available. **This is now the only API server needed.** |
+| `embedded_api.py` | **Embedded** FastAPI server (v3.0.0). Runs as daemon thread inside viewer. Shares `ob_buffer` by direct Python reference. Receives `EngineManager` for V3 zone endpoints. Includes `ResponseCache` with eviction for concurrent-user scaling. All endpoints (V1–V3) available. `/liq_stats` copies snapshot stats before mutation (Sprint 1 H5). History loading logs corrupt frames (Sprint 1 H1). OB endpoints validate `step`/`range_pct` (Sprint 1 C5). **This is now the only API server needed.** |
 | `liq_plotter.py` | Matplotlib live chart tailing `plot_feed.jsonl`. |
 | `metrics_viewer.py` | Earlier/simpler viewer (predecessor to `full_metrics_viewer.py`). |
 | `list_metrics.py` | Reference script listing all ~40 BTC perpetual metrics from Binance. |
@@ -168,6 +168,8 @@ HeatmapConfig(symbol={SYM}, steps={from SYMBOL_CONFIGS}, decay=0.995, buffer=0.0
 ```python
 symbols=["BTC", "ETH", "SOL"], poll_interval=15.0
 # Polls Binance + Bybit + OKX concurrently per symbol
+# Thread safety: self._snapshot_lock protects self.snapshots dict
+# for concurrent access between poller thread and API thread (Sprint 1 H3)
 ```
 
 ### BinanceRESTPollerThread (ratios only)
@@ -419,8 +421,11 @@ MultiExchangeOIPoller (oi_poller.py) polls every 15s:
 
 ### Path C: Minute Rollover → Snapshot → API → Frontend
 
+**BTC depth fallback (Sprint 1 C1):** The minute rollover requires a valid BTC price (`perp_close > 0`). Primary source is the BTC orderbook depth mid-price. If depth has been stale for >60 seconds, the rollover falls back to `symbol_prices["BTC"]["close"]` (from the `markPrice@1s` stream). A warning is logged once per minute when the fallback activates. If both depth and markPrice are unavailable, the rollover is skipped with an error log — no rollover from bad data.
+
 ```
 full_metrics_viewer detects new minute boundary
+  → if perp_close == 0 for >60s: fallback to BTC markPrice (logged)
   → for each symbol (BTC, ETH, SOL):
     → computes per-symbol OHLC4 from accumulated ticks / markPrice stream
     → eng.heatmap_v2.on_minute(src, high, low, oi, taker_buy, taker_sell)
@@ -526,6 +531,8 @@ Clean paths are primary. Old `/vN/` paths are backwards-compatible aliases via s
 
 **Note:** Binary format responses (`format=bin`) for orderbook endpoints bypass the `ResponseCache` and are always generated fresh.
 
+**Input validation (Sprint 1 C5):** Orderbook endpoints validate user-provided `step` (must be > 0, returns 400) and `range_pct` (must be > 0 and ≤ 1.0, returns 400) before any grid computation. This prevents division-by-zero and infinite-loop bugs from malicious or malformed query parameters.
+
 ### Standalone Server (liq_api.py — ORPHANED)
 
 `liq_api.py` is no longer needed. All its endpoints (including V3 zones) are now served by `embedded_api.py`. The standalone server remains in the codebase for reference but should not be run alongside the viewer.
@@ -570,9 +577,13 @@ Frontend (consumer)
   └─ Polls API endpoints, parses JSON responses
 ```
 
-**Write format for snapshot JSON:** `write_json_atomic()` (tmp + flush + fsync + `os.replace`) in `full_metrics_viewer.py`. Both calibrator weights and snapshot files now use atomic writes.
+**Write format for snapshot JSON:** `write_json_atomic()` (tmp + flush + fsync + `os.replace`) in `full_metrics_viewer.py`. Both calibrator weights and snapshot files now use atomic writes. Write failures are logged via `logger.error()` with full traceback (Sprint 1 C2) — failures do not crash the process but are always visible in logs.
 
 **Write format for binary files:** fixed 4KB records. Header (48 bytes): `ts(d) + src(d) + price_min(d) + price_max(d) + step(d) + n_buckets(I)`. Followed by 1000 bytes long intensity (u8), 1000 bytes short intensity (u8), padded to 4096.
+
+**Shutdown behavior (Sprint 1 C3):** On SIGINT/SIGTERM or KeyboardInterrupt, the shutdown path calls `heatmap_v2.close()` for every registered engine (BTC, ETH, SOL). This flushes zone persistence to disk, stops zone manager threads, and closes log file handles. Each engine's close is independently try/excepted — one engine's failure does not block others. The shutdown sequence is: `stop_event.set()` → `connector.stop()` → `oi_poller.stop()` → `rest_poller.stop()` → `_close_engines()`.
+
+**History file loading (Sprint 1 H1):** `LiquidationHeatmapBuffer._load_from_disk()` logs corrupt frames at WARNING level per-record and ERROR level (with traceback) for whole-file failures. A summary line at INFO level reports loaded vs skipped frame counts.
 
 ## NEVER DO — Code Rules
 
@@ -659,6 +670,74 @@ Frontend (consumer)
 
 ### NOTE: Weight file saving gated by calibration_enabled
 - `_save_weights()` is only called inside `_run_calibration()` and is conditional on `self.calibration_enabled == True`. When a safety trip (e.g. entropy collapse) sets `calibration_enabled = False`, weight saving is intentionally suspended. The return value of `_save_weights()` is not checked at the call site (line 2418), but the method logs errors internally. This is intentional design — weights freeze when safety guardrails trip.
+
+### RESOLVED: BTC depth failure froze ALL symbol pipelines (Sprint 1 C1)
+- **Root cause:** `_check_minute_rollover()` was gated on `self.state.perp_close > 0`. `perp_close` only comes from BTC orderbook depth. If BTC depth disconnected, `perp_close` stayed at 0 and minute rollover never fired for ANY symbol — ETH/SOL were silently frozen.
+- **Fix:** Added markPrice fallback: if `perp_close` is 0 for >60 seconds, fall back to `symbol_prices["BTC"]["close"]` (from `markPrice@1s`). Warning logged once per minute. If markPrice also unavailable, rollover is skipped with error log.
+
+### RESOLVED: write_json_atomic() silently swallowed all exceptions (Sprint 1 C2)
+- **Root cause:** Bare `except: pass` hid all I/O errors (disk full, permissions, etc.).
+- **Fix:** Changed to `except Exception as e: logger.error(...)` with `exc_info=True`. Failures are now visible in logs.
+
+### RESOLVED: Shutdown did not close per-symbol heatmap engines (Sprint 1 C3)
+- **Root cause:** On Ctrl+C, zone persistence was not flushed, file handles not closed.
+- **Fix:** Added `_close_engines()` helper that iterates all engines and calls `heatmap_v2.close()`. Called from both signal handler and finally block. Each engine's close is independently try/excepted.
+
+### RESOLVED: OB endpoints accepted unvalidated step/range_pct (Sprint 1 C5)
+- **Root cause:** User-provided `step` went directly into grid math. `step=0` caused division-by-zero, negative step caused infinite loops.
+- **Fix:** `/orderbook_heatmap` validates `step > 0` and `0 < range_pct <= 1.0` (returns 400). `/orderbook_heatmap_history` validates `step > 0` (returns 400).
+
+### RESOLVED: History file deserialization silently swallowed corruption (Sprint 1 H1)
+- **Root cause:** `_load_from_disk()` had nested `except: pass` at both per-record and whole-file levels.
+- **Fix:** Per-record: `logger.warning()`. Whole-file: `logger.error()` with traceback. Summary line logs loaded vs skipped frame counts.
+
+### RESOLVED: OI poller snapshot dict shared without lock (Sprint 1 H3)
+- **Root cause:** `self.snapshots` written by poller thread, read by API thread — no synchronization.
+- **Fix:** Added `self._snapshot_lock = threading.Lock()`. Write path (`_poll_symbol`) and read path (`get_snapshot`) both acquire the lock.
+
+### RESOLVED: /liq_stats mutated cached V2 snapshot in-place (Sprint 1 H5)
+- **Root cause:** Endpoint added `symbol`, `snapshot_ts`, `snapshot_age_s` directly to the cached snapshot dict, corrupting subsequent `/liq_heatmap_v2` reads.
+- **Fix:** `copy.deepcopy()` before mutation. Original cached dict is never modified.
+
+### RESOLVED: WebSocket connectors suppressed all exceptions with no logging (Sprint 1 H2-lite)
+- **Root cause:** All three connectors (Binance, Bybit, OKX) had bare `except: pass` or `except Exception: await asyncio.sleep(1)` with zero logging. Disconnections, parse errors, and protocol faults were invisible.
+- **Fix:** Added `logger = logging.getLogger(__name__)` to `ws_connectors.py`. All 9 except blocks now log: `json.JSONDecodeError` at WARNING, `ConnectionClosed` at ERROR, general `Exception` at ERROR with `exc_info=True`. All blocks retain existing sleep(1) for reconnect delay.
+
+### RESOLVED: Calibrator silently dropped events when no snapshot available (Sprint 2 C4)
+- **Root cause:** `_process_event()` returned early when `_get_snapshot_for_event()` returned None, with no indication that events were being dropped.
+- **Fix:** Added rate-limited WARNING log (once per minute) before the early return: `"Calibrator [SYM]: dropping event — no snapshot available for minute N. snapshots_count=M"`.
+
+### RESOLVED: WebSocket reconnect used fixed 1s delay with no backoff (Sprint 2 H2-full)
+- **Root cause:** All three WS connectors used `await asyncio.sleep(1)` on every reconnect, hammering exchange endpoints during outages.
+- **Fix:** Exponential backoff: initial=1s, max=30s, jitter ×random(0.8, 1.2). Resets on successful connection. After 5 consecutive identical errors, log level downgrades to DEBUG. Constants: `_BACKOFF_INITIAL`, `_BACKOFF_MAX`, `_BACKOFF_JITTER_LOW`, `_BACKOFF_JITTER_HIGH`, `_REPEATED_ERROR_THRESHOLD`.
+
+### RESOLVED: /oi returned 404 during warmup instead of 503 (Sprint 2 H4)
+- **Root cause:** `/oi` returned 404 when no OI data was available yet; 404 implies the resource doesn't exist.
+- **Fix:** Changed to `status_code=503` with message "Poller may still be initializing".
+
+### RESOLVED: Thread stop methods were non-blocking with no join (Sprint 2 H6)
+- **Root cause:** `OIPollerThread.stop()` and `BinanceRESTPollerThread.stop()` only signaled stop but never waited for thread termination.
+- **Fix:** Added `self._thread.join(timeout=5)` after signaling stop. Logs WARNING if thread doesn't terminate within 5s.
+
+### RESOLVED: ob_heatmap.py used incremental p+=step grid construction (Sprint 2 H7)
+- **Root cause:** `OrderbookFrame.get_prices()` and `OrderbookAccumulator._emit_frame()` used `while p += step` loops, violating Rule #16.
+- **Fix:** Replaced with index-based `round(price_min + i * step, ndigits)` in both locations.
+
+### RESOLVED: Embedded API refresh thread not joined on shutdown (Sprint 2 H9)
+- **Root cause:** `EmbeddedAPIState.stop()` only set `_running = False`. No code called `state.stop()` during shutdown.
+- **Fix:** `stop()` now joins the refresh thread (timeout=5s). `app._api_state = state` attached for external access. `_stop_api_state()` added to `full_metrics_viewer.py` shutdown path (signal handler + finally block).
+
+### RESOLVED: EntryInference projection dicts accessed without thread safety (Sprint 2 M1)
+- **Root cause:** `projected_long_liqs` and `projected_short_liqs` written by main thread, read by API thread, no synchronization.
+- **Fix:** Added `self._projection_lock = threading.Lock()`. Write path: `on_minute()` mutation block wrapped with lock. Read paths: `get_combined_heatmap()`, `get_combined_heatmap_display()`, `get_projections()`, `get_stats()` use copy-on-read under the lock.
+
+### RESOLVED: OI poller delivered 0.0 when all exchanges failed (Sprint 2 M2)
+- **Root cause:** When all 3 exchanges failed, `per_exchange` was empty, `sum()` returned 0.0, downstream interpreted as "OI dropped to zero".
+- **Fix:** Early return with WARNING when `per_exchange` is empty. No snapshot update, no callback. Previous snapshot remains valid.
+
+### RESOLVED: API bind address not configurable (Sprint 2 M8)
+- **Root cause:** `start_api_thread()` hardcoded `host="127.0.0.1"`.
+- **Fix:** Resolution order: explicit parameter > `API_HOST` env var > `"127.0.0.1"` fallback. Set `API_HOST=0.0.0.0` for production.
 
 ---
 

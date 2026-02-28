@@ -531,12 +531,10 @@ class OrderbookFrame:
         return len(self.bid_u8)
 
     def get_prices(self) -> List[float]:
-        """Generate price grid from bounds."""
-        prices = []
-        p = self.price_min
-        while p <= self.price_max + 0.01:  # Small epsilon for float comparison
-            prices.append(p)
-            p += self.step
+        """Generate price grid from bounds (index-based, Rule #16)."""
+        ndigits = max(0, -Decimal(str(self.step)).as_tuple().exponent)
+        n = int(round((self.price_max - self.price_min) / self.step)) + 1
+        prices = [round(self.price_min + i * self.step, ndigits) for i in range(n)]
         return prices[:self.n_prices]  # Ensure length matches
 
     def to_bytes(self) -> bytes:
@@ -699,12 +697,9 @@ class OrderbookAccumulator:
         price_min = round((src * (1 - self.range_pct)) / self.step) * self.step
         price_max = round((src * (1 + self.range_pct)) / self.step) * self.step
 
-        # Generate price grid
-        prices = []
-        p = price_min
-        while p <= price_max + 0.01:
-            prices.append(p)
-            p += self.step
+        # Generate price grid (index-based, Rule #16)
+        n_grid = int(round((price_max - price_min) / self.step)) + 1
+        prices = [round(price_min + i * self.step, self._ndigits) for i in range(n_grid)]
 
         n_prices = len(prices)
         if n_prices > MAX_PRICE_BUCKETS:

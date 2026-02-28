@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import statistics
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -166,6 +167,9 @@ class EntryInference:
 
         # Projected liquidation zones from inferred entries
         # These are WHERE we expect liquidations to occur
+        # Protected by _projection_lock for thread-safe access between
+        # the main processing thread (writes) and API thread (reads).
+        self._projection_lock = threading.Lock()
         self.projected_long_liqs: Dict[float, PositionBucket] = {}   # Below current price
         self.projected_short_liqs: Dict[float, PositionBucket] = {}  # Above current price
 
@@ -288,102 +292,105 @@ class EntryInference:
         self.last_oi = oi
         self.last_oi_minute = minute_key
 
-        # Apply decay to existing projections
-        self._apply_decay()
+        # All projection mutations are protected by _projection_lock for
+        # thread-safe access between main thread (writes) and API thread (reads).
+        with self._projection_lock:
+            # Apply decay to existing projections
+            self._apply_decay()
 
-        # Sweep: remove projected zones that price crossed
-        swept_long = 0
-        swept_short = 0
-        swept_long_notional = 0.0
-        swept_short_notional = 0.0
-        if high and low:
-            swept_long, swept_short, swept_long_notional, swept_short_notional = self._sweep(high, low, minute_key)
+            # Sweep: remove projected zones that price crossed
+            swept_long = 0
+            swept_short = 0
+            swept_long_notional = 0.0
+            swept_short_notional = 0.0
+            if high and low:
+                swept_long, swept_short, swept_long_notional, swept_short_notional = self._sweep(high, low, minute_key)
 
-        # Compute aggression from USD notional
-        total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
+            # Compute aggression from USD notional
+            total_notional_usd = taker_buy_notional_usd + taker_sell_notional_usd
 
-        # Calculate buy_pct and weighted distribution
-        buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
+            # Calculate buy_pct and weighted distribution
+            buy_pct = taker_buy_notional_usd / total_notional_usd if total_notional_usd > 0 else 0.5
 
-        # Clamp buy_weight to never fully zero a side
-        buy_weight = max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, buy_pct))
-        sell_weight = 1.0 - buy_weight
+            # Clamp buy_weight to never fully zero a side
+            buy_weight = max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, buy_pct))
+            sell_weight = 1.0 - buy_weight
 
-        # Debug log for diagnostics
-        # OI is in base-asset units (e.g. BTC count); convert threshold to USD
-        oi_threshold = self.last_oi * src_price * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
+            # Debug log for diagnostics
+            # OI is in base-asset units (e.g. BTC count); convert threshold to USD
+            oi_threshold = self.last_oi * src_price * self.MIN_OI_CHANGE_PCT if self.last_oi > 0 else 0
 
-        # Track projected additions for debug logging
-        projected_added_long_usd = 0.0
-        projected_added_short_usd = 0.0
+            # Track projected additions for debug logging
+            projected_added_long_usd = 0.0
+            projected_added_short_usd = 0.0
 
-        if oi_delta > 0:
-            # New positions opening - compute BOTH sides
-            # OI is in base-asset units (BTC/ETH/SOL count) — convert to USD
-            oi_delta_usd = abs(oi_delta) * src_price
+            if oi_delta > 0:
+                # New positions opening - compute BOTH sides
+                # OI is in base-asset units (BTC/ETH/SOL count) — convert to USD
+                oi_delta_usd = abs(oi_delta) * src_price
 
-            # Distribute OI to both sides based on aggression weight
-            long_open_usd = oi_delta_usd * buy_weight
-            short_open_usd = oi_delta_usd * sell_weight
+                # Distribute OI to both sides based on aggression weight
+                long_open_usd = oi_delta_usd * buy_weight
+                short_open_usd = oi_delta_usd * sell_weight
 
-            # Skip if OI delta too small
-            if oi_delta_usd < oi_threshold:
-                long_open_usd = 0.0
-                short_open_usd = 0.0
-            else:
-                # Create projected liquidation zones for LONG positions
-                inferences.extend(self._project_side(
-                    minute_key=minute_key,
-                    src_price=src_price,
-                    side="long",
-                    size_usd=long_open_usd,
-                    confidence=buy_weight  # Use weight as confidence
-                ))
-                projected_added_long_usd = long_open_usd
-
-                # Create projected liquidation zones for SHORT positions
-                inferences.extend(self._project_side(
-                    minute_key=minute_key,
-                    src_price=src_price,
-                    side="short",
-                    size_usd=short_open_usd,
-                    confidence=sell_weight  # Use weight as confidence
-                ))
-                projected_added_short_usd = short_open_usd
-
-                logger.info(
-                    f"[{self.symbol}] INFERENCE: oi_delta={oi_delta:+,.0f} "
-                    f"buy_pct={buy_pct:.3f} buy_weight={buy_weight:.3f} "
-                    f"long_usd={long_open_usd:,.0f} short_usd={short_open_usd:,.0f}"
-                )
-
-        elif oi_delta < 0:
-            # Positions closing - proportionally decay BOTH sides
-            total_projected = sum(b.size_usd for b in self.projected_long_liqs.values()) + \
-                              sum(b.size_usd for b in self.projected_short_liqs.values())
-
-            if total_projected > 0:
-                # Scale reduction proportionally to OI drop magnitude
-                if self.last_oi > 0:
-                    # OI-relative ratio: fraction of total OI that closed this minute
-                    close_factor = min(abs(oi_delta) / self.last_oi, MAX_OI_REDUCTION_PER_MINUTE)
+                # Skip if OI delta too small
+                if oi_delta_usd < oi_threshold:
+                    long_open_usd = 0.0
+                    short_open_usd = 0.0
                 else:
-                    # Fallback: use projected-relative ratio when OI is zero
-                    close_factor = min(abs(oi_delta) * src_price / total_projected, MAX_OI_REDUCTION_PER_MINUTE)
+                    # Create projected liquidation zones for LONG positions
+                    inferences.extend(self._project_side(
+                        minute_key=minute_key,
+                        src_price=src_price,
+                        side="long",
+                        size_usd=long_open_usd,
+                        confidence=buy_weight  # Use weight as confidence
+                    ))
+                    projected_added_long_usd = long_open_usd
 
-                # Reduce both sides proportionally
-                self._reduce_projections(self.projected_long_liqs, close_factor)
-                self._reduce_projections(self.projected_short_liqs, close_factor)
+                    # Create projected liquidation zones for SHORT positions
+                    inferences.extend(self._project_side(
+                        minute_key=minute_key,
+                        src_price=src_price,
+                        side="short",
+                        size_usd=short_open_usd,
+                        confidence=sell_weight  # Use weight as confidence
+                    ))
+                    projected_added_short_usd = short_open_usd
 
-                # V3: Also apply close_factor to zone manager weights
-                # This reduces zone weights when OI drops, improving accuracy
-                if self.zone_manager:
-                    self._apply_oi_decay_to_zones(close_factor)
+                    logger.info(
+                        f"[{self.symbol}] INFERENCE: oi_delta={oi_delta:+,.0f} "
+                        f"buy_pct={buy_pct:.3f} buy_weight={buy_weight:.3f} "
+                        f"long_usd={long_open_usd:,.0f} short_usd={short_open_usd:,.0f}"
+                    )
 
-                logger.debug(
-                    f"[{self.symbol}] CLOSING: oi_delta={oi_delta:,.0f} "
-                    f"close_factor={close_factor:.3f} total_projected={total_projected:,.0f}"
-                )
+            elif oi_delta < 0:
+                # Positions closing - proportionally decay BOTH sides
+                total_projected = sum(b.size_usd for b in self.projected_long_liqs.values()) + \
+                                  sum(b.size_usd for b in self.projected_short_liqs.values())
+
+                if total_projected > 0:
+                    # Scale reduction proportionally to OI drop magnitude
+                    if self.last_oi > 0:
+                        # OI-relative ratio: fraction of total OI that closed this minute
+                        close_factor = min(abs(oi_delta) / self.last_oi, MAX_OI_REDUCTION_PER_MINUTE)
+                    else:
+                        # Fallback: use projected-relative ratio when OI is zero
+                        close_factor = min(abs(oi_delta) * src_price / total_projected, MAX_OI_REDUCTION_PER_MINUTE)
+
+                    # Reduce both sides proportionally
+                    self._reduce_projections(self.projected_long_liqs, close_factor)
+                    self._reduce_projections(self.projected_short_liqs, close_factor)
+
+                    # V3: Also apply close_factor to zone manager weights
+                    # This reduces zone weights when OI drops, improving accuracy
+                    if self.zone_manager:
+                        self._apply_oi_decay_to_zones(close_factor)
+
+                    logger.debug(
+                        f"[{self.symbol}] CLOSING: oi_delta={oi_delta:,.0f} "
+                        f"close_factor={close_factor:.3f} total_projected={total_projected:,.0f}"
+                    )
 
         # Write enhanced debug log
         if self._debug_log_fh:
@@ -767,15 +774,16 @@ class EntryInference:
 
     def get_projections(self) -> Dict[str, Dict[float, float]]:
         """
-        Get current projected liquidation zones.
+        Get current projected liquidation zones (thread-safe copy-on-read).
 
         Returns:
             {"long": {price: size_usd}, "short": {price: size_usd}}
         """
-        return {
-            "long": {b.price: b.size_usd for b in self.projected_long_liqs.values()},
-            "short": {b.price: b.size_usd for b in self.projected_short_liqs.values()}
-        }
+        with self._projection_lock:
+            return {
+                "long": {b.price: b.size_usd for b in self.projected_long_liqs.values()},
+                "short": {b.price: b.size_usd for b in self.projected_short_liqs.values()}
+            }
 
     def get_combined_heatmap(
         self,
@@ -808,8 +816,10 @@ class EntryInference:
         tape_short = tape_heatmap.get("short", {})
         all_tape_vals = [max(0.0, v) for v in list(tape_long.values()) + list(tape_short.values())]
 
-        proj_long = {b.price: max(0.0, b.size_usd) for b in self.projected_long_liqs.values()}
-        proj_short = {b.price: max(0.0, b.size_usd) for b in self.projected_short_liqs.values()}
+        # Copy-on-read: snapshot projection dicts under lock (thread safety M1)
+        with self._projection_lock:
+            proj_long = {b.price: max(0.0, b.size_usd) for b in self.projected_long_liqs.values()}
+            proj_short = {b.price: max(0.0, b.size_usd) for b in self.projected_short_liqs.values()}
         all_proj_vals = list(proj_long.values()) + list(proj_short.values())
 
         # Compute p99-based scaling factors (p99 prevents single spike from
@@ -869,8 +879,10 @@ class EntryInference:
 
         tape_long = tape_heatmap.get("long", {})
         tape_short = tape_heatmap.get("short", {})
-        proj_long = {b.price: max(0.0, b.size_usd) for b in self.projected_long_liqs.values()}
-        proj_short = {b.price: max(0.0, b.size_usd) for b in self.projected_short_liqs.values()}
+        # Copy-on-read: snapshot projection dicts under lock (thread safety M1)
+        with self._projection_lock:
+            proj_long = {b.price: max(0.0, b.size_usd) for b in self.projected_long_liqs.values()}
+            proj_short = {b.price: max(0.0, b.size_usd) for b in self.projected_short_liqs.values()}
 
         # Track boost statistics for debug logging
         total_buckets = 0
@@ -971,15 +983,18 @@ class EntryInference:
         return result
 
     def get_stats(self) -> dict:
-        """Get current inference statistics."""
+        """Get current inference statistics (thread-safe)."""
+        with self._projection_lock:
+            long_count = len(self.projected_long_liqs)
+            short_count = len(self.projected_short_liqs)
         return {
             "symbol": self.symbol,
             "current_minute": self.current_minute,
             "current_price": self.current_price,
             "total_inferred_long_usd": self.total_inferred_long_usd,
             "total_inferred_short_usd": self.total_inferred_short_usd,
-            "projected_long_buckets": len(self.projected_long_liqs),
-            "projected_short_buckets": len(self.projected_short_liqs),
+            "projected_long_buckets": long_count,
+            "projected_short_buckets": short_count,
             "inferences_in_window": len(self.inferences),
             "leverage_weights": self.leverage_weights
         }

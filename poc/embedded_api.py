@@ -26,6 +26,7 @@ Usage:
     api_thread = start_api_thread(app, host="127.0.0.1", port=8899)
 """
 
+import copy
 import json
 import os
 import struct
@@ -211,6 +212,8 @@ class LiquidationHeatmapBuffer:
         frames_to_load = min(total_frames, self.max_frames)
         start_offset = (total_frames - frames_to_load) * LIQ_FRAME_RECORD_SIZE
 
+        loaded = 0
+        skipped = 0
         try:
             with open(self.persistence_path, 'rb') as f:
                 f.seek(start_offset)
@@ -223,10 +226,19 @@ class LiquidationHeatmapBuffer:
                         if frame is not None:
                             self._frames.append(frame)
                             self._last_ts = frame.ts
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                            loaded += 1
+                        else:
+                            skipped += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.warning("Skipped corrupt frame in %s: %s",
+                                       self.persistence_path, e)
+        except Exception as e:
+            logger.error("Failed to load history file %s: %s",
+                         self.persistence_path, e, exc_info=True)
+        if loaded > 0 or skipped > 0:
+            logger.info("Loaded %d frames, skipped %d corrupt frames from %s",
+                        loaded, skipped, self.persistence_path)
 
     def _frame_from_bytes(self, data: bytes) -> Optional[HistoryFrame]:
         """Deserialize frame from binary record."""
@@ -472,6 +484,10 @@ class EmbeddedAPIState:
 
     def stop(self):
         self._running = False
+        if self._refresh_thread.is_alive():
+            self._refresh_thread.join(timeout=5)
+            if self._refresh_thread.is_alive():
+                logger.warning("API refresh thread did not terminate within 5s")
 
     def get_v1_snapshot(self, symbol: str = "BTC") -> Optional[Dict]:
         return self._v1_caches.get(symbol)
@@ -527,6 +543,9 @@ def create_embedded_app(
         description="API for liquidation zone visualization - embedded mode with shared buffers",
         version=API_VERSION
     )
+
+    # Attach state to app so callers can access it for shutdown (H9)
+    app._api_state = state
 
     def _validate_symbol(symbol: str) -> str:
         """Validate and normalize symbol. Returns uppercase short symbol or raises 400."""
@@ -614,7 +633,7 @@ def create_embedded_app(
         snapshot = state.oi_poller.get_snapshot(symbol_short)
         if not snapshot:
             raise HTTPException(
-                status_code=404,
+                status_code=503,
                 detail=f"No OI data available for {symbol_short}. Poller may still be initializing."
             )
 
@@ -872,7 +891,8 @@ def create_embedded_app(
                 detail=f"Data for {sym} is warming up, try again shortly"
             )
 
-        stats = snapshot.get('stats', {})
+        # Copy stats to avoid mutating the cached snapshot dict in-place
+        stats = copy.deepcopy(snapshot.get('stats', {}))
         stats['symbol'] = sym
         stats['snapshot_ts'] = snapshot.get('ts', 0)
         stats['snapshot_age_s'] = round(time.time() - snapshot.get('ts', 0), 1)
@@ -923,6 +943,12 @@ def create_embedded_app(
         Returns the most recently WRITTEN frame (never synthesized/rewritten).
         """
         _require_btc_orderbook(symbol)
+
+        # Validate user-provided grid parameters
+        if step <= 0:
+            raise HTTPException(status_code=400, detail="step must be positive")
+        if range_pct <= 0 or range_pct > 1.0:
+            raise HTTPException(status_code=400, detail="range_pct must be between 0 and 1.0")
 
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
@@ -1051,6 +1077,10 @@ def create_embedded_app(
         Binary format (format=bin) returns compact blob for low-latency backfill.
         """
         _require_btc_orderbook(symbol)
+
+        # Validate user-provided grid parameters
+        if step <= 0:
+            raise HTTPException(status_code=400, detail="step must be positive")
 
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
@@ -1461,13 +1491,17 @@ def create_embedded_app(
 
 def start_api_thread(
     app: 'FastAPI',
-    host: str = "127.0.0.1",
+    host: str = None,
     port: int = 8899,
     log_level: str = "warning"
 ) -> threading.Thread:
     """Start the API server in a background daemon thread."""
     if not HAS_FASTAPI:
         raise ImportError("FastAPI not installed")
+
+    # Resolve host: explicit param > API_HOST env var > default 127.0.0.1
+    if host is None:
+        host = os.environ.get("API_HOST", "127.0.0.1")
 
     def run_server():
         config = uvicorn.Config(

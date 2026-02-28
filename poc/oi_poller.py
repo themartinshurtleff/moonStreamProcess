@@ -70,8 +70,10 @@ class MultiExchangeOIPoller:
         self.running = False
         self._session: Optional[aiohttp.ClientSession] = None
 
-        # Latest snapshots per symbol (thread-safe reads from API thread)
+        # Latest snapshots per symbol — protected by _snapshot_lock for
+        # thread-safe access between the poller thread and API thread.
         self.snapshots: Dict[str, OISnapshot] = {}
+        self._snapshot_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Per-exchange fetch functions — return OI in BASE ASSET or None
@@ -179,15 +181,21 @@ class MultiExchangeOIPoller:
             elif result is not None:
                 per_exchange[name] = result
 
+        # Skip callback if ALL exchanges failed — do not deliver stale 0.0
+        if not per_exchange:
+            logger.warning("OI %s: all exchanges failed, skipping callback", symbol_short)
+            return
+
         aggregated = sum(per_exchange.values())
 
-        # Store snapshot
-        self.snapshots[symbol_short] = OISnapshot(
-            symbol=symbol_short,
-            aggregated_oi=aggregated,
-            per_exchange=dict(per_exchange),
-            ts=time.time(),
-        )
+        # Store snapshot (thread-safe write)
+        with self._snapshot_lock:
+            self.snapshots[symbol_short] = OISnapshot(
+                symbol=symbol_short,
+                aggregated_oi=aggregated,
+                per_exchange=dict(per_exchange),
+                ts=time.time(),
+            )
 
         # Deliver to callback
         try:
@@ -226,7 +234,8 @@ class MultiExchangeOIPoller:
 
     def get_snapshot(self, symbol: str) -> Optional[OISnapshot]:
         """Get the latest OI snapshot for a symbol (thread-safe read)."""
-        return self.snapshots.get(symbol)
+        with self._snapshot_lock:
+            return self.snapshots.get(symbol)
 
 
 class OIPollerThread:
@@ -264,8 +273,12 @@ class OIPollerThread:
         self._thread.start()
 
     def stop(self):
-        """Stop the poller."""
+        """Stop the poller and join the thread."""
         self.poller.stop()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                logger.warning("OI poller thread did not terminate within 5s")
 
     def get_snapshot(self, symbol: str) -> Optional[OISnapshot]:
         """Get latest OI snapshot (thread-safe)."""

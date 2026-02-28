@@ -431,6 +431,9 @@ class LiquidationCalibrator:
         self._total_minutes_no_mark: int = 0  # Running counter across sessions
         self._mark_warning_emitted: bool = False
 
+        # Rate-limit event drop warnings (once per minute per symbol)
+        self._last_drop_warning_minute: int = -1
+
         # Setup logging with rotation
         if log_file:
             # Rotate log if too large or too old
@@ -1019,6 +1022,14 @@ class LiquidationCalibrator:
         # Find the snapshot for this event's minute (or closest prior)
         snapshot = self._get_snapshot_for_event(event)
         if not snapshot:
+            event_minute = int(event.timestamp // 60)
+            if event_minute != self._last_drop_warning_minute:
+                logger.warning(
+                    "Calibrator [%s]: dropping event — no snapshot available "
+                    "for minute %d. snapshots_count=%d",
+                    self.symbol, event_minute, len(self.snapshots)
+                )
+                self._last_drop_warning_minute = event_minute
             return
 
         # === PHASE 1: DETERMINE EVENT-TIME SRC ===

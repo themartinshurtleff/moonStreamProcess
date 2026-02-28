@@ -198,7 +198,8 @@ def write_json_atomic(filepath: str, data: dict):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, filepath)
-    except Exception:
+    except Exception as e:
+        logger.error("write_json_atomic failed for %s: %s", filepath, e, exc_info=True)
         # Clean up temp file on failure, don't crash
         try:
             os.remove(tmp_path)
@@ -709,6 +710,11 @@ class FullMetricsProcessor:
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
         self._sanity_check_limit = 50
+
+        # Timestamp when perp_close was last > 0 (for markPrice fallback in C1)
+        self._last_depth_price_ts: float = 0.0
+        # Rate-limit fallback warning to once per minute
+        self._last_fallback_warning_ts: float = 0.0
 
         # ZoneTracker for UI stability (hysteresis + TTL)
         self.zone_tracker = ZoneTracker(
@@ -1418,6 +1424,37 @@ class FullMetricsProcessor:
     def _check_minute_rollover(self):
         current_minute = datetime.now().minute
         if current_minute != self.current_minute:
+            # FIX C1: BTC depth fallback — if perp_close is 0 (depth stream
+            # disconnected), fall back to BTC markPrice so ETH/SOL pipelines
+            # are not blocked. Depth-derived price is preferred when available.
+            if self.state.perp_close > 0:
+                self._last_depth_price_ts = time.time()
+            elif time.time() - self._last_depth_price_ts > 60:
+                # Depth has been stale for >60s — try markPrice fallback
+                mark_close = self.symbol_prices.get("BTC", {}).get("close", 0.0)
+                if mark_close > 0:
+                    now = time.time()
+                    if now - self._last_fallback_warning_ts >= 60:
+                        logger.warning(
+                            "BTC depth stale, using markPrice fallback for "
+                            "minute rollover (markPrice=%.2f)", mark_close
+                        )
+                        self._last_fallback_warning_ts = now
+                    # Populate perp_close (and OHLC if empty) so downstream
+                    # code works unchanged.
+                    self.state.perp_close = mark_close
+                    if self.state.perp_open == 0:
+                        self.state.perp_open = mark_close
+                    if self.state.perp_high == 0:
+                        self.state.perp_high = mark_close
+                    if self.state.perp_low == 0:
+                        self.state.perp_low = mark_close
+                else:
+                    logger.error(
+                        "BTC depth AND markPrice both unavailable — "
+                        "skipping minute rollover"
+                    )
+
             if self.state.perp_close > 0:
                 # Update V2 heatmap engine (OI inference layer)
                 # ohlc4 = (open + high + low + close) / 4
@@ -1623,6 +1660,7 @@ class FullMetricsProcessor:
                     self._applied_persisted_weights[sym_short] = True
 
                 # Get top predicted liquidation zones from V2 engine (clustered pools)
+                # Display-only: ZoneTracker is a UI widget, safe to use display wrapper
                 v2_response = self._btc().heatmap_v2.get_api_response_display(
                     price_center=v2_src,
                     price_range_pct=0.25,      # ±25% range for more visibility
@@ -2411,6 +2449,7 @@ def main():
 
     # Start embedded API server if requested
     api_thread = None
+    app = None  # FastAPI app, set if API server started
     if args.api:
         try:
             from embedded_api import create_embedded_app, start_api_thread, HAS_FASTAPI
@@ -2445,12 +2484,33 @@ def main():
     )
     ws_thread.start()
 
+    def _close_engines(proc):
+        """Close all per-symbol heatmap engines (zone persistence, file handles)."""
+        for sym_short in proc.engine_manager.get_all_symbols():
+            try:
+                eng = proc.engine_manager.get_engine(sym_short)
+                if eng and eng.heatmap_v2:
+                    eng.heatmap_v2.close()
+                    logger.info("Closed heatmap engine for %s", sym_short)
+            except Exception as e:
+                logger.error("Failed to close engine for %s: %s", sym_short, e, exc_info=True)
+
+    def _stop_api_state():
+        """Stop the embedded API refresh thread if running."""
+        try:
+            if app is not None and hasattr(app, '_api_state') and app._api_state is not None:
+                app._api_state.stop()
+        except Exception as e:
+            logger.warning("Error stopping API state: %s", e)
+
     def signal_handler(sig, frame):
         console.print("\n[yellow]Shutting down...[/]")
         stop_event.set()
         connector.stop()
         processor.oi_poller.stop()
         processor.rest_poller.stop()
+        _close_engines(processor)
+        _stop_api_state()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -2471,6 +2531,8 @@ def main():
         connector.stop()
         processor.oi_poller.stop()
         processor.rest_poller.stop()
+        _close_engines(processor)
+        _stop_api_state()
 
     if api_thread:
         console.print("[dim]API server thread will terminate automatically.[/]")
