@@ -484,6 +484,10 @@ class EmbeddedAPIState:
 
     def stop(self):
         self._running = False
+        if self._refresh_thread.is_alive():
+            self._refresh_thread.join(timeout=5)
+            if self._refresh_thread.is_alive():
+                logger.warning("API refresh thread did not terminate within 5s")
 
     def get_v1_snapshot(self, symbol: str = "BTC") -> Optional[Dict]:
         return self._v1_caches.get(symbol)
@@ -539,6 +543,9 @@ def create_embedded_app(
         description="API for liquidation zone visualization - embedded mode with shared buffers",
         version=API_VERSION
     )
+
+    # Attach state to app so callers can access it for shutdown (H9)
+    app._api_state = state
 
     def _validate_symbol(symbol: str) -> str:
         """Validate and normalize symbol. Returns uppercase short symbol or raises 400."""
@@ -626,7 +633,7 @@ def create_embedded_app(
         snapshot = state.oi_poller.get_snapshot(symbol_short)
         if not snapshot:
             raise HTTPException(
-                status_code=404,
+                status_code=503,
                 detail=f"No OI data available for {symbol_short}. Poller may still be initializing."
             )
 
@@ -1484,13 +1491,17 @@ def create_embedded_app(
 
 def start_api_thread(
     app: 'FastAPI',
-    host: str = "127.0.0.1",
+    host: str = None,
     port: int = 8899,
     log_level: str = "warning"
 ) -> threading.Thread:
     """Start the API server in a background daemon thread."""
     if not HAS_FASTAPI:
         raise ImportError("FastAPI not installed")
+
+    # Resolve host: explicit param > API_HOST env var > default 127.0.0.1
+    if host is None:
+        host = os.environ.get("API_HOST", "127.0.0.1")
 
     def run_server():
         config = uvicorn.Config(

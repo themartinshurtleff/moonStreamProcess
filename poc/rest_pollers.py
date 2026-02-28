@@ -559,9 +559,16 @@ class BinanceRESTPollerThread:
         self._thread.start()
 
     def stop(self):
-        """Stop the poller thread."""
+        """Stop the poller thread and join."""
         if self._loop:
             self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.poller.stop()))
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "REST poller thread did not terminate within 5s"
+                )
 
     def get_state(self) -> PollerState:
         """Get current poller state (thread-safe read)."""

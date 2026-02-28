@@ -2449,6 +2449,7 @@ def main():
 
     # Start embedded API server if requested
     api_thread = None
+    app = None  # FastAPI app, set if API server started
     if args.api:
         try:
             from embedded_api import create_embedded_app, start_api_thread, HAS_FASTAPI
@@ -2494,6 +2495,14 @@ def main():
             except Exception as e:
                 logger.error("Failed to close engine for %s: %s", sym_short, e, exc_info=True)
 
+    def _stop_api_state():
+        """Stop the embedded API refresh thread if running."""
+        try:
+            if app is not None and hasattr(app, '_api_state') and app._api_state is not None:
+                app._api_state.stop()
+        except Exception as e:
+            logger.warning("Error stopping API state: %s", e)
+
     def signal_handler(sig, frame):
         console.print("\n[yellow]Shutting down...[/]")
         stop_event.set()
@@ -2501,6 +2510,7 @@ def main():
         processor.oi_poller.stop()
         processor.rest_poller.stop()
         _close_engines(processor)
+        _stop_api_state()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -2522,6 +2532,7 @@ def main():
         processor.oi_poller.stop()
         processor.rest_poller.stop()
         _close_engines(processor)
+        _stop_api_state()
 
     if api_thread:
         console.print("[dim]API server thread will terminate automatically.[/]")

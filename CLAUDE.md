@@ -703,6 +703,42 @@ Frontend (consumer)
 - **Root cause:** All three connectors (Binance, Bybit, OKX) had bare `except: pass` or `except Exception: await asyncio.sleep(1)` with zero logging. Disconnections, parse errors, and protocol faults were invisible.
 - **Fix:** Added `logger = logging.getLogger(__name__)` to `ws_connectors.py`. All 9 except blocks now log: `json.JSONDecodeError` at WARNING, `ConnectionClosed` at ERROR, general `Exception` at ERROR with `exc_info=True`. All blocks retain existing sleep(1) for reconnect delay.
 
+### RESOLVED: Calibrator silently dropped events when no snapshot available (Sprint 2 C4)
+- **Root cause:** `_process_event()` returned early when `_get_snapshot_for_event()` returned None, with no indication that events were being dropped.
+- **Fix:** Added rate-limited WARNING log (once per minute) before the early return: `"Calibrator [SYM]: dropping event — no snapshot available for minute N. snapshots_count=M"`.
+
+### RESOLVED: WebSocket reconnect used fixed 1s delay with no backoff (Sprint 2 H2-full)
+- **Root cause:** All three WS connectors used `await asyncio.sleep(1)` on every reconnect, hammering exchange endpoints during outages.
+- **Fix:** Exponential backoff: initial=1s, max=30s, jitter ×random(0.8, 1.2). Resets on successful connection. After 5 consecutive identical errors, log level downgrades to DEBUG. Constants: `_BACKOFF_INITIAL`, `_BACKOFF_MAX`, `_BACKOFF_JITTER_LOW`, `_BACKOFF_JITTER_HIGH`, `_REPEATED_ERROR_THRESHOLD`.
+
+### RESOLVED: /oi returned 404 during warmup instead of 503 (Sprint 2 H4)
+- **Root cause:** `/oi` returned 404 when no OI data was available yet; 404 implies the resource doesn't exist.
+- **Fix:** Changed to `status_code=503` with message "Poller may still be initializing".
+
+### RESOLVED: Thread stop methods were non-blocking with no join (Sprint 2 H6)
+- **Root cause:** `OIPollerThread.stop()` and `BinanceRESTPollerThread.stop()` only signaled stop but never waited for thread termination.
+- **Fix:** Added `self._thread.join(timeout=5)` after signaling stop. Logs WARNING if thread doesn't terminate within 5s.
+
+### RESOLVED: ob_heatmap.py used incremental p+=step grid construction (Sprint 2 H7)
+- **Root cause:** `OrderbookFrame.get_prices()` and `OrderbookAccumulator._emit_frame()` used `while p += step` loops, violating Rule #16.
+- **Fix:** Replaced with index-based `round(price_min + i * step, ndigits)` in both locations.
+
+### RESOLVED: Embedded API refresh thread not joined on shutdown (Sprint 2 H9)
+- **Root cause:** `EmbeddedAPIState.stop()` only set `_running = False`. No code called `state.stop()` during shutdown.
+- **Fix:** `stop()` now joins the refresh thread (timeout=5s). `app._api_state = state` attached for external access. `_stop_api_state()` added to `full_metrics_viewer.py` shutdown path (signal handler + finally block).
+
+### RESOLVED: EntryInference projection dicts accessed without thread safety (Sprint 2 M1)
+- **Root cause:** `projected_long_liqs` and `projected_short_liqs` written by main thread, read by API thread, no synchronization.
+- **Fix:** Added `self._projection_lock = threading.Lock()`. Write path: `on_minute()` mutation block wrapped with lock. Read paths: `get_combined_heatmap()`, `get_combined_heatmap_display()`, `get_projections()`, `get_stats()` use copy-on-read under the lock.
+
+### RESOLVED: OI poller delivered 0.0 when all exchanges failed (Sprint 2 M2)
+- **Root cause:** When all 3 exchanges failed, `per_exchange` was empty, `sum()` returned 0.0, downstream interpreted as "OI dropped to zero".
+- **Fix:** Early return with WARNING when `per_exchange` is empty. No snapshot update, no callback. Previous snapshot remains valid.
+
+### RESOLVED: API bind address not configurable (Sprint 2 M8)
+- **Root cause:** `start_api_thread()` hardcoded `host="127.0.0.1"`.
+- **Fix:** Resolution order: explicit parameter > `API_HOST` env var > `"127.0.0.1"` fallback. Set `API_HOST=0.0.0.0` for production.
+
 ---
 
 ## Symbol Conventions

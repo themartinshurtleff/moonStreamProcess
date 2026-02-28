@@ -181,6 +181,11 @@ class MultiExchangeOIPoller:
             elif result is not None:
                 per_exchange[name] = result
 
+        # Skip callback if ALL exchanges failed — do not deliver stale 0.0
+        if not per_exchange:
+            logger.warning("OI %s: all exchanges failed, skipping callback", symbol_short)
+            return
+
         aggregated = sum(per_exchange.values())
 
         # Store snapshot (thread-safe write)
@@ -268,8 +273,12 @@ class OIPollerThread:
         self._thread.start()
 
     def stop(self):
-        """Stop the poller."""
+        """Stop the poller and join the thread."""
         self.poller.stop()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                logger.warning("OI poller thread did not terminate within 5s")
 
     def get_snapshot(self, symbol: str) -> Optional[OISnapshot]:
         """Get latest OI snapshot (thread-safe)."""

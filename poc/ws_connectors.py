@@ -6,6 +6,7 @@ Supports Binance, Bybit, and OKX perpetual streams.
 import asyncio
 import json
 import logging
+import random
 import time
 import websockets
 from typing import Callable, Dict, Any, List, Optional
@@ -13,6 +14,13 @@ from dataclasses import dataclass, field
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+# Backoff constants for reconnect loops
+_BACKOFF_INITIAL = 1.0
+_BACKOFF_MAX = 30.0
+_BACKOFF_JITTER_LOW = 0.8
+_BACKOFF_JITTER_HIGH = 1.2
+_REPEATED_ERROR_THRESHOLD = 5  # Downgrade to debug after this many consecutive identical errors
 
 # Default symbols for multi-symbol connectors (Bybit, OKX).
 # Binance uses !forceOrder@arr which already gets all symbols.
@@ -46,6 +54,8 @@ class BinanceConnector:
         self.ws_connections: Dict[str, Any] = {}
         self.message_counts: Dict[str, int] = {}
         self.last_messages: Dict[str, float] = {}
+        # Per-stream backoff state: {stream_name: (attempt_count, last_error_str)}
+        self._backoff: Dict[str, list] = {}
 
     def _wrap_message(self, data: dict, exchange: str, instrument: str,
                       ins_type: str, obj: str) -> str:
@@ -64,14 +74,17 @@ class BinanceConnector:
     async def _connect_stream(self, name: str, url: str,
                               wrapper_params: tuple,
                               subscribe_msg: Optional[dict] = None):
-        """Connect to a single websocket stream."""
+        """Connect to a single websocket stream with exponential backoff."""
         exchange, instrument, ins_type, obj = wrapper_params
+        self._backoff.setdefault(name, [0, ""])
 
         while self.running:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
                     self.ws_connections[name] = ws
                     self.message_counts[name] = 0
+                    # Reset backoff on successful connection
+                    self._backoff[name] = [0, ""]
 
                     if subscribe_msg:
                         await ws.send(json.dumps(subscribe_msg))
@@ -97,12 +110,36 @@ class BinanceConnector:
 
             except websockets.exceptions.ConnectionClosed as e:
                 if self.running:
-                    logger.error("Binance %s connection closed: %s", name, e)
-                    await asyncio.sleep(1)
+                    err_str = str(e)
+                    attempts, last_err = self._backoff[name]
+                    attempts += 1
+                    if err_str == last_err and attempts > _REPEATED_ERROR_THRESHOLD:
+                        logger.debug("Binance %s connection closed: %s", name, e)
+                    else:
+                        logger.error("Binance %s connection closed: %s", name, e)
+                    if err_str != last_err:
+                        attempts = 1
+                    self._backoff[name] = [attempts, err_str]
+                    delay = min(_BACKOFF_INITIAL * (2 ** (attempts - 1)), _BACKOFF_MAX)
+                    delay *= random.uniform(_BACKOFF_JITTER_LOW, _BACKOFF_JITTER_HIGH)
+                    logger.info("Binance %s reconnecting in %.1fs (attempt %d)", name, delay, attempts)
+                    await asyncio.sleep(delay)
             except Exception as e:
                 if self.running:
-                    logger.error("Binance %s error: %s", name, e, exc_info=True)
-                    await asyncio.sleep(1)
+                    err_str = str(e)
+                    attempts, last_err = self._backoff[name]
+                    attempts += 1
+                    if err_str == last_err and attempts > _REPEATED_ERROR_THRESHOLD:
+                        logger.debug("Binance %s error: %s", name, e)
+                    else:
+                        logger.error("Binance %s error: %s", name, e, exc_info=True)
+                    if err_str != last_err:
+                        attempts = 1
+                    self._backoff[name] = [attempts, err_str]
+                    delay = min(_BACKOFF_INITIAL * (2 ** (attempts - 1)), _BACKOFF_MAX)
+                    delay *= random.uniform(_BACKOFF_JITTER_LOW, _BACKOFF_JITTER_HIGH)
+                    logger.info("Binance %s reconnecting in %.1fs (attempt %d)", name, delay, attempts)
+                    await asyncio.sleep(delay)
 
     async def connect_all(self):
         """Connect to all Binance BTC perpetual streams."""
@@ -186,6 +223,8 @@ class OKXConnector:
         self.running = False
         self.message_counts: Dict[str, int] = {}
         self.last_messages: Dict[str, float] = {}
+        self._attempt: int = 0
+        self._last_err: str = ""
 
     def _wrap_message(self, data: dict, exchange: str, instrument: str,
                       ins_type: str, obj: str) -> str:
@@ -230,6 +269,8 @@ class OKXConnector:
         while self.running:
             try:
                 async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
+                    self._attempt = 0
+                    self._last_err = ""
                     # Build subscription args
                     args = []
                     # BTC-specific data streams (orderbook, trades, funding, OI)
@@ -277,12 +318,34 @@ class OKXConnector:
 
             except websockets.exceptions.ConnectionClosed as e:
                 if self.running:
-                    logger.error("OKX connection closed: %s", e)
-                    await asyncio.sleep(1)
+                    err_str = str(e)
+                    self._attempt += 1
+                    if err_str == self._last_err and self._attempt > _REPEATED_ERROR_THRESHOLD:
+                        logger.debug("OKX connection closed: %s", e)
+                    else:
+                        logger.error("OKX connection closed: %s", e)
+                    if err_str != self._last_err:
+                        self._attempt = 1
+                    self._last_err = err_str
+                    delay = min(_BACKOFF_INITIAL * (2 ** (self._attempt - 1)), _BACKOFF_MAX)
+                    delay *= random.uniform(_BACKOFF_JITTER_LOW, _BACKOFF_JITTER_HIGH)
+                    logger.info("OKX reconnecting in %.1fs (attempt %d)", delay, self._attempt)
+                    await asyncio.sleep(delay)
             except Exception as e:
                 if self.running:
-                    logger.error("OKX error: %s", e, exc_info=True)
-                    await asyncio.sleep(1)
+                    err_str = str(e)
+                    self._attempt += 1
+                    if err_str == self._last_err and self._attempt > _REPEATED_ERROR_THRESHOLD:
+                        logger.debug("OKX error: %s", e)
+                    else:
+                        logger.error("OKX error: %s", e, exc_info=True)
+                    if err_str != self._last_err:
+                        self._attempt = 1
+                    self._last_err = err_str
+                    delay = min(_BACKOFF_INITIAL * (2 ** (self._attempt - 1)), _BACKOFF_MAX)
+                    delay *= random.uniform(_BACKOFF_JITTER_LOW, _BACKOFF_JITTER_HIGH)
+                    logger.info("OKX reconnecting in %.1fs (attempt %d)", delay, self._attempt)
+                    await asyncio.sleep(delay)
 
     def stop(self):
         self.running = False
@@ -302,6 +365,8 @@ class BybitConnector:
         self.running = False
         self.message_counts: Dict[str, int] = {}
         self.last_messages: Dict[str, float] = {}
+        self._attempt: int = 0
+        self._last_err: str = ""
 
     def _wrap_message(self, data: dict, exchange: str, instrument: str,
                       ins_type: str, obj: str) -> str:
@@ -348,6 +413,9 @@ class BybitConnector:
         while self.running:
             try:
                 async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
+                    # Reset backoff on successful connection
+                    self._attempt = 0
+                    self._last_err = ""
                     # Build subscription args for all symbols
                     args = []
                     # BTC-specific data streams (orderbook, trades, tickers)
@@ -395,12 +463,34 @@ class BybitConnector:
 
             except websockets.exceptions.ConnectionClosed as e:
                 if self.running:
-                    logger.error("Bybit connection closed: %s", e)
-                    await asyncio.sleep(1)
+                    err_str = str(e)
+                    self._attempt += 1
+                    if err_str == self._last_err and self._attempt > _REPEATED_ERROR_THRESHOLD:
+                        logger.debug("Bybit connection closed: %s", e)
+                    else:
+                        logger.error("Bybit connection closed: %s", e)
+                    if err_str != self._last_err:
+                        self._attempt = 1
+                    self._last_err = err_str
+                    delay = min(_BACKOFF_INITIAL * (2 ** (self._attempt - 1)), _BACKOFF_MAX)
+                    delay *= random.uniform(_BACKOFF_JITTER_LOW, _BACKOFF_JITTER_HIGH)
+                    logger.info("Bybit reconnecting in %.1fs (attempt %d)", delay, self._attempt)
+                    await asyncio.sleep(delay)
             except Exception as e:
                 if self.running:
-                    logger.error("Bybit error: %s", e, exc_info=True)
-                    await asyncio.sleep(1)
+                    err_str = str(e)
+                    self._attempt += 1
+                    if err_str == self._last_err and self._attempt > _REPEATED_ERROR_THRESHOLD:
+                        logger.debug("Bybit error: %s", e)
+                    else:
+                        logger.error("Bybit error: %s", e, exc_info=True)
+                    if err_str != self._last_err:
+                        self._attempt = 1
+                    self._last_err = err_str
+                    delay = min(_BACKOFF_INITIAL * (2 ** (self._attempt - 1)), _BACKOFF_MAX)
+                    delay *= random.uniform(_BACKOFF_JITTER_LOW, _BACKOFF_JITTER_HIGH)
+                    logger.info("Bybit reconnecting in %.1fs (attempt %d)", delay, self._attempt)
+                    await asyncio.sleep(delay)
 
     def stop(self):
         self.running = False
