@@ -828,7 +828,7 @@ class EntryInference:
         proj_scale = _p99_scale(all_proj_vals)
 
         # Combine long zones with independent normalization
-        all_long_prices = set(tape_long.keys()) | set(self.projected_long_liqs.keys())
+        all_long_prices = set(tape_long.keys()) | set(proj_long.keys())
         for price in all_long_prices:
             tape_norm = min(max(0.0, tape_long.get(price, 0)) / tape_scale, 1.0)
             proj_norm = min(max(0.0, proj_long.get(price, 0)) / proj_scale, 1.0)
@@ -837,7 +837,7 @@ class EntryInference:
                 result["long"][price] = combined
 
         # Combine short zones with independent normalization
-        all_short_prices = set(tape_short.keys()) | set(self.projected_short_liqs.keys())
+        all_short_prices = set(tape_short.keys()) | set(proj_short.keys())
         for price in all_short_prices:
             tape_norm = min(max(0.0, tape_short.get(price, 0)) / tape_scale, 1.0)
             proj_norm = min(max(0.0, proj_short.get(price, 0)) / proj_scale, 1.0)

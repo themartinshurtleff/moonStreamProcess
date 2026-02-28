@@ -192,8 +192,12 @@ class LiquidationHeatmap:
         If we have a projected zone near this liquidation, use the stored entry price.
         This provides feedback for offset learning.
         """
-        # Look for matching projection within ±2 buckets
-        buckets = self.inference.projected_long_liqs if side == "long" else self.inference.projected_short_liqs
+        # Copy-on-read: snapshot the relevant projection dict under lock
+        with self.inference._projection_lock:
+            if side == "long":
+                buckets = {p: b.entry_price for p, b in self.inference.projected_long_liqs.items()}
+            else:
+                buckets = {p: b.entry_price for p, b in self.inference.projected_short_liqs.items()}
 
         _ndigits = max(0, -Decimal(str(self.config.steps)).as_tuple().exponent)
         liq_bucket = round(round(liq_price / self.config.steps) * self.config.steps, _ndigits)
@@ -201,7 +205,7 @@ class LiquidationHeatmap:
         for delta in [0, -self.config.steps, self.config.steps, -2*self.config.steps, 2*self.config.steps]:
             check_bucket = liq_bucket + delta
             if check_bucket in buckets:
-                return buckets[check_bucket].entry_price
+                return buckets[check_bucket]
 
         return None
 

@@ -549,9 +549,9 @@ Defined in `embedded_api.py` via the `ResponseCache` class. Thread-safe `Dict[st
 | Health (`/health`) | **none** | Always computed fresh for monitoring accuracy |
 | Binary responses (`format=bin`) | **none** | Binary `Response` objects bypass the cache (only `JSONResponse` is cached) |
 
-Cache keys include all query parameters that affect the response (e.g., `liq_zones?symbol=BTC&side=long&min_leverage=20`). This prevents cross-contamination between different filter combinations.
+Cache keys are built via `ResponseCache.normalize_cache_key()` which normalizes all query parameters: symbols uppercased/truncated, floats rounded to 2dp, side validated to long/short/None, keys >200 chars hashed via MD5. This prevents cardinality explosion from raw user input variations.
 
-`ResponseCache` evicts expired entries (>60s) every 100 cache sets to prevent unbounded memory growth. Error responses and binary format responses bypass the cache.
+`ResponseCache` has dual eviction: (a) TTL-based — expired entries (>60s) evicted every 100 cache sets; (b) LRU-based — `MAX_CACHE_ENTRIES = 500` cap, oldest-accessed entries evicted when exceeded. Error responses and binary format responses bypass the cache.
 
 ## Snapshot Pipeline
 
@@ -607,6 +607,8 @@ Frontend (consumer)
 18. **NEVER combine tape and inference raw USD values without independent normalization** — tape (observed liquidation flow, ~$1-10K/min) and inference (estimated position inventory, ~$1-5M/min) differ by 100-1000x in magnitude. Always normalize each source to 0-1 independently via `_p99_scale()` before applying `tape_weight`/`projection_weight`. Raw combination makes the weight split useless and produces persistent horizontal lines.
 19. **NEVER compute entropy for safety checks without excluding DISABLED_TIERS** — structural zero-weight tiers cap entropy below safety thresholds (e.g. 10 tiers with one disabled → max H ≈ 1.59, below the 1.6 threshold). Always filter to enabled tiers and renormalize before entropy calculation. See `_run_calibration()` entropy block.
 20. **NEVER normalize weights without calling `_enforce_disabled_tiers()` afterward** — disabled tiers absorb weight through normalization drift (dividing total across all tiers including zeroed ones). After any weight normalization, zero disabled tiers and renormalize enabled tiers to sum to 1.0.
+21. **NEVER read `self.projected_long_liqs` or `self.projected_short_liqs` outside `_projection_lock`** — these dicts are mutated by the main thread in `on_minute()` and read by the API thread in `get_combined_heatmap()`, `get_combined_heatmap_display()`, `get_projections()`, `get_stats()`. Always copy-on-read under the lock, then compute outside. See Sprint 2 M1 fix and Sprint 3.5 C1 fix.
+22. **NEVER construct cache keys from raw user query params** — use `ResponseCache.normalize_cache_key()` which uppercases symbols, rounds floats to 2dp, validates side to long/short/None, and hashes keys >200 chars. Raw f-string cache keys allow cardinality explosion via float precision, mixed-case symbols, and invalid side values.
 
 ## Known Bugs and Past Issues
 
@@ -738,6 +740,22 @@ Frontend (consumer)
 ### RESOLVED: API bind address not configurable (Sprint 2 M8)
 - **Root cause:** `start_api_thread()` hardcoded `host="127.0.0.1"`.
 - **Fix:** Resolution order: explicit parameter > `API_HOST` env var > `"127.0.0.1"` fallback. Set `API_HOST=0.0.0.0` for production.
+
+### RESOLVED: Projection lock incomplete — live dict reads outside lock (Sprint 3.5 C1)
+- **Root cause:** Sprint 2 M1 added `_projection_lock` but missed 3 read sites: (a) `get_combined_heatmap()` lines 831/840 used `set(self.projected_long_liqs.keys())` and `set(self.projected_short_liqs.keys())` — reading live dicts outside the lock even though copies `proj_long`/`proj_short` were already made under lock at lines 820-822; (b) `_estimate_entry_from_projection()` in `liq_heatmap.py` iterated `self.inference.projected_*_liqs` with no lock at all.
+- **Fix:** (a) Changed lines 831/840 to use `set(proj_long.keys())` / `set(proj_short.keys())` (the already-copied dicts). (b) Added copy-on-read in `_estimate_entry_from_projection()`: acquires `self.inference._projection_lock`, copies `{price: entry_price}` dict under lock, computes bucket lookup outside lock.
+
+### RESOLVED: Unbounded grid allocation DoS via tiny step or corrupt binary frames (Sprint 3.5 C2)
+- **Root cause:** (a) Orderbook heatmap endpoints accepted arbitrary `step` and `range_pct` — a request with `step=0.001&range_pct=1.0` could create millions of grid buckets. (b) Corrupt binary history frames could claim huge `n_buckets` in their header, causing large memory allocations during deserialization.
+- **Fix:** (a) Added `MAX_GRID_BUCKETS = 10000` constant. Pre-build validation estimates bucket count from user params and rejects with 400 if > 10000. Post-build validation checks `len(prices) > MAX_GRID_BUCKETS` for default-range grids. Applied to both `/orderbook_heatmap` and `/orderbook_heatmap_history`. (b) `_frame_from_bytes()` in `embedded_api.py` validates `n_buckets <= LIQ_MAX_BUCKETS` and byte-length consistency (`len(data) >= LIQ_HEADER_SIZE + 2 * LIQ_MAX_BUCKETS`). `OrderbookFrame.from_bytes()` in `ob_heatmap.py` validates `0 < n_prices <= MAX_PRICE_BUCKETS` and byte-length consistency.
+
+### RESOLVED: Malformed WebSocket payload tears down entire stream (Sprint 3.5 H-WS)
+- **Root cause:** If `self.on_message(wrapped)` raised an exception (e.g. from a downstream processing bug triggered by unusual but valid JSON), the exception bubbled up to the connection-level handler, which triggered a full reconnect with backoff. A single malformed payload could thus take down the entire stream.
+- **Fix:** Added `try/except Exception` around `self.on_message(wrapped)` in all 3 connectors (Binance, OKX, Bybit). The handler logs `logger.error()` with the exception and truncated message data (200 chars). It does NOT touch backoff counters or trigger reconnect — the stream continues processing the next message. The catch is nested inside the existing `try/except json.JSONDecodeError` block.
+
+### RESOLVED: Response cache unbounded cardinality (Sprint 3.5 H-Cache)
+- **Root cause:** Cache keys were built from raw user query params via f-strings (e.g. `f"liq_zones?symbol={symbol}&side={side}..."`). This allowed cardinality explosion via: (a) float precision variations (`min_notional=0.0` vs `0.00` vs `0.000`), (b) mixed-case symbols (`btc` vs `BTC` vs `Btc`), (c) arbitrary side values creating unique keys. No entry count limit — a determined attacker could fill server memory.
+- **Fix:** (a) Added `ResponseCache.normalize_cache_key(**params)` static method: symbols stripped/uppercased/truncated to 10 chars, floats rounded to 2dp, side validated to long/short/None, keys >200 chars hashed via MD5. (b) All 13 cache key construction sites replaced with `cache.normalize_cache_key(endpoint=..., ...)`. (c) `MAX_CACHE_ENTRIES = 500` with LRU eviction — oldest-accessed entries removed when over limit. (d) Added `_validate_side()` function for side parameter validation (returns 400 on invalid), wired into `/liq_zones`. (e) `_validate_symbol()` now rejects empty or oversized (>10 chars) symbols.
 
 ---
 

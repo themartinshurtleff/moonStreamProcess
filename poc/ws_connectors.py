@@ -104,7 +104,11 @@ class BinanceConnector:
                             )
                             self.message_counts[name] = self.message_counts.get(name, 0) + 1
                             self.last_messages[name] = time.time()
-                            self.on_message(wrapped)
+                            try:
+                                self.on_message(wrapped)
+                            except Exception as e:
+                                logger.error("Binance %s callback error: %s (data: %.200s)",
+                                             name, e, str(message)[:200])
                         except json.JSONDecodeError as e:
                             logger.warning("Binance %s JSON decode error: %s", name, e)
 
@@ -312,7 +316,11 @@ class OKXConnector:
                             )
                             self.message_counts[obj] = self.message_counts.get(obj, 0) + 1
                             self.last_messages[obj] = time.time()
-                            self.on_message(wrapped)
+                            try:
+                                self.on_message(wrapped)
+                            except Exception as e:
+                                logger.error("OKX callback error: %s (data: %.200s)",
+                                             e, str(message)[:200])
                         except json.JSONDecodeError as e:
                             logger.warning("OKX JSON decode error: %s", e)
 
@@ -457,7 +465,11 @@ class BybitConnector:
                             )
                             self.message_counts[obj] = self.message_counts.get(obj, 0) + 1
                             self.last_messages[obj] = time.time()
-                            self.on_message(wrapped)
+                            try:
+                                self.on_message(wrapped)
+                            except Exception as e:
+                                logger.error("Bybit callback error: %s (data: %.200s)",
+                                             e, str(message)[:200])
                         except json.JSONDecodeError as e:
                             logger.warning("Bybit JSON decode error: %s", e)
 

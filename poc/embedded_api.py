@@ -27,6 +27,7 @@ Usage:
 """
 
 import copy
+import hashlib
 import json
 import os
 import struct
@@ -83,6 +84,9 @@ VALID_SYMBOLS = {"BTC", "ETH", "SOL"}
 DEFAULT_STEP = 20.0
 DEFAULT_BAND_PCT = 0.08
 
+# Maximum grid buckets — prevents DoS via tiny step or huge range
+MAX_GRID_BUCKETS = 10000
+
 
 def _step_ndigits(step: float) -> int:
     """Compute decimal precision digits from a step size."""
@@ -122,13 +126,22 @@ LIQ_HEADER_FORMAT = '<dddddI'
 LIQ_HEADER_SIZE = struct.calcsize(LIQ_HEADER_FORMAT)  # 48 bytes
 
 
+MAX_CACHE_ENTRIES = 500  # LRU cap to prevent unbounded cache growth
+
+# Maximum cache key length before hashing (prevents key storage bloat)
+_MAX_KEY_LENGTH = 200
+
+
 class ResponseCache:
     """
     Thread-safe in-memory response cache for API endpoints.
 
     Allows hundreds of concurrent users to receive the same cached response
     instead of each triggering separate data reads. Cache entries expire
-    after a configurable TTL.
+    after a configurable TTL. LRU eviction caps entries at MAX_CACHE_ENTRIES.
+
+    Cache keys should be built via ``normalize_cache_key()`` to prevent
+    cardinality explosion from raw user-controlled query params.
 
     Usage:
         cache = ResponseCache()
@@ -140,16 +153,44 @@ class ResponseCache:
         return response
     """
 
-    def __init__(self):
+    def __init__(self, max_entries: int = MAX_CACHE_ENTRIES):
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._lock = threading.Lock()
         self._sets_count: int = 0
+        self._max_entries = max_entries
+
+    @staticmethod
+    def normalize_cache_key(**params) -> str:
+        """Build a normalized cache key from endpoint params.
+
+        - Symbols: stripped, uppercased, truncated to 10 chars
+        - Numeric values: rounded to 2 decimal places
+        - Side: must be 'long', 'short', or None (omitted from key)
+        - Keys exceeding 200 chars are hashed via MD5 for uniqueness
+        """
+        parts: List[str] = []
+        for k, v in sorted(params.items()):
+            if v is None:
+                continue
+            if k == "symbol":
+                v = str(v).strip().upper()[:10]
+            elif k == "side":
+                v = str(v).strip().lower()
+            elif isinstance(v, float):
+                v = round(v, 2)
+            parts.append(f"{k}={v}")
+        key = "&".join(parts)
+        if len(key) > _MAX_KEY_LENGTH:
+            key = hashlib.md5(key.encode()).hexdigest()
+        return key
 
     def get(self, key: str, ttl: float) -> Optional[JSONResponse]:
         """Return cached JSONResponse if within TTL, else None."""
         with self._lock:
             entry = self._cache.get(key)
             if entry and (time.time() - entry[1]) < ttl:
+                # Update access timestamp for LRU tracking
+                self._cache[key] = (entry[0], time.time())
                 return entry[0]
         return None
 
@@ -160,6 +201,9 @@ class ResponseCache:
             self._sets_count += 1
             if self._sets_count % 100 == 0:
                 self._evict_expired()
+            # LRU eviction if over max entries
+            if len(self._cache) > self._max_entries:
+                self._evict_lru()
 
     def _evict_expired(self) -> None:
         """Remove entries older than max_ttl to prevent unbounded growth. Caller must hold _lock."""
@@ -167,6 +211,16 @@ class ResponseCache:
         max_ttl = 60.0  # nothing should be cached longer than this
         expired = [k for k, (_, ts) in self._cache.items() if (now - ts) > max_ttl]
         for k in expired:
+            del self._cache[k]
+
+    def _evict_lru(self) -> None:
+        """Evict oldest-accessed entries until under max_entries. Caller must hold _lock."""
+        excess = len(self._cache) - self._max_entries
+        if excess <= 0:
+            return
+        # Sort by access time (oldest first) and remove excess
+        oldest = sorted(self._cache.items(), key=lambda item: item[1][1])
+        for k, _ in oldest[:excess]:
             del self._cache[k]
 
 
@@ -249,6 +303,21 @@ class LiquidationHeatmapBuffer:
         ts, src, price_min, price_max, step, n_buckets = header
 
         if ts <= 0 or n_buckets == 0:
+            return None
+
+        # Cap n_buckets to prevent corrupt frames from allocating huge arrays
+        if n_buckets > LIQ_MAX_BUCKETS:
+            logger.warning("Corrupt frame: n_buckets=%d exceeds LIQ_MAX_BUCKETS=%d, skipping",
+                           n_buckets, LIQ_MAX_BUCKETS)
+            return None
+
+        # Validate that the record has enough data for the claimed buckets.
+        # Each side needs n_buckets bytes of intensity data starting after the header.
+        # Layout: header + LIQ_MAX_BUCKETS (long) + LIQ_MAX_BUCKETS (short) + padding
+        min_required = LIQ_HEADER_SIZE + 2 * LIQ_MAX_BUCKETS
+        if len(data) < min_required:
+            logger.warning("Truncated frame: %d bytes < %d required (header + 2*%d), skipping",
+                           len(data), min_required, LIQ_MAX_BUCKETS)
             return None
 
         long_start = LIQ_HEADER_SIZE
@@ -550,12 +619,29 @@ def create_embedded_app(
     def _validate_symbol(symbol: str) -> str:
         """Validate and normalize symbol. Returns uppercase short symbol or raises 400."""
         sym = symbol.strip().upper().replace("USDT", "")
+        if not sym or len(sym) > 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid symbol '{symbol}'. Valid symbols: {', '.join(sorted(VALID_SYMBOLS))}"
+            )
         if sym not in VALID_SYMBOLS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid symbol '{symbol}'. Valid symbols: {', '.join(sorted(VALID_SYMBOLS))}"
             )
         return sym
+
+    def _validate_side(side: Optional[str]) -> Optional[str]:
+        """Validate side parameter. Returns 'long', 'short', or None. Raises 400 on invalid."""
+        if side is None:
+            return None
+        s = side.strip().lower()
+        if s not in ("long", "short"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid side '{side}'. Must be 'long' or 'short'."
+            )
+        return s
 
     @app.on_event("startup")
     async def startup():
@@ -619,7 +705,7 @@ def create_embedded_app(
         Returns per-exchange breakdown and aggregate (in base asset).
         """
         symbol_short = _validate_symbol(symbol)
-        cache_key = f"oi?symbol={symbol_short}"
+        cache_key = cache.normalize_cache_key(endpoint="oi", symbol=symbol_short)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
@@ -655,7 +741,7 @@ def create_embedded_app(
         """Get current V1 liquidation heatmap snapshot."""
         sym = _validate_symbol(symbol)
 
-        cache_key = f"liq_heatmap?symbol={sym}"
+        cache_key = cache.normalize_cache_key(endpoint="liq_heatmap", symbol=sym)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
@@ -689,7 +775,7 @@ def create_embedded_app(
         minutes = max(5, min(720, minutes))
         stride = max(1, min(30, stride))
 
-        cache_key = f"liq_heatmap_history?symbol={sym}&minutes={minutes}&stride={stride}"
+        cache_key = cache.normalize_cache_key(endpoint="liq_heatmap_history", symbol=sym, minutes=minutes, stride=stride)
         cached = cache.get(cache_key, ttl=30.0)
         if cached is not None:
             return cached
@@ -762,7 +848,7 @@ def create_embedded_app(
         """Get current V2 liquidation heatmap (tape + inference)."""
         sym = _validate_symbol(symbol)
 
-        cache_key = f"liq_heatmap_v2?symbol={sym}&min_notional={min_notional}"
+        cache_key = cache.normalize_cache_key(endpoint="liq_heatmap_v2", symbol=sym, min_notional=min_notional)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
@@ -807,7 +893,7 @@ def create_embedded_app(
         minutes = max(5, min(720, minutes))
         stride = max(1, min(30, stride))
 
-        cache_key = f"liq_heatmap_v2_history?symbol={sym}&minutes={minutes}&stride={stride}"
+        cache_key = cache.normalize_cache_key(endpoint="liq_heatmap_v2_history", symbol=sym, minutes=minutes, stride=stride)
         cached = cache.get(cache_key, ttl=30.0)
         if cached is not None:
             return cached
@@ -879,7 +965,7 @@ def create_embedded_app(
         """Get V2 heatmap statistics."""
         sym = _validate_symbol(symbol)
 
-        cache_key = f"liq_stats?symbol={sym}"
+        cache_key = cache.normalize_cache_key(endpoint="liq_stats", symbol=sym)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
@@ -949,6 +1035,16 @@ def create_embedded_app(
             raise HTTPException(status_code=400, detail="step must be positive")
         if range_pct <= 0 or range_pct > 1.0:
             raise HTTPException(status_code=400, detail="range_pct must be between 0 and 1.0")
+        if price_min is not None and price_max is not None and price_max <= price_min:
+            raise HTTPException(status_code=400, detail="price_max must be greater than price_min")
+        # Estimate grid size to prevent DoS from tiny step with wide range
+        if price_min is not None and price_max is not None:
+            est_buckets = int((price_max - price_min) / step) + 1
+            if est_buckets > MAX_GRID_BUCKETS or est_buckets <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"grid too large: {est_buckets} buckets exceeds limit of {MAX_GRID_BUCKETS}"
+                )
 
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
@@ -988,7 +1084,7 @@ def create_embedded_app(
             )
 
         # JSON format — check cache
-        cache_key = f"orderbook_heatmap?symbol={symbol}&range_pct={range_pct}&step={step}&price_min={price_min}&price_max={price_max}"
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap", symbol=symbol, range_pct=range_pct, step=step, price_min=price_min, price_max=price_max)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
@@ -1000,6 +1096,11 @@ def create_embedded_app(
             p_min = price_min if price_min is not None else frame.price_min
             p_max = price_max if price_max is not None else frame.price_max
             prices, p_min, p_max = ob_build_unified_grid([frame], p_min, p_max, step)
+            if len(prices) > MAX_GRID_BUCKETS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"grid too large: {len(prices)} buckets exceeds limit of {MAX_GRID_BUCKETS}"
+                )
             bid_u8, ask_u8 = resample_frame_to_grid(frame, prices, step)
         else:
             prices = frame.get_prices()
@@ -1081,6 +1182,15 @@ def create_embedded_app(
         # Validate user-provided grid parameters
         if step <= 0:
             raise HTTPException(status_code=400, detail="step must be positive")
+        if price_min is not None and price_max is not None and price_max <= price_min:
+            raise HTTPException(status_code=400, detail="price_max must be greater than price_min")
+        if price_min is not None and price_max is not None:
+            est_buckets = int((price_max - price_min) / step) + 1
+            if est_buckets > MAX_GRID_BUCKETS or est_buckets <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"grid too large: {est_buckets} buckets exceeds limit of {MAX_GRID_BUCKETS}"
+                )
 
         if not HAS_OB_HEATMAP or not state.ob_buffer:
             raise HTTPException(
@@ -1128,7 +1238,7 @@ def create_embedded_app(
             )
 
         # JSON format — check cache
-        cache_key = f"orderbook_heatmap_history?symbol={symbol}&minutes={minutes}&stride={stride}&step={step}&price_min={price_min}&price_max={price_max}"
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_history", symbol=symbol, minutes=minutes, stride=stride, step=step, price_min=price_min, price_max=price_max)
         cached = cache.get(cache_key, ttl=30.0)
         if cached is not None:
             return cached
@@ -1184,7 +1294,7 @@ def create_embedded_app(
         - Reconstructor stats: state, resyncs, gaps, update IDs
         - Timing: last frame age, staleness indicator
         """
-        cache_key = "orderbook_heatmap_stats"
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_stats")
         cached = cache.get(cache_key, ttl=10.0)
         if cached is not None:
             return cached
@@ -1241,7 +1351,7 @@ def create_embedded_app(
     @app.get("/v2/orderbook_heatmap_30s_debug")  # backwards compat alias
     async def orderbook_heatmap_30s_debug():
         """Debug endpoint for orderbook heatmap system."""
-        cache_key = "orderbook_heatmap_debug"
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_debug")
         cached = cache.get(cache_key, ttl=10.0)
         if cached is not None:
             return cached
@@ -1295,12 +1405,13 @@ def create_embedded_app(
         - REINFORCED: Zones strengthened by repeated predictions
         - (Zones are removed when SWEPT by price or EXPIRED by time/decay)
         """
-        cache_key = f"liq_zones?symbol={symbol}&side={side}&min_leverage={min_leverage}&max_leverage={max_leverage}&min_weight={min_weight}"
+        symbol_short = _validate_symbol(symbol)
+        side = _validate_side(side)
+
+        cache_key = cache.normalize_cache_key(endpoint="liq_zones", symbol=symbol_short, side=side, min_leverage=min_leverage, max_leverage=max_leverage, min_weight=min_weight)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
-
-        symbol_short = _validate_symbol(symbol)
 
         if not state.engine_manager:
             raise HTTPException(
@@ -1312,7 +1423,7 @@ def create_embedded_app(
         if not zone_mgr:
             raise HTTPException(
                 status_code=404,
-                detail=f"No zone manager available for {symbol}. Is the engine registered?"
+                detail=f"No zone manager available for {symbol_short}. Is the engine registered?"
             )
 
         # Get active zones with filters
@@ -1355,12 +1466,12 @@ def create_embedded_app(
 
         Returns counts and totals for zone lifecycle tracking.
         """
-        cache_key = f"liq_zones_summary?symbol={symbol}"
+        symbol_short = _validate_symbol(symbol)
+
+        cache_key = cache.normalize_cache_key(endpoint="liq_zones_summary", symbol=symbol_short)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
-
-        symbol_short = _validate_symbol(symbol)
 
         if not state.engine_manager:
             raise HTTPException(
@@ -1399,12 +1510,12 @@ def create_embedded_app(
         Unlike V2, this supports filtering zones based on which leverage tiers
         contributed to them.
         """
-        cache_key = f"liq_zones_heatmap?symbol={symbol}&min_notional={min_notional}&min_leverage={min_leverage}&max_leverage={max_leverage}&min_weight={min_weight}"
+        symbol_short = _validate_symbol(symbol)
+
+        cache_key = cache.normalize_cache_key(endpoint="liq_zones_heatmap", symbol=symbol_short, min_notional=min_notional, min_leverage=min_leverage, max_leverage=max_leverage, min_weight=min_weight)
         cached = cache.get(cache_key, ttl=5.0)
         if cached is not None:
             return cached
-
-        symbol_short = _validate_symbol(symbol)
 
         if not state.engine_manager:
             raise HTTPException(

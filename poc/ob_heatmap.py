@@ -562,6 +562,18 @@ class OrderbookFrame:
         header = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
         ts, src, step, price_min, price_max, n_prices, norm_p50, norm_p95, total_bid, total_ask = header
 
+        # Cap n_prices to prevent corrupt frames from allocating huge arrays
+        if n_prices <= 0 or n_prices > MAX_PRICE_BUCKETS:
+            raise ValueError(f"Invalid n_prices={n_prices} (max {MAX_PRICE_BUCKETS})")
+
+        # Validate remaining bytes can hold the claimed bucket data
+        min_required = HEADER_SIZE + 2 * MAX_PRICE_BUCKETS
+        if len(data) < min_required:
+            raise ValueError(
+                f"Truncated frame: {len(data)} bytes < {min_required} required "
+                f"(header {HEADER_SIZE} + 2*{MAX_PRICE_BUCKETS})"
+            )
+
         # Extract intensity arrays
         bid_start = HEADER_SIZE
         ask_start = HEADER_SIZE + MAX_PRICE_BUCKETS
