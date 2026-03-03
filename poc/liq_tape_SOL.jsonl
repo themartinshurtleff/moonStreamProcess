@@ -6937,3 +6937,5 @@
 {"type": "forceOrder", "ts": 1772490687.405, "symbol": "SOL", "side": "short", "price": 88.42, "qty": 5.13, "notional": 453.5946, "bucket": 88.4, "entry_est": 87.30306693499999}
 {"type": "forceOrder", "ts": 1772490985.364, "symbol": "SOL", "side": "short", "price": 88.5, "qty": 100.0, "notional": 8850.0, "bucket": 88.5, "entry_est": 86.59788359750002}
 {"type": "forceOrder", "ts": 1772490986.523, "symbol": "SOL", "side": "short", "price": 88.51, "qty": 1.72, "notional": 152.2372, "bucket": 88.5, "entry_est": 86.59788359750002}
+{"type": "forceOrder", "ts": 1772496182.35, "symbol": "SOL", "side": "short", "price": 87.23, "qty": 59.9, "notional": 5225.077, "bucket": 87.2, "entry_est": 86.56395298749999}
+{"type": "forceOrder", "ts": 1772496588.278, "symbol": "SOL", "side": "long", "price": 87.33, "qty": 195.6, "notional": 17081.748, "bucket": 87.3, "entry_est": null}
