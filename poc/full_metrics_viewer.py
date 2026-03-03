@@ -143,6 +143,10 @@ ZONE_PERSIST_FILES = {
 
 logger = logging.getLogger(__name__)
 
+# Module-level shutdown guard: prevents re-entrant cleanup when Ctrl+C fires
+# during the finally block. threading.Event is atomic and safe from any thread.
+_shutdown_event = threading.Event()
+
 
 def _rotate_log_if_needed(log_path: str, max_mb: float = 200, max_age_hours: float = 24) -> bool:
     """Rotate log file if it exceeds size or age limits."""
@@ -707,6 +711,11 @@ class FullMetricsProcessor:
         # Last-seen timestamps per exchange for dashboard connection health
         self.exchange_last_seen = defaultdict(float)
 
+        # Lock protecting display-consumed dicts: symbol_prices, liq_counts,
+        # oi_by_symbol, exchange_last_seen. The display thread reads these via
+        # get_display_state() which copies under this lock.
+        self._display_lock = threading.Lock()
+
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
         self._sanity_check_limit = 50
@@ -949,11 +958,13 @@ class FullMetricsProcessor:
         """Callback from MultiExchangeOIPoller with per-symbol aggregated OI."""
         with self.lock:
             prev = self.oi_by_symbol.get(symbol_short, {}).get("aggregated_oi", 0.0)
-            self.oi_by_symbol[symbol_short] = {
+            new_oi_entry = {
                 "aggregated_oi": aggregated_oi,
                 "per_exchange": dict(per_exchange),
                 "ts": time.time(),
             }
+            with self._display_lock:
+                self.oi_by_symbol[symbol_short] = new_oi_entry
 
             # BTC backwards compat — update legacy state fields
             if symbol_short == "BTC":
@@ -987,7 +998,8 @@ class FullMetricsProcessor:
         instrument = msg.get("instrument", "")
         data = msg.get("data", {})
 
-        self.exchange_last_seen[exchange] = time.time()
+        with self._display_lock:
+            self.exchange_last_seen[exchange] = time.time()
 
         with self.lock:
             key = f"{exchange}_{obj_type}"
@@ -1313,7 +1325,8 @@ class FullMetricsProcessor:
                     qty=event.qty,
                     notional=event.notional,
                 )
-                self.liq_counts[event.symbol_short][event.exchange] += 1
+                with self._display_lock:
+                    self.liq_counts[event.symbol_short][event.exchange] += 1
             except Exception as e:
                 _write_debug_log({
                     "type": "liq_processing_error",
@@ -1338,15 +1351,16 @@ class FullMetricsProcessor:
         if "p" in data:
             mark = float(data["p"])
             if mark > 0:
-                prices = self.symbol_prices[sym]
-                prices["mark"] = mark
-                prices["close"] = mark
+                with self._display_lock:
+                    prices = self.symbol_prices[sym]
+                    prices["mark"] = mark
+                    prices["close"] = mark
 
-                # OHLC accumulation: first tick sets open, then track high/low
-                if prices["open"] == 0.0:
-                    prices["open"] = mark
-                prices["high"] = max(prices["high"], mark) if prices["high"] > 0 else mark
-                prices["low"] = min(prices["low"], mark) if prices["low"] > 0 else mark
+                    # OHLC accumulation: first tick sets open, then track high/low
+                    if prices["open"] == 0.0:
+                        prices["open"] = mark
+                    prices["high"] = max(prices["high"], mark) if prices["high"] > 0 else mark
+                    prices["low"] = min(prices["low"], mark) if prices["low"] > 0 else mark
 
                 # BTC backwards compat: update self.state.perp_markPrice
                 if sym == "BTC":
@@ -1881,11 +1895,12 @@ class FullMetricsProcessor:
 
             # Reset per-symbol OHLC for new minute.
             # Carry forward last close as new open (first tick will override).
-            for sym in self.symbol_prices:
-                last_close = self.symbol_prices[sym]["close"]
-                self.symbol_prices[sym]["open"] = last_close if last_close > 0 else 0.0
-                self.symbol_prices[sym]["high"] = last_close if last_close > 0 else 0.0
-                self.symbol_prices[sym]["low"] = last_close if last_close > 0 else 0.0
+            with self._display_lock:
+                for sym in self.symbol_prices:
+                    last_close = self.symbol_prices[sym]["close"]
+                    self.symbol_prices[sym]["open"] = last_close if last_close > 0 else 0.0
+                    self.symbol_prices[sym]["high"] = last_close if last_close > 0 else 0.0
+                    self.symbol_prices[sym]["low"] = last_close if last_close > 0 else 0.0
 
             # Reset per-symbol volume accumulators for new minute.
             for sym in self.symbol_volumes:
@@ -2034,6 +2049,25 @@ class FullMetricsProcessor:
                 f"extra={snap_keys - reference_keys}"
             )
 
+    def get_display_state(self) -> dict:
+        """Return a frozen snapshot of display-consumed dicts for the Rich dashboard.
+
+        Acquires _display_lock to copy mutable dicts safely, then releases
+        before the caller does any Rich rendering. Values inside nested dicts
+        are plain floats/ints so dict() shallow copy is sufficient.
+        """
+        with self._display_lock:
+            prices_snap = {sym: dict(v) for sym, v in self.symbol_prices.items()}
+            liq_snap = {sym: dict(v) for sym, v in self.liq_counts.items()}
+            oi_snap = {sym: dict(v) for sym, v in self.oi_by_symbol.items()}
+            exch_snap = dict(self.exchange_last_seen)
+        return {
+            "symbol_prices": prices_snap,
+            "liq_counts": liq_snap,
+            "oi_by_symbol": oi_snap,
+            "exchange_last_seen": exch_snap,
+        }
+
     def get_state(self) -> FullMetricsState:
         with self.lock:
             # Return a copy to avoid threading issues
@@ -2044,6 +2078,8 @@ class FullMetricsProcessor:
 def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout:
     """Generate the display layout."""
     state = processor.get_state()
+    # Frozen snapshot of display-consumed dicts (thread-safe copy under _display_lock)
+    dsnap = processor.get_display_state()
 
     def fmt_price(value: float) -> str:
         return f"${value:,.2f}" if value and value > 0 else "—"
@@ -2120,10 +2156,10 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
 
         for sym in dashboard_symbols:
             try:
-                prices = processor.symbol_prices.get(sym, {})
+                prices = dsnap["symbol_prices"].get(sym, {})
                 price_text = fmt_price(prices.get("mark", 0.0))
 
-                liq_events = sum(processor.liq_counts.get(sym, {}).values())
+                liq_events = sum(dsnap["liq_counts"].get(sym, {}).values())
                 engine = processor.engine_manager.get_engine(sym)
 
                 cal_events = 0
@@ -2141,7 +2177,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
                         except Exception:
                             zone_count = 0
 
-                agg_oi = processor.oi_by_symbol.get(sym, {}).get("aggregated_oi", 0.0)
+                agg_oi = dsnap["oi_by_symbol"].get(sym, {}).get("aggregated_oi", 0.0)
                 agg_oi_text = f"{agg_oi:,.0f}" if agg_oi and agg_oi > 0 else "0"
 
                 overview.add_row(
@@ -2169,7 +2205,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
 
         for sym in dashboard_symbols:
             try:
-                per_sym = processor.liq_counts.get(sym, {})
+                per_sym = dsnap["liq_counts"].get(sym, {})
                 liq_breakdown.add_row(
                     sym,
                     f"{per_sym.get('binance', 0):,}",
@@ -2186,7 +2222,7 @@ def create_display(processor: FullMetricsProcessor, start_time: float) -> Layout
         now_ts = time.time()
         statuses = []
         for ex in ["binance", "bybit", "okx"]:
-            age = now_ts - processor.exchange_last_seen.get(ex, 0.0)
+            age = now_ts - dsnap["exchange_last_seen"].get(ex, 0.0)
             if age < 30:
                 st = "[green]LIVE[/green]"
             elif age < 120:
@@ -2503,14 +2539,50 @@ def main():
         except Exception as e:
             logger.warning("Error stopping API state: %s", e)
 
-    def signal_handler(sig, frame):
-        console.print("\n[yellow]Shutting down...[/]")
+    def _do_cleanup():
+        """Run shutdown cleanup exactly once (guarded by _shutdown_event).
+
+        This is safe to call from both signal handler and finally block —
+        the second call is a no-op thanks to the atomic Event check.
+        """
+        if _shutdown_event.is_set():
+            return  # Already running or completed — no re-entry
+        _shutdown_event.set()
+
+        logger.info("Shutdown cleanup starting")
+
+        # 1. Signal all loops to stop
         stop_event.set()
-        connector.stop()
-        processor.oi_poller.stop()
-        processor.rest_poller.stop()
+
+        # 2. Stop WS connector (sets running=False, non-blocking)
+        try:
+            connector.stop()
+        except Exception as e:
+            logger.warning("Error stopping connector: %s", e)
+
+        # 3. Stop pollers (these have .join(timeout=5) internally)
+        try:
+            processor.oi_poller.stop()
+        except Exception as e:
+            logger.warning("Error stopping OI poller: %s", e)
+
+        try:
+            processor.rest_poller.stop()
+        except Exception as e:
+            logger.warning("Error stopping REST poller: %s", e)
+
+        # 4. Close engines (per-symbol, exception-isolated)
         _close_engines(processor)
+
+        # 5. Stop API state refresh thread
         _stop_api_state()
+
+        logger.info("Shutdown cleanup complete")
+
+    def signal_handler(sig, frame):
+        """Lightweight signal handler — set flags only, let finally block do cleanup."""
+        stop_event.set()
+        _shutdown_event.set()  # Prevent finally block from duplicating work
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -2527,12 +2599,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        stop_event.set()
-        connector.stop()
-        processor.oi_poller.stop()
-        processor.rest_poller.stop()
-        _close_engines(processor)
-        _stop_api_state()
+        # Rich Live context manager has exited — terminal is released.
+        # Now safe to do cleanup (joins, flushes, etc.)
+        _do_cleanup()
 
     if api_thread:
         console.print("[dim]API server thread will terminate automatically.[/]")

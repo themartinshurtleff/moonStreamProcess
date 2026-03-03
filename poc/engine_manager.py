@@ -43,6 +43,7 @@ Current engine constructor parameters (from full_metrics_viewer.py):
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
@@ -204,6 +205,16 @@ class EngineManager:
             logger.warning(
                 "on_force_order: no engine for symbol %s", symbol_short
             )
+            return
+
+        # Validate side — must be exactly "long" or "short"
+        if side not in ("long", "short"):
+            if not hasattr(self, '_bad_side_logged_at') or time.time() - self._bad_side_logged_at > 60:
+                logger.warning(
+                    "on_force_order: dropping event with invalid side=%r for %s (price=%.2f, qty=%.4f)",
+                    side, symbol_short, price, qty,
+                )
+                self._bad_side_logged_at = time.time()
             return
 
         # 1. Calibrator — weight learning feedback

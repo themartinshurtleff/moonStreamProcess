@@ -893,6 +893,7 @@ class LiquidationCalibrator:
             # Update current params
             self.current_ladder = ladder.copy()
             self.current_weights = weights.copy()
+            self._enforce_disabled_tiers()
             self.current_buffer = buffer
             self.steps = steps
 

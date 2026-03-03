@@ -559,7 +559,7 @@ class ActiveZoneManager:
                         'last_reinforced_at': zone.last_reinforced_at,
                         'reinforcement_count': zone.reinforcement_count,
                         'source': zone.source,
-                        'tier_contributions': zone.tier_contributions
+                        'tier_contributions': dict(zone.tier_contributions)
                     })
 
                 data = {
@@ -570,12 +570,22 @@ class ActiveZoneManager:
                 }
 
             # Write to temp file first, then rename (atomic)
-            temp_file = self.persist_file + '.tmp'
-            with open(temp_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            temp_file = self.persist_file + f'.tmp.{os.getpid()}'
+            try:
+                with open(temp_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
 
-            os.replace(temp_file, self.persist_file)
-            return True
+                os.replace(temp_file, self.persist_file)
+                return True
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(temp_file)
+                except OSError:
+                    pass
+                raise
 
         except Exception as e:
             logger.error(f"Error saving zones to disk: {e}")

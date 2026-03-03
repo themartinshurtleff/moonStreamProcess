@@ -83,8 +83,7 @@ class BinanceConnector:
                 async with websockets.connect(url, ping_interval=20) as ws:
                     self.ws_connections[name] = ws
                     self.message_counts[name] = 0
-                    # Reset backoff on successful connection
-                    self._backoff[name] = [0, ""]
+                    _data_received_on_connection = False
 
                     if subscribe_msg:
                         await ws.send(json.dumps(subscribe_msg))
@@ -109,6 +108,10 @@ class BinanceConnector:
                             except Exception as e:
                                 logger.error("Binance %s callback error: %s (data: %.200s)",
                                              name, e, str(message)[:200])
+                            # Reset backoff after first successful data flow
+                            if not _data_received_on_connection:
+                                _data_received_on_connection = True
+                                self._backoff[name] = [0, ""]
                         except json.JSONDecodeError as e:
                             logger.warning("Binance %s JSON decode error: %s", name, e)
 
@@ -273,8 +276,7 @@ class OKXConnector:
         while self.running:
             try:
                 async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
-                    self._attempt = 0
-                    self._last_err = ""
+                    _data_received_on_connection = False
                     # Build subscription args
                     args = []
                     # BTC-specific data streams (orderbook, trades, funding, OI)
@@ -321,6 +323,11 @@ class OKXConnector:
                             except Exception as e:
                                 logger.error("OKX callback error: %s (data: %.200s)",
                                              e, str(message)[:200])
+                            # Reset backoff after first successful data flow
+                            if not _data_received_on_connection:
+                                _data_received_on_connection = True
+                                self._attempt = 0
+                                self._last_err = ""
                         except json.JSONDecodeError as e:
                             logger.warning("OKX JSON decode error: %s", e)
 
@@ -421,9 +428,7 @@ class BybitConnector:
         while self.running:
             try:
                 async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
-                    # Reset backoff on successful connection
-                    self._attempt = 0
-                    self._last_err = ""
+                    _data_received_on_connection = False
                     # Build subscription args for all symbols
                     args = []
                     # BTC-specific data streams (orderbook, trades, tickers)
@@ -470,6 +475,11 @@ class BybitConnector:
                             except Exception as e:
                                 logger.error("Bybit callback error: %s (data: %.200s)",
                                              e, str(message)[:200])
+                            # Reset backoff after first successful data flow
+                            if not _data_received_on_connection:
+                                _data_received_on_connection = True
+                                self._attempt = 0
+                                self._last_err = ""
                         except json.JSONDecodeError as e:
                             logger.warning("Bybit JSON decode error: %s", e)
 

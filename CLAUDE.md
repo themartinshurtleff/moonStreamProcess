@@ -757,6 +757,30 @@ Frontend (consumer)
 - **Root cause:** Cache keys were built from raw user query params via f-strings (e.g. `f"liq_zones?symbol={symbol}&side={side}..."`). This allowed cardinality explosion via: (a) float precision variations (`min_notional=0.0` vs `0.00` vs `0.000`), (b) mixed-case symbols (`btc` vs `BTC` vs `Btc`), (c) arbitrary side values creating unique keys. No entry count limit — a determined attacker could fill server memory.
 - **Fix:** (a) Added `ResponseCache.normalize_cache_key(**params)` static method: symbols stripped/uppercased/truncated to 10 chars, floats rounded to 2dp, side validated to long/short/None, keys >200 chars hashed via MD5. (b) All 13 cache key construction sites replaced with `cache.normalize_cache_key(endpoint=..., ...)`. (c) `MAX_CACHE_ENTRIES = 500` with LRU eviction — oldest-accessed entries removed when over limit. (d) Added `_validate_side()` function for side parameter validation (returns 400 on invalid), wired into `/liq_zones`. (e) `_validate_symbol()` now rejects empty or oversized (>10 chars) symbols.
 
+### RESOLVED: Ctrl+C freezes process due to signal handler doing cleanup (Sprint 3.5 H-Shutdown)
+- **Root cause:** The SIGINT/SIGTERM signal handler performed full cleanup (connector.stop(), poller joins, engine close) inline. Thread `.join()` calls inside a signal handler can deadlock when the interrupted thread holds a lock the cleanup path needs. Additionally, both the signal handler and the `finally` block ran the same cleanup, causing re-entrance.
+- **Fix:** Signal handler now only sets flags (`stop_event.set()`, `_shutdown_event.set()`). All cleanup moved to `_do_cleanup()` guarded by `_shutdown_event` (atomic re-entrance prevention via `threading.Event`). Called once from the `finally` block after `Rich.Live` context exits. All `.join()` calls have `timeout=5`.
+
+### RESOLVED: Display thread reads live dicts without lock (Sprint 3.5 H-Display)
+- **Root cause:** `create_display()` (called at 4 FPS from Rich Live) read `processor.symbol_prices`, `processor.liq_counts`, `processor.oi_by_symbol`, and `processor.exchange_last_seen` directly — no synchronization with the main processing thread that mutates them.
+- **Fix:** Added `self._display_lock = threading.Lock()`. All write sites for these 4 dicts acquire the lock. Added `get_display_state()` method that copies all 4 dicts under the lock and returns a frozen snapshot. `create_display()` calls `get_display_state()` once and uses only the returned snapshot — never accesses live processor dicts directly.
+
+### RESOLVED: Zone persistence serializes shared reference outside lock (Sprint 3.5 H-Zone)
+- **Root cause:** `_save_to_disk()` in `active_zone_manager.py` serialized `zone.tier_contributions` (a `Dict[int, float]`) as a shallow reference. While `json.dump` reads the dict outside the lock (after the `with self._lock:` block exits), the main thread could mutate it. Also missing `fsync` and temp file cleanup on failure.
+- **Fix:** Deep copy via `dict(zone.tier_contributions)` under the lock. Added `f.flush()` + `os.fsync(f.fileno())` before rename. Unique temp filename with PID. `try/except` around write with `os.unlink(temp_file)` cleanup on failure.
+
+### RESOLVED: WS backoff resets on TCP connect not data flow (Sprint 3.5 H-Backoff)
+- **Root cause:** All three WS connectors (Binance, OKX, Bybit) reset their backoff counters immediately on `websockets.connect()` success. An exchange that accepts TCP then immediately drops (rate limiting, maintenance) would reset backoff to 0, causing rapid reconnect hammering.
+- **Fix:** Added `_data_received_on_connection` flag in each connector. Backoff reset moved from the `async with websockets.connect()` entry to after the first successful `on_message()` callback completion (no exception). Flag is reset to `False` on each new connection attempt.
+
+### RESOLVED: Unknown liquidation side defaults to short (Sprint 3.5 M-Side)
+- **Root cause:** `EngineManager.on_force_order()` passed the `side` parameter directly to calibrator and heatmap without validation. If a normalizer bug or exchange format change produced an unexpected side value, it would propagate through the entire pipeline.
+- **Fix:** Added validation: `if side not in ("long", "short"): log WARNING and return`. Rate-limited logging (once per minute) to avoid log flood from systematic normalizer bugs.
+
+### RESOLVED: Missing _enforce_disabled_tiers in on_minute_snapshot (Sprint 3.5 M-Calibrator)
+- **Root cause:** `on_minute_snapshot()` at line 895 assigned `self.current_weights = weights.copy()` from the caller's weight list. If the caller passed weights with non-zero disabled tier values (e.g. from a stale weight file loaded before enforcement), the calibrator would operate with non-zero disabled tier weights until the next `_run_calibration()` cycle (up to 30 minutes).
+- **Fix:** Added `self._enforce_disabled_tiers()` immediately after `self.current_weights = weights.copy()`. This is now the 4th call site (joining `_load_weights`, `_save_weights`, and inline in `_run_calibration`).
+
 ---
 
 ## Symbol Conventions
