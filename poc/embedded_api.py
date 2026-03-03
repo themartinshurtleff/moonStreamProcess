@@ -18,7 +18,7 @@ Usage:
     from embedded_api import create_embedded_app, start_api_thread
 
     app = create_embedded_app(
-        ob_buffer=processor.ob_heatmap_buffer,
+        ob_buffer=processor.ob_heatmap_buffers,
         snapshot_dir=POC_DIR,
         engine_manager=processor.engine_manager
     )
@@ -556,7 +556,7 @@ class EmbeddedAPIState:
 
     def __init__(
         self,
-        ob_buffer: Optional['OrderbookHeatmapBuffer'] = None,
+        ob_buffer=None,
         snapshot_dir: Optional[str] = None,
         engine_manager: Optional['EngineManager'] = None,
         oi_poller: Optional[Any] = None,
@@ -565,7 +565,16 @@ class EmbeddedAPIState:
         snapshot_v2_file: Optional[str] = None,
         liq_heatmap_v2_file: Optional[str] = None,
     ):
-        self.ob_buffer = ob_buffer
+        # ob_buffer: Dict[str, OrderbookHeatmapBuffer] keyed by symbol, or single buffer (legacy)
+        if isinstance(ob_buffer, dict):
+            self.ob_buffers: Dict[str, Any] = ob_buffer
+        elif ob_buffer is not None:
+            # Legacy single-buffer: assign to BTC for backwards compat
+            self.ob_buffers = {"BTC": ob_buffer}
+        else:
+            self.ob_buffers = {}
+        # Legacy alias for code that still references state.ob_buffer
+        self.ob_buffer = self.ob_buffers.get("BTC")
         self.engine_manager = engine_manager
         self.oi_poller = oi_poller  # MultiExchangeOIPoller or OIPollerThread
         self.start_time = time.time()
@@ -658,7 +667,7 @@ class EmbeddedAPIState:
 
 
 def create_embedded_app(
-    ob_buffer: Optional['OrderbookHeatmapBuffer'] = None,
+    ob_buffer=None,
     snapshot_dir: Optional[str] = None,
     engine_manager: Optional['EngineManager'] = None,
     oi_poller: Optional[Any] = None,
@@ -729,12 +738,13 @@ def create_embedded_app(
 
     @app.on_event("startup")
     async def startup():
-        ob_frames = 0
-        if state.ob_buffer:
-            ob_stats = state.ob_buffer.get_stats()
-            ob_frames = ob_stats.get('frames_in_memory', 0)
-
-        print(f"[EMBEDDED_API] Started with shared buffer: {ob_frames} OB frames")
+        for sym in sorted(VALID_SYMBOLS):
+            ob_buf = state.ob_buffers.get(sym)
+            if ob_buf:
+                ob_stats = ob_buf.get_stats()
+                print(f"[EMBEDDED_API] {sym} OB buffer: {ob_stats.get('frames_in_memory', 0)} frames")
+            else:
+                print(f"[EMBEDDED_API] {sym} OB buffer: not configured")
         print(f"[EMBEDDED_API] Snapshot dir: {state._snapshot_dir}")
         for sym in sorted(VALID_SYMBOLS):
             v2_frames = state.v2_histories[sym].frame_count()
@@ -748,20 +758,19 @@ def create_embedded_app(
     @app.get("/v1/health")  # backwards compat alias
     async def health():
         """Health check endpoint."""
-        ob_stats = {}
-        if state.ob_buffer:
-            ob_stats = state.ob_buffer.get_stats()
-
         symbols_status = {}
         for sym in sorted(VALID_SYMBOLS):
             v1_snap = state.get_v1_snapshot(sym)
             v2_snap = state.get_v2_snapshot(sym)
+            ob_buf = state.ob_buffers.get(sym)
+            ob_buf_stats = ob_buf.get_stats() if ob_buf else {}
             symbols_status[sym] = {
                 "v1_available": v1_snap is not None,
                 "v1_ts": v1_snap.get('ts', 0) if v1_snap else 0,
                 "v2_available": v2_snap is not None,
                 "v2_ts": v2_snap.get('ts', 0) if v2_snap else 0,
                 "v2_history_frames": state.v2_histories[sym].frame_count(),
+                "ob_frames": ob_buf_stats.get('frames_in_memory', 0),
             }
 
         return {
@@ -769,11 +778,7 @@ def create_embedded_app(
             "version": API_VERSION,
             "mode": "embedded",
             "uptime_s": round(time.time() - state.start_time, 1),
-            "ob_buffer": {
-                "frames_in_memory": ob_stats.get('frames_in_memory', 0),
-                "last_ts": ob_stats.get('last_ts', 0),
-                "shared": state.ob_buffer is not None
-            },
+            "ob_buffers": {sym: bool(state.ob_buffers.get(sym)) for sym in sorted(VALID_SYMBOLS)},
             "symbols": symbols_status,
         }
 
@@ -1078,19 +1083,21 @@ def create_embedded_app(
     # BTC-only: orderbook data is only available for BTC (other symbols lack depth streams)
     # =========================================================================
 
-    def _require_btc_orderbook(symbol: str) -> None:
-        """Reject non-BTC symbols for orderbook endpoints (BTC-only data)."""
-        sym = symbol.strip().upper().replace("USDT", "")
-        if sym != "BTC":
+    def _get_ob_buffer(symbol: str):
+        """Validate symbol and return the per-symbol orderbook buffer. Raises 400/503."""
+        sym = _validate_symbol(symbol)
+        ob_buf = state.ob_buffers.get(sym)
+        if not ob_buf:
             raise HTTPException(
-                status_code=400,
-                detail=f"Orderbook data is only available for BTC. Got: '{symbol}'"
+                status_code=503,
+                detail=f"Orderbook buffer not available for {sym}"
             )
+        return sym, ob_buf
 
     @app.get("/orderbook_heatmap")
     @app.get("/v2/orderbook_heatmap_30s")  # backwards compat alias
     async def orderbook_heatmap_30s(
-        symbol: str = Query(default="BTC", description="Symbol to query (BTC only)"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
         step: float = Query(default=20.0, description="Price bucket size"),
         price_min: float = Query(default=None, description="Override minimum price"),
@@ -1110,7 +1117,7 @@ def create_embedded_app(
 
         Returns the most recently WRITTEN frame (never synthesized/rewritten).
         """
-        _require_btc_orderbook(symbol)
+        sym, ob_buf = _get_ob_buffer(symbol)
 
         # Validate user-provided grid parameters
         if step <= 0:
@@ -1128,13 +1135,13 @@ def create_embedded_app(
                     detail=f"grid too large: {est_buckets} buckets exceeds limit of {MAX_GRID_BUCKETS}"
                 )
 
-        if not HAS_OB_HEATMAP or not state.ob_buffer:
+        if not HAS_OB_HEATMAP:
             raise HTTPException(
                 status_code=503,
-                detail="Orderbook heatmap not available (no shared buffer)"
+                detail="Orderbook heatmap module not available"
             )
 
-        frame = state.ob_buffer.get_latest()
+        frame = ob_buf.get_latest()
         if not frame:
             raise HTTPException(
                 status_code=404,
@@ -1239,7 +1246,7 @@ def create_embedded_app(
     @app.get("/orderbook_heatmap_history")
     @app.get("/v2/orderbook_heatmap_30s_history")  # backwards compat alias
     async def orderbook_heatmap_30s_history(
-        symbol: str = Query(default="BTC", description="Symbol to query (BTC only)"),
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..60)"),
         step: float = Query(default=20.0, description="Price bucket size"),
@@ -1259,7 +1266,7 @@ def create_embedded_app(
 
         Binary format (format=bin) returns compact blob for low-latency backfill.
         """
-        _require_btc_orderbook(symbol)
+        sym, ob_buf = _get_ob_buffer(symbol)
 
         # Validate user-provided grid parameters
         if step <= 0:
@@ -1274,16 +1281,10 @@ def create_embedded_app(
                     detail=f"grid too large: {est_buckets} buckets exceeds limit of {MAX_GRID_BUCKETS}"
                 )
 
-        if not HAS_OB_HEATMAP or not state.ob_buffer:
-            raise HTTPException(
-                status_code=503,
-                detail="Orderbook heatmap not available (no shared buffer)"
-            )
-
         minutes = max(5, min(720, minutes))
         stride = max(1, min(60, stride))
 
-        frames = state.ob_buffer.get_frames(minutes=minutes, stride=stride)
+        frames = ob_buf.get_frames(minutes=minutes, stride=stride)
 
         if not frames:
             return JSONResponse(content={
@@ -1320,7 +1321,7 @@ def create_embedded_app(
             )
 
         # JSON format — check cache
-        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_history", symbol=symbol, minutes=minutes, stride=stride, step=step, price_min=price_min, price_max=price_max)
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_history", symbol=sym, minutes=minutes, stride=stride, step=step, price_min=price_min, price_max=price_max)
         cached = cache.get(cache_key, ttl=30.0)
         if cached is not None:
             return cached
@@ -1367,7 +1368,9 @@ def create_embedded_app(
 
     @app.get("/orderbook_heatmap_stats")
     @app.get("/v2/orderbook_heatmap_30s_stats")  # backwards compat alias
-    async def orderbook_heatmap_30s_stats():
+    async def orderbook_heatmap_30s_stats(
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)")
+    ):
         """
         Get orderbook heatmap buffer and reconstructor statistics.
 
@@ -1376,18 +1379,14 @@ def create_embedded_app(
         - Reconstructor stats: state, resyncs, gaps, update IDs
         - Timing: last frame age, staleness indicator
         """
-        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_stats")
+        sym, ob_buf = _get_ob_buffer(symbol)
+
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_stats", symbol=sym)
         cached = cache.get(cache_key, ttl=10.0)
         if cached is not None:
             return cached
 
-        if not state.ob_buffer:
-            raise HTTPException(
-                status_code=503,
-                detail="Orderbook heatmap not available (no shared buffer)"
-            )
-
-        stats = state.ob_buffer.get_stats()
+        stats = ob_buf.get_stats()
         now = time.time()
         now_ms = int(now * 1000)
 
@@ -1431,22 +1430,28 @@ def create_embedded_app(
 
     @app.get("/orderbook_heatmap_debug")
     @app.get("/v2/orderbook_heatmap_30s_debug")  # backwards compat alias
-    async def orderbook_heatmap_30s_debug():
+    async def orderbook_heatmap_30s_debug(
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)")
+    ):
         """Debug endpoint for orderbook heatmap system."""
-        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_debug")
+        sym = _validate_symbol(symbol)
+
+        cache_key = cache.normalize_cache_key(endpoint="orderbook_heatmap_debug", symbol=sym)
         cached = cache.get(cache_key, ttl=10.0)
         if cached is not None:
             return cached
 
+        ob_buf = state.ob_buffers.get(sym)
         debug_info = {
+            "symbol": sym,
             "has_ob_heatmap_module": HAS_OB_HEATMAP,
-            "ob_buffer_shared": state.ob_buffer is not None,
+            "ob_buffer_available": ob_buf is not None,
             "mode": "embedded"
         }
 
-        if state.ob_buffer is not None:
+        if ob_buf is not None:
             try:
-                debug_info["ob_buffer_stats"] = state.ob_buffer.get_stats()
+                debug_info["ob_buffer_stats"] = ob_buf.get_stats()
             except Exception as e:
                 debug_info["ob_buffer_stats_error"] = str(e)
 

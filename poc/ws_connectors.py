@@ -154,10 +154,18 @@ class BinanceConnector:
 
         # Define all streams
         streams = [
-            # Depth stream (orderbook)
+            # Depth streams (orderbook) — all tracked symbols
             ("depth_btcusdt",
              f"{self.BASE_WS}/btcusdt@depth@100ms",
              ("binance", "btcusdt", "perpetual", "depth"), None),
+
+            ("depth_ethusdt",
+             f"{self.BASE_WS}/ethusdt@depth@100ms",
+             ("binance", "ethusdt", "perpetual", "depth"), None),
+
+            ("depth_solusdt",
+             f"{self.BASE_WS}/solusdt@depth@100ms",
+             ("binance", "solusdt", "perpetual", "depth"), None),
 
             # Trades streams (all tracked symbols)
             ("trades_btcusdt",

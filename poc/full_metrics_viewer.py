@@ -116,7 +116,7 @@ SYMBOL_CONFIGS = {
         "ob_step": 1.0,
         "ob_range_pct": 0.10,
         "ob_gap_tolerance": 50,
-        "has_orderbook": False,
+        "has_orderbook": True,
     },
     "SOL": {
         "symbol_short": "SOL",
@@ -125,7 +125,7 @@ SYMBOL_CONFIGS = {
         "ob_step": 0.10,
         "ob_range_pct": 0.10,
         "ob_gap_tolerance": 5,
-        "has_orderbook": False,
+        "has_orderbook": True,
     },
 }
 
@@ -752,10 +752,17 @@ class FullMetricsProcessor:
             for sym in SYMBOL_CONFIGS
         }
 
-        # Orderbook heatmap (30s DoM screenshots) — BTC only for now
-        self.ob_heatmap_buffer = OrderbookHeatmapBuffer(OB_HEATMAP_FILE)
-        ob_stats = self.ob_heatmap_buffer.get_stats()
-        print(f"[OB_HEATMAP] Loaded {ob_stats['frames_in_memory']} frames from {OB_HEATMAP_FILE}")
+        # Orderbook heatmap (30s DoM screenshots) — per-symbol buffers
+        # BTC keeps legacy filename for backwards compat; ETH/SOL use per-symbol names
+        self.ob_heatmap_buffers: Dict[str, OrderbookHeatmapBuffer] = {}
+        for sym in SYMBOL_CONFIGS:
+            if sym == "BTC":
+                ob_file = OB_HEATMAP_FILE  # legacy: ob_heatmap_30s.bin
+            else:
+                ob_file = os.path.join(POC_DIR, f"ob_heatmap_30s_{sym}.bin")
+            self.ob_heatmap_buffers[sym] = OrderbookHeatmapBuffer(ob_file)
+            ob_stats = self.ob_heatmap_buffers[sym].get_stats()
+            print(f"[OB_HEATMAP] {sym}: Loaded {ob_stats['frames_in_memory']} frames from {ob_file}")
 
         # Engine Manager — bundles all per-symbol engines for multi-symbol routing.
         # Each symbol MUST have independent engines (CLAUDE.md rule).
@@ -822,18 +829,18 @@ class FullMetricsProcessor:
             zone_persist_file=zone_persist_file,
         )
 
-        # Orderbook engines — BTC only for MVP
+        # Orderbook engines — per-symbol reconstructor + accumulator
         ob_reconstructor = None
         ob_accumulator = None
         if has_ob:
             ob_accumulator = OrderbookAccumulator(
                 step=cfg["ob_step"],
                 range_pct=cfg["ob_range_pct"],
-                on_frame_callback=self._on_ob_frame_emitted,
+                on_frame_callback=lambda frame, _sym=sym_short: self._on_ob_frame_emitted(_sym, frame),
             )
             ob_reconstructor = OrderbookReconstructor(
                 symbol=sym_full,
-                on_book_update=self._on_reconstructor_update,
+                on_book_update=lambda recon, _sym=sym_short: self._on_reconstructor_update(_sym, recon),
                 gap_tolerance=cfg["ob_gap_tolerance"],
             )
             print(
@@ -860,13 +867,16 @@ class FullMetricsProcessor:
         """Shortcut to BTC engine instance (kept for backward-compat in BTC-specific UI code)."""
         return self.engine_manager.get_engine("BTC")
 
-    def _on_ob_frame_emitted(self, frame):
+    def _on_ob_frame_emitted(self, symbol: str, frame):
         """Callback when orderbook accumulator emits a 30s frame."""
-        print(f"[OB_DEBUG] Frame emitted! ts={frame.ts} src={frame.src:.2f} n_prices={frame.n_prices}")
-        self.ob_heatmap_buffer.add_frame(frame)
-        print(f"[OB_DEBUG] Frame added to buffer. Buffer stats: {self.ob_heatmap_buffer.get_stats()}")
+        ob_buf = self.ob_heatmap_buffers.get(symbol)
+        if ob_buf is None:
+            return
+        print(f"[OB_DEBUG] {symbol} frame emitted! ts={frame.ts} src={frame.src:.2f} n_prices={frame.n_prices}")
+        ob_buf.add_frame(frame)
+        print(f"[OB_DEBUG] {symbol} frame added to buffer. Buffer stats: {ob_buf.get_stats()}")
 
-    def _on_reconstructor_update(self, reconstructor: OrderbookReconstructor):
+    def _on_reconstructor_update(self, symbol: str, reconstructor: OrderbookReconstructor):
         """
         Callback when OrderbookReconstructor has applied a diff successfully.
 
@@ -876,11 +886,16 @@ class FullMetricsProcessor:
         if not reconstructor.is_synced:
             return
 
+        engine = self.engine_manager.get_engine(symbol)
+        if engine is None or engine.ob_accumulator is None:
+            return
+
         # Get full reconstructed orderbook
         bids, asks = reconstructor.get_full_book()
 
-        # Use mark price as reference (or mid if not available)
-        mid = self.state.btc_price
+        # Use symbol's mark price as reference (or mid from book)
+        prices = self.symbol_prices.get(symbol, {})
+        mid = prices.get("mark", 0.0)
         if mid <= 0:
             # Fallback to mid from reconstructed book
             if bids and asks:
@@ -892,17 +907,7 @@ class FullMetricsProcessor:
 
         # Feed to accumulator (will emit frame on 30s boundary)
         if mid > 0 and bids and asks:
-            # Debug: track accumulator state (throttled to every 10s)
-            now = time.time()
-            if not hasattr(self, '_last_accum_debug'):
-                self._last_accum_debug = 0.0
-            if now - self._last_accum_debug > 10.0:
-                self._last_accum_debug = now
-                slot = int(now // 30)
-                print(f"[OB_DEBUG] Feeding accumulator: mid={mid:.2f} bids={len(bids)} asks={len(asks)} "
-                      f"current_slot={self._btc().ob_accumulator._current_slot} new_slot={slot}")
-
-            self._btc().ob_accumulator.on_depth_update(
+            engine.ob_accumulator.on_depth_update(
                 bids=bids,
                 asks=asks,
                 src_price=mid,
@@ -1009,7 +1014,7 @@ class FullMetricsProcessor:
                 self.state.exchanges.append(exchange)
 
             if obj_type == "depth":
-                self._process_depth(exchange, data)
+                self._process_depth(exchange, instrument, data)
             elif obj_type == "trades":
                 self._process_trades(exchange, instrument, data)
             elif obj_type == "liquidations":
@@ -1024,17 +1029,25 @@ class FullMetricsProcessor:
             self.state.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._check_minute_rollover()
 
-    def _process_depth(self, exchange: str, data: dict):
-        # For Binance, route through the OrderbookReconstructor for proper
-        # snapshot+diff reconciliation (ensures full 1000-level orderbook)
+    def _process_depth(self, exchange: str, instrument: str, data: dict):
+        # For Binance, route through the per-symbol OrderbookReconstructor for
+        # proper snapshot+diff reconciliation (ensures full 1000-level orderbook)
         if exchange == "binance":
+            sym = INSTRUMENT_TO_SHORT.get(instrument)
+            if sym is None:
+                return  # Unknown instrument — skip
+
+            engine = self.engine_manager.get_engine(sym)
+            if engine is None or engine.ob_reconstructor is None:
+                return  # No OB engine for this symbol
+
             # Feed raw diff to reconstructor
             # The reconstructor callback will feed the accumulator with full book
-            self._btc().ob_reconstructor.on_depth_diff(data)
+            engine.ob_reconstructor.on_depth_diff(data)
 
-            # Update local orderbook from reconstructor for UI display
-            if self._btc().ob_reconstructor.is_synced:
-                bids, asks = self._btc().ob_reconstructor.get_full_book()
+            # Update local orderbook from reconstructor for UI display (BTC only)
+            if sym == "BTC" and engine.ob_reconstructor.is_synced:
+                bids, asks = engine.ob_reconstructor.get_full_book()
                 book = self.orderbooks[exchange]
                 book["bids"].clear()
                 book["asks"].clear()
@@ -2494,7 +2507,7 @@ def main():
             else:
                 console.print(f"[cyan]Starting embedded API server on {args.api_host}:{args.api_port}...[/]")
                 app = create_embedded_app(
-                    ob_buffer=processor.ob_heatmap_buffer,
+                    ob_buffer=processor.ob_heatmap_buffers,
                     snapshot_dir=POC_DIR,
                     engine_manager=processor.engine_manager,
                     oi_poller=processor.oi_poller
