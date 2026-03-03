@@ -56,6 +56,31 @@ proxy_cache_valid 200 5s;
 
 **Data retention:** InfluxDB stores all aggregated trade data. No historical backfill — data only exists from when the server started collecting.
 
+**REST API endpoint:**
+
+| Path | Method | Parameters | Response |
+|------|--------|------------|----------|
+| `/` | GET | None | `{"message":"hi"}` |
+| `/products` | GET | None | Array of active market pairs |
+| `/historical/{from}/{to}/{timeframe?}/{markets?}` | GET | `from` (ms), `to` (ms), `timeframe` (ms, default 60000), `markets` (plus-separated) | OHLCV bars per exchange per timeframe |
+
+**Historical endpoint usage:**
+```
+GET /historical/1772498340000/1772501940000/60000/BINANCE_FUTURES:btcusdt+BYBIT:BTCUSDT+OKX:BTC-USDT-SWAP+HYPERLIQUID:BTC
+```
+
+Response columns: `time` (unix seconds), `open`, `high`, `low`, `close`, `vbuy` (buy volume USD), `vsell` (sell volume USD), `cbuy` (buy count), `csell` (sell count), `lbuy` (liquidation buy volume), `lsell` (liquidation sell volume), `market` (exchange source).
+
+Returns one row per exchange per timeframe bucket. Client aggregates by summing volumes/counts across exchanges, taking max high / min low, and using any exchange's close (prices near-identical due to arbitrage).
+
+**Market identifiers for `/historical`:**
+
+| Symbol | Markets string |
+|--------|---------------|
+| BTC | `BINANCE_FUTURES:btcusdt+BYBIT:BTCUSDT+OKX:BTC-USDT-SWAP+HYPERLIQUID:BTC` |
+| ETH | `BINANCE_FUTURES:ethusdt+BYBIT:ETHUSDT+OKX:ETH-USDT-SWAP+HYPERLIQUID:ETH` |
+| SOL | `BINANCE_FUTURES:solusdt+BYBIT:SOLUSDT+OKX:SOL-USDT-SWAP+HYPERLIQUID:SOL` |
+
 **Health check:**
 ```bash
 sudo systemctl status aggr-server
@@ -86,9 +111,9 @@ sudo journalctl -u aggr-server --no-pager -n 20
 
 | Data Type | Single Exchange (e.g. BINANCE:BTCUSDT) | Aggregated (AGGREGATED:BTCUSDT) |
 |-----------|----------------------------------------|--------------------------------|
-| **Klines / OHLC** | proxy.tradenet.org → Binance REST/WS | proxy.tradenet.org → Binance (price reference — prices identical across exchanges due to arbitrage) |
+| **Klines / OHLC** | proxy.tradenet.org → Binance REST/WS | proxy.tradenet.org → aggr-server `/historical` endpoint (OHLCV from all 4 exchanges via InfluxDB). Falls back to Binance for dates before aggr-server started collecting. |
 | **Trade stream** (footprint, volume, delta) | proxy.tradenet.org → Binance aggTrade WS | wss://proxy.tradenet.org/aggr/ → aggr-server (trades from ALL exchanges) |
-| **OI data** | proxy.tradenet.org → Binance OI REST | api.tradenet.org:8899 → Python backend (OI summed from 4 exchanges) |
+| **OI data** | proxy.tradenet.org → Binance OI REST | api.tradenet.org:8899 → Python backend (OI summed from 3 exchanges: Binance, Bybit, OKX) |
 | **Liq heatmap / zones** | api.tradenet.org:8899 → Python backend | api.tradenet.org:8899 → Python backend (forceOrders from all exchanges) |
 | **OB heatmap** | api.tradenet.org:8899 → Python backend (Binance orderbook) | api.tradenet.org:8899 → Python backend (aggregated OB — future feature) |
 

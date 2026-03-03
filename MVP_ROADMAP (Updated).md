@@ -165,10 +165,12 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | B1 | Colored cell backgrounds on footprint | Single biggest visual upgrade — professional footprint chart | Frontend |
 | B4 | Fix CVD + OI CVD accumulation bugs | Data correctness — CVD drift, OI CVD midnight reset | Frontend |
 | B5 | Fix bar stats timeframe mismatch | Data correctness — switching timeframes shows stale data | Frontend |
-| B6 | Connect liq data to bar stats Short Liq / Long Liq rows | Currently zeros — backend has data, frontend needs to consume | Frontend + Backend |
+| B6 | Connect liq data to bar stats Short Liq / Long Liq rows | Currently zeros — backend has data, frontend needs to consume. Aggr-server `/historical` endpoint also provides `lbuy`/`lsell` per candle per exchange — can feed this directly. | Frontend + Backend |
 | B7 | Fix multi-pane heatmap bug | Only one pane displays heatmap at a time | Frontend |
 | B8 | Normalization visibility floor | Strong zones (notional > threshold) must always render at minimum 10-15% intensity regardless of p99 scaling. Prevents extreme events from crushing weaker zones off screen. Discovered during Feb 28 event. | Backend display wrapper |
 | B9 | Swept zone visual persistence | Swept zones dim to 30% or shift color instead of vanishing instantly. Shows the zone was correct. | Frontend rendering |
+| B10 | Aggregated kline history from aggr-server | Aggregated tickers currently fall back to Binance-only for historical klines. Aggr-server on Droplet 1 has `/historical/{from}/{to}/{timeframe}/{markets}` endpoint serving per-exchange OHLCV bars from InfluxDB. Frontend needs: (1) nginx proxy route for `/aggr/historical/*`, (2) fetch path swap for `AGGREGATED:*` tickers to hit aggr-server instead of Binance, (3) client-side merge of per-exchange rows into single aggregated candle (sum volumes, max high, min low). Data exists since aggr-server started collecting — no backfill. | Frontend + Infra |
+| B11 | Volume profile indicator | Compute from existing footprint `KlineTrades` data across visible candles. Renders as vertical histogram on price axis. Frontend-only — no backend dependency. For aggregated tickers, uses aggregated trade data from aggr-server WebSocket. | Frontend |
 
 **Nice-to-have (cut if time tight):**
 
@@ -226,10 +228,10 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | Audit Sprint 3.5 Tier 1 | 4 | 0 | 4 (in progress) |
 | Audit Sprint 3.5 Tier 2 | 6 | 0 | 6 |
 | Audit Sprint 3.5 Tier 3 | 6 | 0 | 6 |
-| Phase B: Visual Polish | 9 | 0 | 9 (7 blockers + 2 nice-to-have) |
+| Phase B: Visual Polish | 11 | 0 | 11 (9 blockers + 2 nice-to-have) |
 | Phase C: Deployment | 8 | 0 | 8 |
 | Phase D: Brand | 5 | 0 | 5 |
-| **TOTAL** | **106** | **56** | **50** |
+| **TOTAL** | **108** | **56** | **52** |
 
 **Critical path to launch (blockers only):**
 
@@ -237,12 +239,12 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 |-------|---------------|
 | Sprint 3.5 Tier 1 | 4 (in progress) |
 | Sprint 3.5 Tier 2 | 6 |
-| Phase B blockers | 7 |
+| Phase B blockers | 9 |
 | Phase C | 8 |
 | Phase D | 5 |
-| **Total blockers to launch** | **30** |
+| **Total blockers to launch** | **32** |
 
-**Progress: 56 tasks complete. ~30 blocker tasks to launch.**
+**Progress: 56 tasks complete. ~32 blocker tasks to launch.**
 
 ---
 
