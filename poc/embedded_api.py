@@ -11,7 +11,6 @@ Per-symbol snapshot files are read from disk every 5 seconds:
   liq_api_snapshot_v2_{SYM}.json (V2, per symbol)
 
 Per-symbol binary history files store frame history:
-  liq_heatmap_v1_{SYM}.bin  (V1 history, per symbol)
   liq_heatmap_v2_{SYM}.bin  (V2 history, per symbol)
 
 Usage:
@@ -564,7 +563,6 @@ class EmbeddedAPIState:
         # Legacy params — accepted but ignored (kept for caller compat during transition)
         snapshot_file: Optional[str] = None,
         snapshot_v2_file: Optional[str] = None,
-        liq_heatmap_v1_file: Optional[str] = None,
         liq_heatmap_v2_file: Optional[str] = None,
     ):
         self.ob_buffer = ob_buffer
@@ -587,14 +585,21 @@ class EmbeddedAPIState:
         self._v1_caches: Dict[str, Optional[Dict]] = {sym: None for sym in VALID_SYMBOLS}
         self._v2_caches: Dict[str, Optional[Dict]] = {sym: None for sym in VALID_SYMBOLS}
 
-        # Per-symbol history buffers with per-symbol binary files
-        self.v1_histories: Dict[str, LiquidationHeatmapBuffer] = {}
+        # Per-symbol V2 history buffers with per-symbol binary files
         self.v2_histories: Dict[str, LiquidationHeatmapBuffer] = {}
         for sym in VALID_SYMBOLS:
-            v1_bin = os.path.join(self._snapshot_dir, f"liq_heatmap_v1_{sym}.bin")
             v2_bin = os.path.join(self._snapshot_dir, f"liq_heatmap_v2_{sym}.bin")
-            self.v1_histories[sym] = LiquidationHeatmapBuffer(v1_bin)
             self.v2_histories[sym] = LiquidationHeatmapBuffer(v2_bin)
+
+        # One-time cleanup: remove stale v1 binary history files (no longer written)
+        for sym in VALID_SYMBOLS:
+            v1_stale = os.path.join(self._snapshot_dir, f"liq_heatmap_v1_{sym}.bin")
+            if os.path.exists(v1_stale):
+                try:
+                    os.unlink(v1_stale)
+                    logger.info("Removed stale V1 history file: %s", v1_stale)
+                except OSError as e:
+                    logger.warning("Failed to remove stale V1 history file %s: %s", v1_stale, e)
 
         # Start background refresh thread
         self._running = True
@@ -625,7 +630,6 @@ class EmbeddedAPIState:
                 data = json.load(f)
             if version == "v1":
                 self._v1_caches[symbol] = data
-                self.v1_histories[symbol].add_frame(data)
             else:
                 self._v2_caches[symbol] = data
                 self.v2_histories[symbol].add_frame(data)
@@ -647,7 +651,7 @@ class EmbeddedAPIState:
         return self._v2_caches.get(symbol)
 
     def get_v1_history(self, symbol: str = "BTC") -> Optional[LiquidationHeatmapBuffer]:
-        return self.v1_histories.get(symbol)
+        return None  # V1 history removed — endpoint returns 503
 
     def get_v2_history(self, symbol: str = "BTC") -> Optional[LiquidationHeatmapBuffer]:
         return self.v2_histories.get(symbol)
@@ -661,7 +665,6 @@ def create_embedded_app(
     # Legacy params — accepted for caller compat during transition, passed through
     snapshot_file: Optional[str] = None,
     snapshot_v2_file: Optional[str] = None,
-    liq_heatmap_v1_file: Optional[str] = None,
     liq_heatmap_v2_file: Optional[str] = None,
 ) -> 'FastAPI':
     """
@@ -682,7 +685,6 @@ def create_embedded_app(
         oi_poller=oi_poller,
         snapshot_file=snapshot_file,
         snapshot_v2_file=snapshot_v2_file,
-        liq_heatmap_v1_file=liq_heatmap_v1_file,
         liq_heatmap_v2_file=liq_heatmap_v2_file,
     )
 
@@ -735,9 +737,8 @@ def create_embedded_app(
         print(f"[EMBEDDED_API] Started with shared buffer: {ob_frames} OB frames")
         print(f"[EMBEDDED_API] Snapshot dir: {state._snapshot_dir}")
         for sym in sorted(VALID_SYMBOLS):
-            v1_frames = state.v1_histories[sym].frame_count()
             v2_frames = state.v2_histories[sym].frame_count()
-            print(f"[EMBEDDED_API] {sym}: V1 history={v1_frames} frames, V2 history={v2_frames} frames")
+            print(f"[EMBEDDED_API] {sym}: V2 history={v2_frames} frames")
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -760,7 +761,6 @@ def create_embedded_app(
                 "v1_ts": v1_snap.get('ts', 0) if v1_snap else 0,
                 "v2_available": v2_snap is not None,
                 "v2_ts": v2_snap.get('ts', 0) if v2_snap else 0,
-                "v1_history_frames": state.v1_histories[sym].frame_count(),
                 "v2_history_frames": state.v2_histories[sym].frame_count(),
             }
 
