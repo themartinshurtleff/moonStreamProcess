@@ -125,6 +125,9 @@ LIQ_MAX_BUCKETS = 1000  # Max price buckets per frame
 LIQ_HEADER_FORMAT = '<dddddI'
 LIQ_HEADER_SIZE = struct.calcsize(LIQ_HEADER_FORMAT)  # 48 bytes
 
+# File size limit for persistence rotation (50 MB)
+MAX_PERSISTENCE_FILE_SIZE = 50 * 1024 * 1024
+
 
 MAX_CACHE_ENTRIES = 500  # LRU cap to prevent unbounded cache growth
 
@@ -340,6 +343,78 @@ class LiquidationHeatmapBuffer:
             prices=prices
         )
 
+    @staticmethod
+    def _frame_to_bytes(frame: HistoryFrame, step: float) -> bytes:
+        """Serialize a HistoryFrame to a fixed-size binary record.
+
+        Layout (LIQ_FRAME_RECORD_SIZE = 4096 bytes):
+          [0..48)   header: ts(d), src(d), price_min(d), price_max(d), step(d), n_buckets(I)
+          [48..1048) long intensity:  n_buckets bytes + zero-padding to LIQ_MAX_BUCKETS
+          [1048..2048) short intensity: n_buckets bytes + zero-padding to LIQ_MAX_BUCKETS
+          [2048..4096) reserved padding (zeros)
+        """
+        n_buckets = min(len(frame.long_intensity), LIQ_MAX_BUCKETS)
+        header = struct.pack(
+            LIQ_HEADER_FORMAT,
+            frame.ts, frame.src, frame.price_min, frame.price_max,
+            step, n_buckets,
+        )
+
+        # Pad intensity arrays to exactly LIQ_MAX_BUCKETS each
+        long_padded = frame.long_intensity[:n_buckets].ljust(LIQ_MAX_BUCKETS, b'\x00')
+        short_padded = frame.short_intensity[:n_buckets].ljust(LIQ_MAX_BUCKETS, b'\x00')
+
+        record = header + long_padded + short_padded
+        # Pad to exactly LIQ_FRAME_RECORD_SIZE
+        record = record.ljust(LIQ_FRAME_RECORD_SIZE, b'\x00')
+        return record
+
+    def _write_frame_to_disk(self, frame: HistoryFrame, step: float) -> None:
+        """Append a single frame to the persistence file.
+
+        Opens file in append-binary mode, writes a single contiguous record,
+        flushes, and closes. Thread safety: caller must hold self._lock.
+        Errors are logged but never propagated — disk failure must not break
+        the live history endpoint.
+        """
+        if not self.persistence_path:
+            return
+
+        try:
+            # Rotate if file exceeds size limit
+            self._maybe_rotate_file()
+
+            record = self._frame_to_bytes(frame, step)
+            with open(self.persistence_path, 'ab') as f:
+                f.write(record)
+                f.flush()
+        except Exception as e:
+            logger.error("Failed to write frame to %s: %s",
+                         self.persistence_path, e, exc_info=True)
+
+    def _maybe_rotate_file(self) -> None:
+        """Rotate persistence file if it exceeds MAX_PERSISTENCE_FILE_SIZE.
+
+        Single-slot rotation: current → {path}.old (overwrites any existing .old).
+        """
+        try:
+            if not os.path.exists(self.persistence_path):
+                return
+            file_size = os.path.getsize(self.persistence_path)
+            if file_size <= MAX_PERSISTENCE_FILE_SIZE:
+                return
+
+            old_path = self.persistence_path + '.old'
+            # Remove existing .old first (single-slot rotation)
+            if os.path.exists(old_path):
+                os.unlink(old_path)
+            os.rename(self.persistence_path, old_path)
+            logger.info("Rotated persistence file %s (%.1f MB) → %s",
+                        self.persistence_path, file_size / (1024 * 1024), old_path)
+        except Exception as e:
+            logger.warning("Failed to rotate persistence file %s: %s",
+                           self.persistence_path, e)
+
     def add_frame(self, snapshot: Dict) -> bool:
         """Add a frame from a snapshot dict."""
         ts = snapshot.get('ts', 0)
@@ -371,6 +446,13 @@ class LiquidationHeatmapBuffer:
 
             self._frames.append(frame)
             self._last_ts = ts
+
+            # Persist to disk — step comes from the snapshot dict
+            step = snapshot.get('step', 0)
+            if step <= 0 and len(frame.prices) >= 2:
+                step = frame.prices[1] - frame.prices[0]
+            self._write_frame_to_disk(frame, step)
+
             return True
 
     def get_frames(self, minutes: int = 60, stride: int = 1) -> List[HistoryFrame]:

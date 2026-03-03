@@ -568,7 +568,7 @@ Embedded API Server (reader — daemon thread in viewer)
   │
   ├─ Shares ob_buffer by direct Python reference (no disk I/O for OB)
   ├─ Reads per-symbol liq JSON snapshots every 5s (liq_api_snapshot_{SYM}.json, liq_api_snapshot_v2_{SYM}.json)
-  ├─ Per-symbol history buffers write to liq_heatmap_v1_{SYM}.bin, liq_heatmap_v2_{SYM}.bin
+  ├─ Per-symbol history buffers append 4KB frames to liq_heatmap_v1_{SYM}.bin, liq_heatmap_v2_{SYM}.bin (rotated at 50MB)
   ├─ Receives EngineManager for V3 zone access (in-memory, no disk)
   └─ ResponseCache serves concurrent users from TTL-based cache
 
@@ -780,6 +780,11 @@ Frontend (consumer)
 ### RESOLVED: Missing _enforce_disabled_tiers in on_minute_snapshot (Sprint 3.5 M-Calibrator)
 - **Root cause:** `on_minute_snapshot()` at line 895 assigned `self.current_weights = weights.copy()` from the caller's weight list. If the caller passed weights with non-zero disabled tier values (e.g. from a stale weight file loaded before enforcement), the calibrator would operate with non-zero disabled tier weights until the next `_run_calibration()` cycle (up to 30 minutes).
 - **Fix:** Added `self._enforce_disabled_tiers()` immediately after `self.current_weights = weights.copy()`. This is now the 4th call site (joining `_load_weights`, `_save_weights`, and inline in `_run_calibration`).
+
+### RESOLVED: Liq heatmap history lost on restart — binary persistence never written
+- **Root cause:** `LiquidationHeatmapBuffer.add_frame()` in `embedded_api.py` only appended frames to the in-memory `self._frames` deque — it never wrote to the binary persistence file on disk. History accumulated in memory and served fine via `/liq_heatmap_v2_history`, but on restart all history was lost because the binary file was never created/written. The class had `_load_from_disk()` and accepted `persistence_path` in `__init__`, but the write path was never implemented.
+- **Impact:** All 6 per-symbol history buffers (v1 and v2 for BTC, ETH, SOL) lost their history on every process restart. Files like `liq_heatmap_v1_BTC.bin` and `liq_heatmap_v2_BTC.bin` were never created.
+- **Fix:** (a) Added `_frame_to_bytes(frame, step)` static method that serializes a `HistoryFrame` into a fixed 4096-byte binary record matching the exact layout that `_load_from_disk()` → `_frame_from_bytes()` reads: 48-byte header (`<dddddI`: ts, src, price_min, price_max, step, n_buckets) + LIQ_MAX_BUCKETS (1000) bytes long intensity + LIQ_MAX_BUCKETS (1000) bytes short intensity + zero-padding to 4096 total. (b) Added `_write_frame_to_disk(frame, step)` method that opens the file in append-binary mode, writes the serialized record, and flushes. Errors are logged but never propagated — disk failure does not break the live history endpoint. (c) `add_frame()` now calls `_write_frame_to_disk()` after successfully appending to the in-memory deque, under the existing `self._lock`. The `step` value comes from the snapshot dict (`snapshot.get('step')`) with fallback to computing from the prices list. (d) Added `_maybe_rotate_file()` with single-slot rotation: when file exceeds `MAX_PERSISTENCE_FILE_SIZE` (50 MB), renames current to `{path}.old` (removing any existing `.old` first) and starts fresh. (e) `_load_from_disk()` already handles partial trailing records gracefully (`if len(record) < LIQ_FRAME_RECORD_SIZE: break` at line 276).
 
 ---
 
