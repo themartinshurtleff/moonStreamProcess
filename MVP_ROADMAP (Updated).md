@@ -8,7 +8,7 @@
 
 ---
 
-## COMPLETED — 56 tasks + 6 bug fixes
+## COMPLETED — 66 tasks + 6 bug fixes
 
 ### Phase 1: Backend Foundation ✅ (9 tasks)
 Core engine architecture, EngineManager, per-symbol calibrator + heatmap + zone manager pipeline, embedded API server, snapshot pipeline, atomic writes.
@@ -63,7 +63,27 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | M2 | OI poller skip-on-total-failure (no stale 0.0) | ✅ |
 | M8 | API bind address configurable (`API_HOST` env var) | ✅ |
 
-**Note:** Sprint 2's H2-full backoff has a behavioral weakness — resets on TCP connect instead of proven data flow. Tracked as Sprint 3.5 H-Backoff.
+**Note:** Sprint 2's H2-full backoff has a behavioral weakness — resets on TCP connect instead of proven data flow. ~~Tracked as Sprint 3.5 H-Backoff.~~ FIXED in Tier 2.
+
+### Codebase Audit — Sprint 3.5 Tier 1: Pre-Deployment Hardening ✅ (4 fixes)
+
+| # | Fix | Status |
+|---|-----|--------|
+| C1 | Projection lock completion (copy-on-read for all dict access) | ✅ |
+| C2 | Grid allocation DoS caps (MAX_GRID_BUCKETS=10000, disk-side validation) | ✅ |
+| H-WS | WS per-message exception boundary (callback wrapped, no reconnect on parse error) | ✅ |
+| H-Cache | Cache key normalization + LRU eviction (MAX_CACHE_ENTRIES=500, symbol/side validation) | ✅ |
+
+### Codebase Audit — Sprint 3.5 Tier 2: Thread Safety & Data Quality ✅ (6 fixes)
+
+| # | Fix | Status |
+|---|-----|--------|
+| H-Shutdown | Idempotent shutdown via threading.Event, signal handler sets flags only, all joins have timeouts | ✅ |
+| H-Display | Display dict snapshot under _display_lock, get_display_state() returns frozen copy | ✅ |
+| H-Zone | Zone persistence deep copy tier_contributions, fsync, PID-unique temp file, cleanup on failure | ✅ |
+| H-Backoff | WS backoff resets on first valid message, not on TCP connect | ✅ |
+| M-Side | Unknown liquidation side validation and drop with rate-limited warning | ✅ |
+| M-Calibrator | _enforce_disabled_tiers() after on_minute_snapshot weight assignment (4th call site) | ✅ |
 
 ---
 
@@ -76,7 +96,7 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 - **Heatmap:** tape + inference producing data, independent normalization working. **2-day soak confirms production-quality visual output** — distinct intensity bands, clear zone structure, on par with Coinglass. History accumulating properly with decay working as designed.
 - **A3a-v2:** VALIDATED during live geopolitical event (US/Israel strike Iran, Feb 28 2026). 2,623 force orders captured. Cluster boost firing at 100% cluster match rate with 47-55 exact bucket overlaps.
 - **Zone Manager:** zones creating, reinforcing, sweeping, expiring normally
-- **Audit status:** 17/29 first-pass findings fixed. 16 second-pass findings identified. Sprint 3.5 Tier 1 prompt sent to Claude Code (in progress).
+- **Audit status:** Sprint 3.5 Tier 1 (4 fixes) and Tier 2 (6 fixes) committed and verified. Deployment-ready for trusted beta behind nginx. Tier 3 (6 fixes) and Sprint 3 (10 fixes) remain for public exposure hardening.
 - **Display/logic boundary:** verified clean by 5 independent auditors (1 Claude Code + 4 ChatGPT Codex)
 - **Known limitation:** Notional USD values undercount real exposure by ~5-10x (only captures runtime OI deltas, not pre-existing inventory). Phase E calibration planned.
 
@@ -88,16 +108,16 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 
 ## Audit: Sprint 3.5 — Pre-Deployment Hardening (from second-pass audit)
 
-### Tier 1 — Must fix before deployment (4 fixes) ⏳ IN PROGRESS
+### Tier 1 — Must fix before deployment (4 fixes) ✅ DONE
 
 | # | ID | Finding | Fix | Status |
 |---|-----|---------|-----|--------|
-| 1 | C1 | Projection lock incomplete (Sprint 2 regression). Live dict keys read outside lock. `_estimate_entry_from_projection()` bypasses lock entirely. No nested locks. | Use `proj_long.keys()` from copy. Add lock to `_estimate_entry_from_projection`. No nested lock acquisition. | ⏳ Prompt sent |
-| 2 | C2 | Unbounded grid allocation DoS. Two independent caps needed. | Request-side: `MAX_GRID_BUCKETS=10000`, reject if exceeded. Validate `price_max > price_min`. Disk-side: cap `n_buckets` from header, validate remaining bytes vs `struct.calcsize()`. | ⏳ Prompt sent |
-| 3 | H-WS | Malformed WS payload tears down stream. Only catches JSONDecodeError. | Wrap callback in `except Exception` per-message, log and continue. Do NOT touch backoff counter on per-message errors. | ⏳ Prompt sent |
-| 4 | H-Cache | Response cache unbounded cardinality. ~300MB under sustained attack. | `MAX_CACHE_ENTRIES=500` LRU. Key normalization: symbol `strip().upper()[:10]`, floats `round(x, 2)`, side validation at endpoint. Hash keys >200 chars via md5. Reject empty/invalid symbols with 400 at endpoint before cache. | ⏳ Prompt sent |
+| 1 | C1 | Projection lock incomplete (Sprint 2 regression). Live dict keys read outside lock. `_estimate_entry_from_projection()` bypasses lock entirely. No nested locks. | Use `proj_long.keys()` from copy. Add lock to `_estimate_entry_from_projection`. No nested lock acquisition. | ✅ |
+| 2 | C2 | Unbounded grid allocation DoS. Two independent caps needed. | Request-side: `MAX_GRID_BUCKETS=10000`, reject if exceeded. Validate `price_max > price_min`. Disk-side: cap `n_buckets` from header, validate remaining bytes vs `struct.calcsize()`. | ✅ |
+| 3 | H-WS | Malformed WS payload tears down stream. Only catches JSONDecodeError. | Wrap callback in `except Exception` per-message, log and continue. Do NOT touch backoff counter on per-message errors. | ✅ |
+| 4 | H-Cache | Response cache unbounded cardinality. ~300MB under sustained attack. | `MAX_CACHE_ENTRIES=500` LRU. Key normalization: symbol `strip().upper()[:10]`, floats `round(x, 2)`, side validation at endpoint. Hash keys >200 chars via md5. Reject empty/invalid symbols with 400 at endpoint before cache. | ✅ |
 
-### Tier 2 — Should fix before deployment (6 fixes) ⬜ NEXT
+### Tier 2 — Should fix before deployment (6 fixes) ✅ DONE
 
 | # | ID | Finding | Fix |
 |---|-----|---------|-----|
@@ -165,12 +185,10 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | B1 | Colored cell backgrounds on footprint | Single biggest visual upgrade — professional footprint chart | Frontend |
 | B4 | Fix CVD + OI CVD accumulation bugs | Data correctness — CVD drift, OI CVD midnight reset | Frontend |
 | B5 | Fix bar stats timeframe mismatch | Data correctness — switching timeframes shows stale data | Frontend |
-| B6 | Connect liq data to bar stats Short Liq / Long Liq rows | Currently zeros — backend has data, frontend needs to consume. Aggr-server `/historical` endpoint also provides `lbuy`/`lsell` per candle per exchange — can feed this directly. | Frontend + Backend |
+| B6 | Connect liq data to bar stats Short Liq / Long Liq rows | Currently zeros — backend has data, frontend needs to consume | Frontend + Backend |
 | B7 | Fix multi-pane heatmap bug | Only one pane displays heatmap at a time | Frontend |
 | B8 | Normalization visibility floor | Strong zones (notional > threshold) must always render at minimum 10-15% intensity regardless of p99 scaling. Prevents extreme events from crushing weaker zones off screen. Discovered during Feb 28 event. | Backend display wrapper |
 | B9 | Swept zone visual persistence | Swept zones dim to 30% or shift color instead of vanishing instantly. Shows the zone was correct. | Frontend rendering |
-| B10 | Aggregated kline history from aggr-server | Aggregated tickers currently fall back to Binance-only for historical klines. Aggr-server on Droplet 1 has `/historical/{from}/{to}/{timeframe}/{markets}` endpoint serving per-exchange OHLCV bars from InfluxDB. Frontend needs: (1) nginx proxy route for `/aggr/historical/*`, (2) fetch path swap for `AGGREGATED:*` tickers to hit aggr-server instead of Binance, (3) client-side merge of per-exchange rows into single aggregated candle (sum volumes, max high, min low). Data exists since aggr-server started collecting — no backfill. | Frontend + Infra |
-| B11 | Volume profile indicator | Compute from existing footprint `KlineTrades` data across visible candles. Renders as vertical histogram on price axis. Frontend-only — no backend dependency. For aggregated tickers, uses aggregated trade data from aggr-server WebSocket. | Frontend |
 
 **Nice-to-have (cut if time tight):**
 
@@ -225,26 +243,26 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | Audit Sprint 1 | 8 | 8 | 0 |
 | Audit Sprint 2 | 9 | 9 | 0 |
 | Audit Sprint 3 | 10 | 0 | 10 |
-| Audit Sprint 3.5 Tier 1 | 4 | 0 | 4 (in progress) |
-| Audit Sprint 3.5 Tier 2 | 6 | 0 | 6 |
+| Audit Sprint 3.5 Tier 1 | 4 | 4 | 0 |
+| Audit Sprint 3.5 Tier 2 | 6 | 6 | 0 |
 | Audit Sprint 3.5 Tier 3 | 6 | 0 | 6 |
 | Phase B: Visual Polish | 11 | 0 | 11 (9 blockers + 2 nice-to-have) |
 | Phase C: Deployment | 8 | 0 | 8 |
 | Phase D: Brand | 5 | 0 | 5 |
-| **TOTAL** | **108** | **56** | **52** |
+| **TOTAL** | **108** | **66** | **42** |
 
 **Critical path to launch (blockers only):**
 
 | Phase | Blocker Tasks |
 |-------|---------------|
-| Sprint 3.5 Tier 1 | 4 (in progress) |
-| Sprint 3.5 Tier 2 | 6 |
+| Sprint 3.5 Tier 1 | ~~4~~ ✅ |
+| Sprint 3.5 Tier 2 | ~~6~~ ✅ |
 | Phase B blockers | 9 |
 | Phase C | 8 |
 | Phase D | 5 |
-| **Total blockers to launch** | **32** |
+| **Total blockers to launch** | **22** |
 
-**Progress: 56 tasks complete. ~32 blocker tasks to launch.**
+**Progress: 66 tasks complete. ~22 blocker tasks to launch. Deployment-ready for trusted beta behind nginx.**
 
 ---
 
@@ -253,12 +271,12 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | Item | Status | Blocks |
 |------|--------|--------|
 | API bind configurable | ✅ PASS | — |
-| Query parameter hardening | ❌ FAIL | Sprint 3.5 C2, H-Cache |
-| WS malformed payload resilience | ❌ FAIL | Sprint 3.5 H-WS |
-| Thread safety (all shared state) | ❌ FAIL | Sprint 3.5 C1, H-Display, H-Zone |
+| Query parameter hardening | ✅ PASS | Sprint 3.5 C2, H-Cache |
+| WS malformed payload resilience | ✅ PASS | Sprint 3.5 H-WS |
+| Thread safety (all shared state) | ✅ PASS | Sprint 3.5 C1, H-Display, H-Zone |
 | Graceful degradation (exchange failure) | ✅ PASS | — |
-| Shutdown behavior | ⚠️ PARTIAL | Sprint 3.5 H-Shutdown |
-| 24h memory stability | ⚠️ PARTIAL | H-Cache under attack |
+| Shutdown behavior | ✅ PASS | Sprint 3.5 H-Shutdown |
+| 24h memory stability | ✅ PASS | H-Cache LRU bounded |
 | Log rotation during runtime | ❌ FAIL | Sprint 3.5 M-Logs |
 | Timezone handling | ✅ PASS | — |
 | Filesystem cross-platform | ✅ PASS | — |
@@ -313,7 +331,7 @@ Verified clean by 5 independent auditors (1 Claude Code + 4 ChatGPT Codex).
 |------|-------|
 | Feb 27, 2026 | Sprint 1 (8 fixes) + Sprint 2 (9 fixes) shipped. A3a-v2 deployed, first cluster detected. |
 | Feb 28, 2026 | **A3a-v2 VALIDATED.** US/Israel strike Iran (Operation Shield of Judah). Engine captured 2,623 force orders. Heatmap showed exact liq structure — long cluster $59.8K–$63.5K, short cluster $63.9K–$69.4K. Side-by-side comparison with competitor showed massive quality gap. Second-pass audit (5 agents) completed, Sprint 3.5 plan created, Tier 1 prompt sent. |
-| Mar 2, 2026 | **2-day soak confirmed.** Liq heatmap running continuously since Feb 28. Visual output on par with Coinglass — distinct intensity bands, proper decay, readable zone structure. Notional USD undercounting (~5-10x) identified and tracked for Phase E calibration. |
+| Mar 2, 2026 | **2-day soak confirmed. Sprint 3.5 Tier 1+2 VERIFIED.** Liq heatmap running continuously since Feb 28. Visual output on par with Coinglass. 10 pre-deployment fixes verified: clean Ctrl+C shutdown, thread-safe display, cache hardening, grid DoS caps, WS resilience, backoff on data flow, side validation, disabled tier enforcement. Deployment-ready for trusted beta behind nginx. Discovered aggr-server `/historical` REST API with per-exchange OHLCV bars from InfluxDB — aggregated kline history available for BTC/ETH/SOL. |
 
 ---
 
