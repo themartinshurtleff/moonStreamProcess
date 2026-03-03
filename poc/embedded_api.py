@@ -156,7 +156,8 @@ class ResponseCache:
     """
 
     def __init__(self, max_entries: int = MAX_CACHE_ENTRIES):
-        self._cache: Dict[str, Tuple[Any, float]] = {}
+        # Cache entry tuple: (response, created_ts, access_ts)
+        self._cache: Dict[str, Tuple[Any, float, float]] = {}
         self._lock = threading.Lock()
         self._sets_count: int = 0
         self._max_entries = max_entries
@@ -190,16 +191,33 @@ class ResponseCache:
         """Return cached JSONResponse if within TTL, else None."""
         with self._lock:
             entry = self._cache.get(key)
-            if entry and (time.time() - entry[1]) < ttl:
-                # Update access timestamp for LRU tracking
-                self._cache[key] = (entry[0], time.time())
-                return entry[0]
+            if not entry:
+                return None
+
+            now = time.time()
+            # Backward compatibility for legacy 2-tuple entries: (response, ts)
+            if len(entry) == 2:
+                response, ts = entry
+                created_ts = ts
+                access_ts = ts
+            else:
+                response, created_ts, access_ts = entry
+
+            # TTL is based on age since set/creation, not last access
+            if (now - created_ts) >= ttl:
+                del self._cache[key]
+                return None
+
+            # Update access timestamp only for LRU tracking
+            self._cache[key] = (response, created_ts, now)
+            return response
         return None
 
     def set(self, key: str, response: JSONResponse) -> None:
         """Store a JSONResponse in the cache."""
         with self._lock:
-            self._cache[key] = (response, time.time())
+            now = time.time()
+            self._cache[key] = (response, now, now)
             self._sets_count += 1
             if self._sets_count % 100 == 0:
                 self._evict_expired()
@@ -211,7 +229,12 @@ class ResponseCache:
         """Remove entries older than max_ttl to prevent unbounded growth. Caller must hold _lock."""
         now = time.time()
         max_ttl = 60.0  # nothing should be cached longer than this
-        expired = [k for k, (_, ts) in self._cache.items() if (now - ts) > max_ttl]
+        expired = []
+        for key, entry in self._cache.items():
+            # Legacy format support: (response, ts)
+            created_ts = entry[1]
+            if (now - created_ts) > max_ttl:
+                expired.append(key)
         for k in expired:
             del self._cache[k]
 
@@ -221,9 +244,21 @@ class ResponseCache:
         if excess <= 0:
             return
         # Sort by access time (oldest first) and remove excess
-        oldest = sorted(self._cache.items(), key=lambda item: item[1][1])
+        oldest = sorted(
+            self._cache.items(),
+            # Legacy format support: (response, ts) uses ts as access_ts
+            key=lambda item: item[1][2] if len(item[1]) == 3 else item[1][1],
+        )
         for k, _ in oldest[:excess]:
             del self._cache[k]
+
+    # Dev sanity check (manual):
+    #   cache = ResponseCache()
+    #   cache.set("k", JSONResponse({"ok": True}))
+    #   _ = cache.get("k", ttl=0.2)
+    #   time.sleep(0.25)
+    #   assert cache.get("k", ttl=0.2) is None
+    # Repeated reads before TTL should NOT pin entries forever without set().
 
 
 @dataclass
