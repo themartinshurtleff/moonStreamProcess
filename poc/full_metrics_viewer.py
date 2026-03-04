@@ -716,6 +716,11 @@ class FullMetricsProcessor:
         # get_display_state() which copies under this lock.
         self._display_lock = threading.Lock()
 
+        # Per-symbol individual liquidation event buffers for /liq_events API endpoint.
+        # Separate lock from _display_lock to avoid contention with the 4 FPS display thread.
+        self._liq_events_lock = threading.Lock()
+        self._liq_events: Dict[str, deque] = {sym: deque(maxlen=12000) for sym in SYMBOL_CONFIGS}
+
         # Event sanity validator - log first 50 liquidation events for verification
         self._sanity_check_count = 0
         self._sanity_check_limit = 50
@@ -1272,6 +1277,22 @@ class FullMetricsProcessor:
             engine = self.engine_manager.get_engine(event.symbol_short)
             if engine is None:
                 continue  # skip symbols we don't track
+
+            # Buffer individual event for /liq_events API endpoint.
+            # Capture BEFORE engine routing — exchange field is only available here.
+            sym = event.symbol_short
+            if sym in self._liq_events:
+                ts_ms = int(event.timestamp * 1000) if event.timestamp < 1e12 else int(event.timestamp)
+                with self._liq_events_lock:
+                    self._liq_events[sym].append({
+                        "ts": ts_ms,
+                        "symbol": sym,
+                        "side": event.side,
+                        "price": event.price,
+                        "qty": event.qty,
+                        "notional_usd": event.notional,
+                        "exchange": event.exchange,
+                    })
 
             try:
                 # Update BTC UI liquidation counters (BTC only — other symbols
@@ -2510,7 +2531,9 @@ def main():
                     ob_buffer=processor.ob_heatmap_buffers,
                     snapshot_dir=POC_DIR,
                     engine_manager=processor.engine_manager,
-                    oi_poller=processor.oi_poller
+                    oi_poller=processor.oi_poller,
+                    liq_events=processor._liq_events,
+                    liq_events_lock=processor._liq_events_lock,
                 )
                 api_thread = start_api_thread(app, host=args.api_host, port=args.api_port)
                 console.print("[green]Embedded API server started - orderbook buffer is shared directly![/]")

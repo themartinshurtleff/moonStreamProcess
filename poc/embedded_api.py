@@ -595,6 +595,8 @@ class EmbeddedAPIState:
         snapshot_dir: Optional[str] = None,
         engine_manager: Optional['EngineManager'] = None,
         oi_poller: Optional[Any] = None,
+        liq_events: Optional[Dict[str, Any]] = None,
+        liq_events_lock: Optional[Any] = None,
         # Legacy params — accepted but ignored (kept for caller compat during transition)
         snapshot_file: Optional[str] = None,
         snapshot_v2_file: Optional[str] = None,
@@ -612,6 +614,9 @@ class EmbeddedAPIState:
         self.ob_buffer = self.ob_buffers.get("BTC")
         self.engine_manager = engine_manager
         self.oi_poller = oi_poller  # MultiExchangeOIPoller or OIPollerThread
+        # Per-symbol individual liq event deques + lock (shared from FullMetricsProcessor)
+        self.liq_events: Dict[str, Any] = liq_events or {}
+        self.liq_events_lock = liq_events_lock
         self.start_time = time.time()
 
         # Resolve snapshot directory: explicit param > inferred from legacy path > cwd
@@ -706,6 +711,8 @@ def create_embedded_app(
     snapshot_dir: Optional[str] = None,
     engine_manager: Optional['EngineManager'] = None,
     oi_poller: Optional[Any] = None,
+    liq_events: Optional[Dict[str, Any]] = None,
+    liq_events_lock: Optional[Any] = None,
     # Legacy params — accepted for caller compat during transition, passed through
     snapshot_file: Optional[str] = None,
     snapshot_v2_file: Optional[str] = None,
@@ -727,6 +734,8 @@ def create_embedded_app(
         snapshot_dir=snapshot_dir,
         engine_manager=engine_manager,
         oi_poller=oi_poller,
+        liq_events=liq_events,
+        liq_events_lock=liq_events_lock,
         snapshot_file=snapshot_file,
         snapshot_v2_file=snapshot_v2_file,
         liq_heatmap_v2_file=liq_heatmap_v2_file,
@@ -1114,8 +1123,66 @@ def create_embedded_app(
         return response
 
     # =========================================================================
-    # Orderbook Heatmap Endpoints (30s DoM - uses shared buffer directly)
-    # BTC-only: orderbook data is only available for BTC (other symbols lack depth streams)
+    # Individual Liquidation Events (for liq bubbles, tape, footprint liq rows)
+    # =========================================================================
+
+    @app.get("/liq_events")
+    @app.get("/v2/liq_events")
+    async def liq_events(
+        symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
+        limit: int = Query(default=500, description="Max events to return (capped at 5000)"),
+        since_ts: int = Query(default=0, description="Only return events with ts > this value (milliseconds)"),
+    ):
+        """
+        Get individual liquidation (force order) events.
+
+        Returns raw events with exchange attribution for liq bubbles,
+        footprint bar liq rows, and liquidation tape.
+        Events are returned in chronological order (oldest first).
+        If more events match than `limit`, the most recent `limit` events are returned.
+        """
+        sym = _validate_symbol(symbol)
+        limit = max(1, min(5000, limit))
+
+        if not state.liq_events or not state.liq_events_lock:
+            raise HTTPException(
+                status_code=503,
+                detail="Liquidation events buffer not available"
+            )
+
+        sym_deque = state.liq_events.get(sym)
+        if sym_deque is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No liquidation event buffer for symbol {sym}"
+            )
+
+        # Copy deque under lock, filter/slice outside
+        with state.liq_events_lock:
+            all_events = list(sym_deque)
+
+        # Filter by since_ts
+        if since_ts > 0:
+            all_events = [e for e in all_events if e["ts"] > since_ts]
+
+        # Take last `limit` events (most recent), return in chronological order
+        if len(all_events) > limit:
+            all_events = all_events[-limit:]
+
+        oldest_available_ts = all_events[0]["ts"] if all_events else 0
+        newest_ts = all_events[-1]["ts"] if all_events else 0
+
+        return JSONResponse(content={
+            "symbol": sym,
+            "events": all_events,
+            "count": len(all_events),
+            "oldest_available_ts": oldest_available_ts,
+            "newest_ts": newest_ts,
+            "ts_unit": "ms",
+        })
+
+    # =========================================================================
+    # Orderbook Heatmap Endpoints (30s DoM — uses per-symbol shared buffer)
     # =========================================================================
 
     def _get_ob_buffer(symbol: str):
@@ -1767,6 +1834,7 @@ def start_api_thread(
     print(f"  GET http://{host}:{port}/liq_heatmap_v2")
     print(f"  GET http://{host}:{port}/liq_heatmap_v2_history")
     print(f"  GET http://{host}:{port}/liq_stats")
+    print(f"  GET http://{host}:{port}/liq_events")
     print(f"  GET http://{host}:{port}/orderbook_heatmap")
     print(f"  GET http://{host}:{port}/orderbook_heatmap_history")
     print(f"  GET http://{host}:{port}/orderbook_heatmap_stats")
