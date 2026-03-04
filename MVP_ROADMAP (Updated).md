@@ -1,5 +1,5 @@
 # TradeNet Quantum Terminal — MVP Roadmap
-## Updated: Mar 2, 2026
+## Updated: Mar 3, 2026
 
 ---
 
@@ -87,11 +87,11 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 
 ---
 
-## CURRENT ENGINE STATE (verified Mar 2, 2026)
+## CURRENT ENGINE STATE (verified Mar 3, 2026)
 
 - **Backend:** 3 exchanges (Binance/Bybit/OKX), 3 symbols (BTC/ETH/SOL), real per-symbol liq heatmaps
 - **OI:** 3-exchange aggregation (Binance + Bybit + OKX per symbol)
-- **OB heatmap:** Binance only (not aggregated). Multi-exchange OB is Phase F (post-launch).
+- **OB heatmap:** Binance BTC/ETH/SOL — full parity across all flagship tickers (Sprint 4 complete). Multi-exchange OB is Phase F (post-launch).
 - **Calibrator:** healthy, event drop warning added
 - **Heatmap:** tape + inference producing data, independent normalization working. **2-day soak confirms production-quality visual output** — distinct intensity bands, clear zone structure, on par with Coinglass. History accumulating properly with decay working as designed.
 - **A3a-v2:** VALIDATED during live geopolitical event (US/Israel strike Iran, Feb 28 2026). 2,623 force orders captured. Cluster boost firing at 100% cluster match rate with 47-55 exact bucket overlaps.
@@ -160,6 +160,73 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 
 ---
 
+## COMPLETED: Sprint 4 — Backend Feature Parity
+
+All 3 flagship tickers (BTC, ETH, SOL) now have identical feature sets. ✅
+
+| # | Task | Status | Impact | Repo |
+|---|------|--------|--------|------|
+| S4-1 | Liq heatmap binary persistence | ✅ DONE | Fixed: frames now persist to disk via `_write_frame_to_disk()`. History survives restarts. V1 dead-code buffers removed (no endpoint served v1). | Backend |
+| S4-2 | ETH/SOL depth WS subscriptions | ✅ DONE | Added ETH/SOL depth streams to Binance connector using same format as BTC. | Backend |
+| S4-3 | ETH/SOL OrderbookReconstructor + Accumulator | ✅ DONE | Per-symbol OB engines created. `has_orderbook=True` for all 3 flagship symbols. | Backend |
+| S4-4 | Per-symbol depth routing | ✅ DONE | `_process_depth()` routes by symbol, no longer hardcoded to BTC. | Backend |
+| S4-5 | Per-symbol OB buffer + binary files | ✅ DONE | Per-symbol buffers and binary persistence files for ETH/SOL. Legacy BTC filename preserved. | Backend |
+| S4-6 | OB API endpoint parity | ✅ DONE | All OB endpoints accept ETH/SOL. Cache keys include symbol. BTC/ETH/SOL all return data. | Backend |
+
+---
+
+## CURRENT: Sprint 5 — Backend Completion (pre-deployment lockdown)
+
+**Goal:** Finish ALL backend work so the server can be deployed once and not touched again during frontend development.
+
+**Key finding from gap analysis:** Most "gaps" are already covered by the frontend's own data sources. The frontend computes volume/delta/CVD from live trades (aggr-server WS), fetches OI directly from exchanges (15s polling), and gets OHLC from exchange REST/WS. The ONLY data the frontend cannot get elsewhere is liquidation events — force orders flow exclusively through the Python backend. All candle metrics / OHLC / CVD endpoints proposed in the gap analysis are redundant.
+
+### S5-A: Critical (blocks core frontend features)
+
+| # | Task | Status | Gap | Impact | Difficulty |
+|---|------|--------|-----|--------|------------|
+| S5-1 | Data layer gap analysis | ✅ DONE | — | Produced implementation plan. Most gaps found to be redundant with frontend data sources. | — |
+| S5-2 | `/liq_events` endpoint | ⬜ | GAP-1 | CRITICAL — only source for liq bubbles, per-candle Short/Long Liq on footprint bar stats, liq tape. New per-symbol deque in `FullMetricsProcessor`, populated in `_process_liquidations()` where `CommonLiqEvent.exchange` is still available. Fields: `ts, symbol, side, price, qty, notional_usd, exchange`. Rolling 12hr buffer (maxlen ~5200 per symbol at ~7 events/min). Supports `?symbol=BTC&limit=100&since_ts=`. | LOW (~50 lines) |
+| S5-3 | Liq heatmap grid tear fix | ⬜ | — | Visual bug — heatmap tears when price drifts beyond initial grid range (BTC ~7hrs, SOL ~9hrs post-restart). Fix: over-allocate grid range ±15-20%, or interpolate old frames onto new boundaries, or use fixed-step grid. | MEDIUM |
+| S5-4 | Normalization visibility floor | ⬜ | — | Strong zones crushed off screen during extreme events. Zones above notional threshold must render at minimum 10-15% intensity regardless of p99 scaling. Discovered during Feb 28 event. | LOW-MEDIUM |
+
+### S5-B: Useful additions (data already in memory, just needs endpoints)
+
+| # | Task | Status | Gap | Impact | Difficulty |
+|---|------|--------|-----|--------|------------|
+| S5-5 | `/market_data` endpoint | ⬜ | GAP-3 | Convenience: mark price, last price, funding rate, next funding ts, OI — all in one call per symbol. Data already in `symbol_prices` and `self.state`. Useful for AGGREGATED tickers where frontend may not have a direct exchange source for funding. | LOW (~30 lines) |
+| S5-6 | `/trader_ratios` endpoint | ⬜ | GAP-4 | Expose top trader account ratio, position ratio, global account ratio. Already polled from Binance REST, stored in `self.state`. BTC only for now. | LOW (~25 lines) |
+| S5-7 | Extend `/oi` with delta fields | ⬜ | GAP-E1 | Add `oi_delta`, `oi_delta_pct`, `previous_oi` to existing response. Store previous reading in poller. Frontend already computes delta itself but this saves a step. | LOW (~15 lines) |
+| S5-8 | Add `source` field to liq V2 pools | ⬜ | GAP-E2 | Add "tape"/"inference"/"combined" to each pool in `/liq_heatmap_v2`. Source attribution already computed for boost logic. | LOW (~20 lines) |
+| S5-9 | Exchange connection quality in `/health` | ⬜ | GAP-E5 | Per-exchange connection status, last message timestamp, reconnect count. Data in `processor.exchange_last_seen` and WS connector state. | LOW (~30 lines) |
+
+### S5-C: Aggr-server trade storage (for aggregated footprint backfill)
+
+| # | Task | Status | Impact | Notes |
+|---|------|--------|--------|-------|
+| S5-10 | Store individual trades for flagship tickers | ⬜ | Write each incoming trade to `raw_trades` InfluxDB measurement alongside existing candle aggregation. Fields: timestamp, price, qty, side, exchange. Only BTC/ETH/SOL. | Aggr-server (Node.js) |
+| S5-11 | 12-hour retention policy on raw trades | ⬜ | InfluxDB retention policy auto-deletes trades older than 12hrs. Estimated 65-280MB depending on volatility. | Aggr-server / InfluxDB |
+| S5-12 | REST endpoint for historical trades | ⬜ | `/trades/{symbol}?from={ms}&to={ms}` — returns individual trades for footprint backfill on aggregated tickers. | Aggr-server |
+| S5-13 | Nginx proxy route for trade endpoint | ⬜ | Route on Droplet 1 so frontend can reach aggr-server trade endpoint. | Infra |
+
+### NOT building (redundant — frontend already has these data sources)
+
+| Gap from Analysis | Why Redundant |
+|-------------------|---------------|
+| GAP-2a: `/candle_metrics` (live) | Frontend computes volume/delta from live trade stream (aggr-server WS or exchange WS) |
+| GAP-2b: `/candle_metrics_history` | Frontend computes from historical klines (exchange REST / aggr-server `/historical`) |
+| GAP-2c: CVD 24h accumulator | Frontend accumulates rolling 24h CVD from per-candle deltas client-side |
+| GAP-2d: OI cumulative delta | Frontend accumulates from its own OI polling (15s from Binance) with UTC midnight reset |
+| GAP-5: `/candles` OHLC endpoint | Frontend fetches klines from exchange REST/WS + aggr-server `/historical`. Backend OHLC would be duplicate. |
+| GAP-E3: Exchange breakdown in liq pools | Nice-to-have post-launch. Needs LiqBucket schema change. Not a launch blocker. |
+| GAP-E4: Per-minute volume in liq_stats | Redundant with frontend trade-stream volume computation |
+| GAP-6: `/calibrator_status` | Diagnostic panel only. Post-launch. |
+
+**Dependency chain:** S5-2 is highest priority and independent. S5-3 and S5-4 are independent. S5-5 through S5-9 are all independent (each exposes existing in-memory data). S5-10 → S5-11 → S5-12 → S5-13 are sequential.
+
+**After Sprint 5:** Backend is deployment-locked. Every data endpoint the frontend needs is serving. Aggr-server storing trades for footprint backfill. Deploy to Droplet 2, never touch backend during frontend dev.
+
+
 ## PHASE A (remaining): Heatmap Quality
 
 | # | Task | Status | Notes |
@@ -176,19 +243,21 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 
 ---
 
-## PHASE B: Visual Polish — Ship Quality
+## PHASE B: Visual Polish — Ship Quality (frontend-only after Sprint 5)
 
 **Launch blockers:**
 
 | # | Task | Impact | Repo |
 |---|------|--------|------|
 | B1 | Colored cell backgrounds on footprint | Single biggest visual upgrade — professional footprint chart | Frontend |
+| B13 | OB heatmap frontend parity for ETH/SOL | Backend serves OB data for all 3 symbols (Sprint 4). Frontend needs to route OB overlay per-symbol matching the active ticker. | Frontend |
 | B4 | Fix CVD + OI CVD accumulation bugs | Data correctness — CVD drift, OI CVD midnight reset | Frontend |
 | B5 | Fix bar stats timeframe mismatch | Data correctness — switching timeframes shows stale data | Frontend |
-| B6 | Connect liq data to bar stats Short Liq / Long Liq rows | Currently zeros — backend has data, frontend needs to consume | Frontend + Backend |
+| B6 | Connect liq data to bar stats Short Liq / Long Liq rows | Currently zeros — consume S5-2 individual liq events endpoint, aggregate into candle buckets client-side | Frontend |
 | B7 | Fix multi-pane heatmap bug | Only one pane displays heatmap at a time | Frontend |
-| B8 | Normalization visibility floor | Strong zones (notional > threshold) must always render at minimum 10-15% intensity regardless of p99 scaling. Prevents extreme events from crushing weaker zones off screen. Discovered during Feb 28 event. | Backend display wrapper |
-| B9 | Swept zone visual persistence | Swept zones dim to 30% or shift color instead of vanishing instantly. Shows the zone was correct. | Frontend rendering |
+| B9 | Swept zone visual persistence | Swept zones dim to 30% or shift color instead of vanishing instantly. Shows the zone was correct. | Frontend |
+| B14 | Liq bubbles on heatmap | Render individual large liquidation events as bubbles on liq heatmap overlay. Consume S5-2 individual liq events endpoint. Size = notional, color = side. | Frontend |
+| B15 | Aggregated ticker footprint backfill | Fetch historical trades from aggr-server S5-8 endpoint for AGGREGATED tickers. Build footprint volume-at-price from individual trades. Falls back to Binance aggTrades for dates before aggr-server trade storage began. | Frontend |
 
 **Nice-to-have (cut if time tight):**
 
@@ -196,6 +265,8 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 |---|------|--------|------|
 | B2 | POC row highlighting | Professional standard | Frontend |
 | B3 | K/M number formatting | Readability | Frontend |
+| B10 | Aggregated kline history from aggr-server | Nginx route + frontend fetch path swap for AGGREGATED tickers | Frontend + Infra |
+| B11 | Volume profile indicator | Computed from footprint KlineTrades data | Frontend |
 
 ---
 
@@ -246,10 +317,12 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 | Audit Sprint 3.5 Tier 1 | 4 | 4 | 0 |
 | Audit Sprint 3.5 Tier 2 | 6 | 6 | 0 |
 | Audit Sprint 3.5 Tier 3 | 6 | 0 | 6 |
-| Phase B: Visual Polish | 11 | 0 | 11 (9 blockers + 2 nice-to-have) |
+| Sprint 4: Backend Feature Parity | 6 | 6 | 0 |
+| Sprint 5: Backend Completion | 13 | 1 | 12 |
+| Phase B: Visual Polish | 13 | 0 | 13 (9 blockers + 4 nice-to-have) |
 | Phase C: Deployment | 8 | 0 | 8 |
 | Phase D: Brand | 5 | 0 | 5 |
-| **TOTAL** | **108** | **66** | **42** |
+| **TOTAL** | **129** | **73** | **56** |
 
 **Critical path to launch (blockers only):**
 
@@ -257,12 +330,16 @@ SOL FP grid (floating-point drift), BTC OI unit mismatch (base→USD conversion)
 |-------|---------------|
 | Sprint 3.5 Tier 1 | ~~4~~ ✅ |
 | Sprint 3.5 Tier 2 | ~~6~~ ✅ |
+| Sprint 4: Backend Feature Parity | ~~5~~ ✅ |
+| Sprint 5: Backend Completion | 12 |
 | Phase B blockers | 9 |
 | Phase C | 8 |
 | Phase D | 5 |
-| **Total blockers to launch** | **22** |
+| **Total blockers to launch** | **34** |
 
-**Progress: 66 tasks complete. ~22 blocker tasks to launch. Deployment-ready for trusted beta behind nginx.**
+**Progress: 73 tasks complete. ~34 blocker tasks to launch.**
+
+**Execution order: Sprint 5 (backend lockdown) → Deploy to Droplet 2 → Phase B (frontend) + Phase C (deployment infra) + Phase D (brand) in parallel.**
 
 ---
 
@@ -312,8 +389,8 @@ Verified clean by 5 independent auditors (1 Claude Code + 4 ChatGPT Codex).
 |-------|----------|-------|
 | Bybit geo-blocked without VPN | DEV ONLY | Droplet has no geo-restrictions. Germany VPN for local dev. |
 | Proxy latency (~1.2s/kline) | LOW | Frontend kline loading slow through proxy. Direct Binance 399ms. Phase C. |
-| OB heatmap Binance-only | KNOWN | Not aggregated. Multi-exchange OB is Phase F (post-launch). |
-| depth_band missing for ETH/SOL | DEFERRED | Needs per-symbol OB engines. Not MVP. |
+| OB heatmap Binance-only | KNOWN | Not aggregated across exchanges. Multi-exchange OB is Phase F (post-launch). Per-symbol Binance OB for ETH/SOL done in Sprint 4. |
+| ~~depth_band missing for ETH/SOL~~ | ✅ RESOLVED | Per-symbol OB engines added in Sprint 4. ETH/SOL now have depth_band inputs for calibrator. |
 | Hyperliquid excluded | DEFERRED | No public liquidation WebSocket stream. |
 | 10x leverage tier disabled | KNOWN | -$62K median miss. Excluded from calibration. Monitor post-launch. |
 | Agent signals disabled | DEFERRED | Re-enable post-launch. |
@@ -322,6 +399,9 @@ Verified clean by 5 independent auditors (1 Claude Code + 4 ChatGPT Codex).
 | Swept zones vanish before trader can see confirmation | KNOWN | B9 fix planned. Sweep reduction + decay erases zones as price confirms them. |
 | Sprint 2 backoff resets on connect not data flow | KNOWN | Sprint 3.5 H-Backoff fix planned. Behavioral weakness, not regression. |
 | Notional USD values undercount real exposure (~5-10x) | KNOWN | Engine only captures OI deltas during runtime, missing pre-existing position inventory. Also missing exchanges beyond Binance/Bybit/OKX (Bitget, Gate, MEXC, etc). Tooltip shows ~$500K where real exposure is likely $3-20M. Phase E calibration task: compare displayed notional vs actual force order volume when zones sweep, derive correction factor. |
+| ~~Liq heatmap frontend not updating in realtime~~ | ✅ RESOLVED | Was backend: ResponseCache refreshed TTL on every `get()` hit, turning TTL into an inactivity timeout. Frequently-polled endpoints served stale responses indefinitely. Fixed: `get()` now checks TTL against `created_ts` only, not `access_ts`. |
+| ~~Liq heatmap tooltip drifts after runtime~~ | ✅ RESOLVED | Same root cause as above — stale cache served old grid definitions. Fixed by cache TTL fix. |
+| Liq heatmap grid tear on price drift | S5-3 | Dynamic unified grid rebuckets when price moves beyond initial range. Now tracked in Sprint 5 for pre-deployment fix. |
 
 ---
 
@@ -332,6 +412,7 @@ Verified clean by 5 independent auditors (1 Claude Code + 4 ChatGPT Codex).
 | Feb 27, 2026 | Sprint 1 (8 fixes) + Sprint 2 (9 fixes) shipped. A3a-v2 deployed, first cluster detected. |
 | Feb 28, 2026 | **A3a-v2 VALIDATED.** US/Israel strike Iran (Operation Shield of Judah). Engine captured 2,623 force orders. Heatmap showed exact liq structure — long cluster $59.8K–$63.5K, short cluster $63.9K–$69.4K. Side-by-side comparison with competitor showed massive quality gap. Second-pass audit (5 agents) completed, Sprint 3.5 plan created, Tier 1 prompt sent. |
 | Mar 2, 2026 | **2-day soak confirmed. Sprint 3.5 Tier 1+2 VERIFIED.** Liq heatmap running continuously since Feb 28. Visual output on par with Coinglass. 10 pre-deployment fixes verified: clean Ctrl+C shutdown, thread-safe display, cache hardening, grid DoS caps, WS resilience, backoff on data flow, side validation, disabled tier enforcement. Deployment-ready for trusted beta behind nginx. Discovered aggr-server `/historical` REST API with per-exchange OHLCV bars from InfluxDB — aggregated kline history available for BTC/ETH/SOL. |
+| Mar 3, 2026 | **Sprint 4 COMPLETE — full backend feature parity.** Liq heatmap binary persistence fixed (history survives restarts). V1 dead-code buffers removed. ETH/SOL orderbook heatmap pipeline replicated from BTC (depth WS, reconstructor, accumulator, per-symbol buffers, API endpoints). All 3 flagship tickers now serve liq heatmap + OB heatmap + OI + zones. ResponseCache TTL bug fixed (was refreshing on read, causing stale responses). nginx proxy cache lock issue diagnosed and fixed on Droplet 1. |
 
 ---
 
