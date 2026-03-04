@@ -1134,7 +1134,7 @@ def create_embedded_app(
     async def orderbook_heatmap_30s(
         symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         range_pct: float = Query(default=0.10, description="Price range as decimal"),
-        step: float = Query(default=20.0, description="Price bucket size"),
+        step: float = Query(default=None, description="Price bucket size (default: per-symbol native step)"),
         price_min: float = Query(default=None, description="Override minimum price"),
         price_max: float = Query(default=None, description="Override maximum price"),
         format: str = Query(default="json", description="Response format: json or bin")
@@ -1154,6 +1154,23 @@ def create_embedded_app(
         """
         sym, ob_buf = _get_ob_buffer(symbol)
 
+        if not HAS_OB_HEATMAP:
+            raise HTTPException(
+                status_code=503,
+                detail="Orderbook heatmap module not available"
+            )
+
+        frame = ob_buf.get_latest()
+        if not frame:
+            raise HTTPException(
+                status_code=404,
+                detail="No orderbook frames available yet"
+            )
+
+        # Resolve step: use frame's native step if not explicitly provided
+        if step is None:
+            step = frame.step
+
         # Validate user-provided grid parameters
         if step <= 0:
             raise HTTPException(status_code=400, detail="step must be positive")
@@ -1169,19 +1186,6 @@ def create_embedded_app(
                     status_code=400,
                     detail=f"grid too large: {est_buckets} buckets exceeds limit of {MAX_GRID_BUCKETS}"
                 )
-
-        if not HAS_OB_HEATMAP:
-            raise HTTPException(
-                status_code=503,
-                detail="Orderbook heatmap module not available"
-            )
-
-        frame = ob_buf.get_latest()
-        if not frame:
-            raise HTTPException(
-                status_code=404,
-                detail="No orderbook frames available yet"
-            )
 
         # Compute time metadata
         frame_ts_ms = int(frame.ts * 1000)
@@ -1284,7 +1288,7 @@ def create_embedded_app(
         symbol: str = Query(default="BTC", description="Symbol to query (BTC, ETH, SOL)"),
         minutes: int = Query(default=720, description="Minutes of history (clamped 5..720)"),  # was 360 (6h), changed to 720 (12h) 2026-02-15
         stride: int = Query(default=1, description="Downsample stride (clamped 1..60)"),
-        step: float = Query(default=20.0, description="Price bucket size"),
+        step: float = Query(default=None, description="Price bucket size (default: per-symbol native step)"),
         price_min: float = Query(default=None, description="Override minimum price"),
         price_max: float = Query(default=None, description="Override maximum price"),
         format: str = Query(default="json", description="Response format: json or bin")
@@ -1303,6 +1307,20 @@ def create_embedded_app(
         """
         sym, ob_buf = _get_ob_buffer(symbol)
 
+        minutes = max(5, min(720, minutes))
+        stride = max(1, min(60, stride))
+
+        frames = ob_buf.get_frames(minutes=minutes, stride=stride)
+
+        # Resolve step: use first frame's native step if not explicitly provided
+        if step is None:
+            if frames:
+                step = frames[0].step
+            else:
+                # Fallback for empty response — look up from SYMBOL_CONFIGS
+                _symbol_ob_steps = {"BTC": 20.0, "ETH": 1.0, "SOL": 0.10}
+                step = _symbol_ob_steps.get(sym, 20.0)
+
         # Validate user-provided grid parameters
         if step <= 0:
             raise HTTPException(status_code=400, detail="step must be positive")
@@ -1315,11 +1333,6 @@ def create_embedded_app(
                     status_code=400,
                     detail=f"grid too large: {est_buckets} buckets exceeds limit of {MAX_GRID_BUCKETS}"
                 )
-
-        minutes = max(5, min(720, minutes))
-        stride = max(1, min(60, stride))
-
-        frames = ob_buf.get_frames(minutes=minutes, stride=stride)
 
         if not frames:
             return JSONResponse(content={
