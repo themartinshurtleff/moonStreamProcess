@@ -96,6 +96,48 @@ def _build_price_grid(price_min: float, price_max: float, step: float) -> List[f
     n_buckets = int(round((price_max - price_min) / step)) + 1
     return [round(price_min + i * step, ndigits) for i in range(n_buckets)]
 
+
+# ---------------------------------------------------------------------------
+# Visibility floor — display-only post-normalization lift for significant
+# buckets that p99 normalization would otherwise crush to invisible levels.
+# CRITICAL: Applied ONLY at snapshot write time (display path). Never in
+# calibrator, zone manager, inference, or any logic path.
+# ---------------------------------------------------------------------------
+VISIBILITY_FLOOR_THRESHOLD = {"BTC": 25_000, "ETH": 10_000, "SOL": 5_000}
+VISIBILITY_FLOOR_MIN_U8 = 25                              # ~10% of 255
+VISIBILITY_FLOOR_MIN_FLOAT = VISIBILITY_FLOOR_MIN_U8 / 255.0  # ≈0.098
+
+# Rate-limit: last log timestamp per symbol for floor activity
+_floor_last_log_ts: Dict[str, float] = {}
+
+
+def _apply_visibility_floor(
+    symbol: str,
+    intensity: List[float],
+    prices: List[float],
+    raw_long_usd: Dict[float, float],
+    raw_short_usd: Dict[float, float],
+    side: str,
+) -> int:
+    """Lift intensity of significant buckets that p99 crushed below visibility.
+
+    Only modifies buckets where raw notional >= threshold AND current
+    intensity < floor.  Returns count of buckets floored.
+    Display-only — never call from calibrator/zone/inference paths.
+    """
+    threshold = VISIBILITY_FLOOR_THRESHOLD.get(symbol, 25_000)
+    floor_val = VISIBILITY_FLOOR_MIN_FLOAT
+    raw = raw_long_usd if side == "long" else raw_short_usd
+    floored = 0
+    for i, price in enumerate(prices):
+        if i >= len(intensity):
+            break
+        raw_usd = raw.get(price, 0.0)
+        if raw_usd >= threshold and intensity[i] < floor_val:
+            intensity[i] = floor_val
+            floored += 1
+    return floored
+
 # Per-symbol engine configuration.
 # BTC gets full engines (calibrator + heatmap + orderbook).
 # ETH and SOL get liquidation engines only (calibrator + heatmap) for MVP.
@@ -1652,6 +1694,34 @@ class FullMetricsProcessor:
                         sym_v2_shorts = sym_v2_hm.get("short", {})
                         sym_v2_li = [sym_v2_longs.get(pp, 0.0) for pp in sym_v2_prices]
                         sym_v2_si = [sym_v2_shorts.get(pp, 0.0) for pp in sym_v2_prices]
+
+                        # Visibility floor (display-only): lift significant buckets
+                        # that p99 normalization crushed below visibility.
+                        _tape = sym_v2_hm.get("tape", {})
+                        _proj = sym_v2_hm.get("projection", {})
+                        _raw_long = {}
+                        for _p, _v in _tape.get("long", {}).items():
+                            _raw_long[_p] = _raw_long.get(_p, 0.0) + _v
+                        for _p, _v in _proj.get("long", {}).items():
+                            _raw_long[_p] = _raw_long.get(_p, 0.0) + _v
+                        _raw_short = {}
+                        for _p, _v in _tape.get("short", {}).items():
+                            _raw_short[_p] = _raw_short.get(_p, 0.0) + _v
+                        for _p, _v in _proj.get("short", {}).items():
+                            _raw_short[_p] = _raw_short.get(_p, 0.0) + _v
+                        _v2_fl = _apply_visibility_floor(
+                            sym_v2, sym_v2_li, sym_v2_prices, _raw_long, _raw_short, "long")
+                        _v2_fs = _apply_visibility_floor(
+                            sym_v2, sym_v2_si, sym_v2_prices, _raw_long, _raw_short, "short")
+                        if _v2_fl > 0 or _v2_fs > 0:
+                            _now = time.time()
+                            _last = _floor_last_log_ts.get(f"V2_{sym_v2}", 0.0)
+                            if _now - _last >= 60.0:
+                                _floor_last_log_ts[f"V2_{sym_v2}"] = _now
+                                logger.info(
+                                    "Visibility floor V2 %s: long=%d/%d short=%d/%d buckets floored",
+                                    sym_v2, _v2_fl, len(sym_v2_li), _v2_fs, len(sym_v2_si))
+
                         sym_v2_lb = [round(u / pp, 6) if pp > 0 else 0.0
                                      for u, pp in zip(sym_v2_li, sym_v2_prices)]
                         sym_v2_sb = [round(u / pp, 6) if pp > 0 else 0.0
@@ -2028,6 +2098,33 @@ class FullMetricsProcessor:
 
         long_intensity = [round(normalize(s), 4) for s in long_smooth]
         short_intensity = [round(normalize(s), 4) for s in short_smooth]
+
+        # Visibility floor (display-only): lift significant buckets
+        # that p50/p95 normalization crushed below visibility.
+        _v1_tape = v1_heatmap.get("tape", {})
+        _v1_proj = v1_heatmap.get("projection", {})
+        _v1_raw_long = {}
+        for _p, _v in _v1_tape.get("long", {}).items():
+            _v1_raw_long[_p] = _v1_raw_long.get(_p, 0.0) + _v
+        for _p, _v in _v1_proj.get("long", {}).items():
+            _v1_raw_long[_p] = _v1_raw_long.get(_p, 0.0) + _v
+        _v1_raw_short = {}
+        for _p, _v in _v1_tape.get("short", {}).items():
+            _v1_raw_short[_p] = _v1_raw_short.get(_p, 0.0) + _v
+        for _p, _v in _v1_proj.get("short", {}).items():
+            _v1_raw_short[_p] = _v1_raw_short.get(_p, 0.0) + _v
+        _v1_fl = _apply_visibility_floor(
+            sym_short, long_intensity, prices, _v1_raw_long, _v1_raw_short, "long")
+        _v1_fs = _apply_visibility_floor(
+            sym_short, short_intensity, prices, _v1_raw_long, _v1_raw_short, "short")
+        if _v1_fl > 0 or _v1_fs > 0:
+            _now = time.time()
+            _last = _floor_last_log_ts.get(f"V1_{sym_short}", 0.0)
+            if _now - _last >= 60.0:
+                _floor_last_log_ts[f"V1_{sym_short}"] = _now
+                logger.info(
+                    "Visibility floor V1 %s: long=%d/%d short=%d/%d buckets floored",
+                    sym_short, _v1_fl, len(long_intensity), _v1_fs, len(short_intensity))
 
         top_long_zones = [
             {"price": round(p, 2), "strength": round(s, 4), "age_min": a}
