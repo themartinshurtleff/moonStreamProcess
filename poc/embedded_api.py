@@ -532,13 +532,29 @@ class LiquidationHeatmapBuffer:
         }
 
 
+def _normalize_price(p: float, step: float, ndigits: int) -> float:
+    """Snap a price to the nearest grid point and round to ndigits.
+
+    Prevents float misalignment when building lookup dicts — e.g. a frame
+    key of 95019.999999 will snap to 95020.0 with step=20.
+    """
+    return round(round(p / step) * step, ndigits)
+
+
 def build_unified_grid(
     frames: List[HistoryFrame],
     current_src: float,
     step: float = DEFAULT_STEP,
     band_pct: float = DEFAULT_BAND_PCT
 ) -> Tuple[List[float], float, float]:
-    """Build a unified price grid that covers all frames."""
+    """Build a unified price grid that covers all frames.
+
+    Uses the union of all frames' price ranges so that old frames whose
+    prices have drifted from the current price are still mapped correctly.
+    Falls back to current_src ± band_pct when no frames are available.
+    If the union grid exceeds MAX_GRID_BUCKETS, it is trimmed symmetrically
+    around current_src.
+    """
     if current_src <= 0:
         if frames:
             current_src = frames[-1].src
@@ -546,8 +562,29 @@ def build_unified_grid(
             return ([], 0, 0)
 
     ndigits = _step_ndigits(step)
-    price_min = round(round((current_src * (1 - band_pct)) / step) * step, ndigits)
-    price_max = round(round((current_src * (1 + band_pct)) / step) * step, ndigits)
+
+    if frames:
+        # Union of all frames' actual price ranges
+        union_min = min(f.price_min for f in frames)
+        union_max = max(f.price_max for f in frames)
+        # Also include the current-price band so the latest minute is covered
+        band_min = current_src * (1 - band_pct)
+        band_max = current_src * (1 + band_pct)
+        raw_min = min(union_min, band_min)
+        raw_max = max(union_max, band_max)
+    else:
+        raw_min = current_src * (1 - band_pct)
+        raw_max = current_src * (1 + band_pct)
+
+    price_min = round(round(raw_min / step) * step, ndigits)
+    price_max = round(round(raw_max / step) * step, ndigits)
+
+    # Safety: cap grid size to MAX_GRID_BUCKETS, trimming around current_src
+    est_buckets = int(round((price_max - price_min) / step)) + 1
+    if est_buckets > MAX_GRID_BUCKETS:
+        half_range = (MAX_GRID_BUCKETS // 2) * step
+        price_min = round(round((current_src - half_range) / step) * step, ndigits)
+        price_max = round(round((current_src + half_range) / step) * step, ndigits)
 
     prices = _build_price_grid(price_min, price_max, step)
 
@@ -559,26 +596,71 @@ def map_frame_to_grid(
     target_prices: List[float],
     step: float
 ) -> Tuple[List[int], List[int]]:
-    """Map a frame's intensities to a target grid."""
+    """Map a frame's intensities to a target grid.
+
+    Both frame keys and target prices are snapped via ``_normalize_price``
+    to prevent float misalignment causing silent zero-fills.
+    """
+    ndigits = _step_ndigits(step)
+
     frame_lookup_long = {}
     frame_lookup_short = {}
 
     for i, price in enumerate(frame.prices):
+        norm_p = _normalize_price(price, step, ndigits)
         if i < len(frame.long_intensity):
-            frame_lookup_long[price] = frame.long_intensity[i]
+            frame_lookup_long[norm_p] = frame.long_intensity[i]
         if i < len(frame.short_intensity):
-            frame_lookup_short[price] = frame.short_intensity[i]
+            frame_lookup_short[norm_p] = frame.short_intensity[i]
 
     long_out = []
     short_out = []
 
     for target_price in target_prices:
-        best_long = frame_lookup_long.get(target_price, 0)
-        best_short = frame_lookup_short.get(target_price, 0)
+        norm_t = _normalize_price(target_price, step, ndigits)
+        best_long = frame_lookup_long.get(norm_t, 0)
+        best_short = frame_lookup_short.get(norm_t, 0)
         long_out.append(best_long)
         short_out.append(best_short)
 
     return (long_out, short_out)
+
+
+def _log_grid_overlap(sym: str, version: str, frames: List[HistoryFrame],
+                      prices: List[float], step: float):
+    """Log DEBUG overlap ratio between unified grid and individual frames.
+
+    For each frame, counts how many of its non-zero intensity prices
+    fall within the unified grid.  Low overlap indicates grid drift.
+    """
+    if not frames or not prices:
+        return
+    ndigits = _step_ndigits(step)
+    grid_set = set(_normalize_price(p, step, ndigits) for p in prices)
+
+    total_keys = 0
+    matched_keys = 0
+    for frame in frames:
+        for i, price in enumerate(frame.prices):
+            has_data = False
+            if i < len(frame.long_intensity) and frame.long_intensity[i] > 0:
+                has_data = True
+            if i < len(frame.short_intensity) and frame.short_intensity[i] > 0:
+                has_data = True
+            if has_data:
+                total_keys += 1
+                norm_p = _normalize_price(price, step, ndigits)
+                if norm_p in grid_set:
+                    matched_keys += 1
+
+    overlap_pct = (matched_keys / total_keys * 100) if total_keys > 0 else 0.0
+    logger.debug(
+        "%s history grid overlap (%s): %d/%d keys mapped (%.1f%%), "
+        "grid=[%.2f..%.2f] %d buckets, frames=%d",
+        version, sym, matched_keys, total_keys, overlap_pct,
+        prices[0] if prices else 0, prices[-1] if prices else 0,
+        len(prices), len(frames)
+    )
 
 
 class EmbeddedAPIState:
@@ -962,6 +1044,7 @@ def create_embedded_app(
             short_flat.extend(short_row)
 
         print(f"[EMBEDDED_API] v1/liq_heatmap_history ({sym}): frames={len(t_arr)} prices={len(prices)}")
+        _log_grid_overlap(sym, "V1", frames, prices, step)
 
         response = JSONResponse(content={
             "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
@@ -1080,6 +1163,7 @@ def create_embedded_app(
             short_flat.extend(short_row)
 
         print(f"[EMBEDDED_API] v2/liq_heatmap_history ({sym}): frames={len(t_arr)} prices={len(prices)}")
+        _log_grid_overlap(sym, "V2", frames, prices, step)
 
         response = JSONResponse(content={
             "t": t_arr, "prices": prices, "long": long_flat, "short": short_flat,
